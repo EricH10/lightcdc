@@ -1,0 +1,192 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug lightcdc: inspect redb",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "lightcdc-cli",
+          "--bin",
+          "lightcdc"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "lightcdc",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "inspect",
+        "--config",
+        "${workspaceFolder}/lightcdc.example.toml",
+        "--limit",
+        "20"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Debug lightcdc: capture",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "lightcdc-cli",
+          "--bin",
+          "lightcdc"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "lightcdc",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "capture",
+        "--config",
+        "${workspaceFolder}/lightcdc.example.toml"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+      "gracefulShutdown": "SIGINT"
+    },
+    {
+      "name": "Debug lightcdc: run capture + gRPC",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "lightcdc-cli",
+          "--bin",
+          "lightcdc"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "lightcdc",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "run",
+        "--config",
+        "${workspaceFolder}/lightcdc.example.toml",
+        "--addr",
+        "127.0.0.1:50051"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+      "gracefulShutdown": "SIGINT"
+    },
+    {
+      "name": "Debug lightcdc: example consumer + demo events",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "lightcdc: wait for gRPC",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "lightcdc-api",
+          "--example",
+          "consumer"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "consumer",
+          "kind": "example"
+        }
+      },
+      "args": [
+        "--endpoint",
+        "http://127.0.0.1:50051",
+        "--stream",
+        "orders",
+        "--consumer",
+        "vscode-debugger",
+        "--seek",
+        "latest",
+        "--limit",
+        "10",
+        "--seed-sql",
+        "${workspaceFolder}/sql/demo_orders.sql"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ],
+      "gracefulShutdown": "SIGINT"
+    },
+    {
+      "name": "Debug storage inspection test",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--package",
+          "lightcdc-storage",
+          "--lib"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "lightcdc_storage",
+          "kind": "lib"
+        }
+      },
+      "args": [
+        "inspection_reports_table_counts_and_offsets",
+        "--nocapture"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Attach to a running Rust process",
+      "type": "lldb",
+      "request": "attach",
+      "pid": "${command:pickMyProcess}",
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Debug lightcdc: CDC + consumer",
+      "configurations": [
+        "Debug lightcdc: run capture + gRPC",
+        "Debug lightcdc: example consumer + demo events"
+      ],
+      "preLaunchTask": "lightcdc: start PostgreSQL",
+      "stopAll": true
+    }
+  ]
+}

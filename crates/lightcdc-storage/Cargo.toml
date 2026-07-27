@@ -1,0 +1,16 @@
+[package]
+name = "lightcdc-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lightcdc-core = { path = "../lightcdc-core" }
+redb.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

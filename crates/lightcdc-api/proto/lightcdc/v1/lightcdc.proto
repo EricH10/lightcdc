@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package lightcdc.v1;
+
+service LightCdc {
+  rpc Subscribe(SubscribeRequest) returns (stream ChangeEvent);
+  rpc Ack(AckRequest) returns (AckResponse);
+  rpc Seek(SeekRequest) returns (SeekResponse);
+}
+
+message SubscribeRequest {
+  string stream = 1;
+  string consumer = 2;
+  uint32 limit = 3;
+}
+
+message AckRequest {
+  string stream = 1;
+  string consumer = 2;
+  uint64 sequence = 3;
+}
+
+message AckResponse {
+  uint64 offset = 1;
+}
+
+message SeekRequest {
+  string stream = 1;
+  string consumer = 2;
+  SeekPosition position = 3;
+  uint64 sequence = 4;
+}
+
+message SeekResponse {
+  uint64 offset = 1;
+}
+
+enum SeekPosition {
+  SEEK_POSITION_UNSPECIFIED = 0;
+  SEEK_POSITION_EARLIEST = 1;
+  SEEK_POSITION_LATEST = 2;
+  SEEK_POSITION_ABSOLUTE = 3;
+}
+
+message ChangeEvent {
+  uint64 sequence = 1;
+  string event_id = 2;
+  SourceMetadata source = 3;
+  optional TransactionMetadata transaction = 4;
+  string schema = 5;
+  string table = 6;
+  Operation operation = 7;
+  optional bytes key = 8;
+  optional bytes before = 9;
+  optional bytes after = 10;
+  optional int64 commit_timestamp_ms = 11;
+}
+
+message SourceMetadata {
+  string database = 1;
+  string slot = 2;
+  string lsn = 3;
+}
+
+message TransactionMetadata {
+  optional uint64 transaction_id = 1;
+  optional string begin_lsn = 2;
+  optional string commit_lsn = 3;
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_INSERT = 1;
+  OPERATION_UPDATE = 2;
+  OPERATION_DELETE = 3;
+  OPERATION_TRUNCATE = 4;
+}
+

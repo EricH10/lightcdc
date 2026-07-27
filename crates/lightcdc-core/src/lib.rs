@@ -1,0 +1,10 @@
+/// Configuration loading and stream matching.
+pub mod config;
+/// Shared error types for the core crate.
+pub mod error;
+/// Shared CDC event types.
+pub mod event;
+
+pub use config::{Config, LoggingConfig, RuntimeConfig, SourceConfig, StreamConfig};
+pub use error::{Error, Result};
+pub use event::{ChangeEvent, Operation, SourceMetadata, TransactionMetadata};

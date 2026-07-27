@@ -1,0 +1,28 @@
+[source]
+name = "default"
+host = "localhost"
+port = 5432
+database = "lightcdc"
+user = "lightcdc"
+password = "lightcdc"
+publication = "lightcdc_publication"
+slot = "lightcdc_slot"
+
+[runtime]
+data_dir = "data"
+storage_file = "lightcdc.redb"
+channel_capacity = 1024
+shutdown_timeout_ms = 10000
+
+[logging]
+level = "info"
+
+[[streams]]
+name = "orders"
+source = "default"
+tables = ["public.orders"]
+
+[[streams]]
+name = "all"
+source = "default"
+tables = ["*"]

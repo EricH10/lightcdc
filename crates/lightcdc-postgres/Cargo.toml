@@ -1,0 +1,17 @@
+[package]
+name = "lightcdc-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lightcdc-core = { path = "../lightcdc-core" }
+pgwire-replication = "0.4.0"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
