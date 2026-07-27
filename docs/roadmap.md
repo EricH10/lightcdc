@@ -16,19 +16,24 @@ features.
 - Persist a transaction's events and source LSN in one atomic redb transaction. DONE
 - Acknowledge PostgreSQL at transaction commit boundaries. DONE
 - Add crash tests around receive, persist, checkpoint, and acknowledgement.
-  PARTIAL: pre-commit rollback, store reopen, uncommitted source transactions,
-  and restart after persistence without PostgreSQL acknowledgement are covered;
-  abrupt process-kill tests remain.
+  DONE: coverage includes pre-commit rollback, store reopen, uncommitted source
+  transactions, restart after persistence without PostgreSQL acknowledgement,
+  and abrupt process kills immediately before and after the atomic redb commit.
 - Guarantee no lost captured row events while the replication slot, required WAL,
-  and redb remain available. CAPTURE PATH COVERED; process-kill testing remains.
+  and redb remain available. DONE for the currently supported row events and
+  tested failure boundaries.
 - Make consumer acknowledgements monotonic. DONE
 - Define the consumer contract: acknowledging sequence N means every previously
-  delivered event through N has completed successfully.
+  delivered matching event through N has completed successfully. DONE
 - Reject acknowledgements beyond the highest sequence delivered to that consumer,
   including reconnect and stale-session behavior.
-- Add consumer crash tests proving unacknowledged events are redelivered.
+- Add consumer crash tests proving unacknowledged events are redelivered. DONE
 - Define contiguous acknowledgement behavior before supporting parallel consumer
-  processing.
+  processing. DONE: the current cursor requires sequential processing and one
+  active subscription per `(stream, consumer)`.
+- Add a leased-message shared-worker mode with opaque acknowledgement IDs,
+  visibility timeouts, negative acknowledgements, and bounded in-flight work,
+  following Sequin's delivery approach.
 - Test large transactions, deletes, TOAST values, truncates, and schema changes.
 - Track each transaction's event count and decoded byte size.
 - Add configurable transaction limits that fail without acknowledging PostgreSQL.
@@ -57,10 +62,12 @@ a bulk migration without accidental data loss or unbounded memory and disk use.
 
 ## Milestone 3: Availability and Supervision
 
-- Reconnect to PostgreSQL with exponential backoff and jitter.
-- Resume capture from the durable source LSN after reconnecting.
+- Reconnect to PostgreSQL with exponential backoff and jitter. DONE
+- Resume capture from the durable source LSN after reconnecting. DONE
 - Separate transient failures from permanent configuration failures.
 - Continue serving stored events while capture is temporarily unavailable.
+  IMPLEMENTED by the retrying capture supervisor and independent gRPC task;
+  direct combined-runtime integration coverage remains.
 - Track runtime states such as starting, capturing, retrying, and failed.
 - Add graceful shutdown at a known durability boundary.
 
@@ -80,7 +87,8 @@ disk-constrained runtime without reading debug logs.
 
 ## Milestone 5: Efficient Consumer Fanout
 
-Each subscription already runs in its own Tokio task. Improve this fanout by
+Each subscription already runs in its own Tokio task, and duplicate active
+subscriptions for one `(stream, consumer)` are rejected. Improve this fanout by
 removing constant per-consumer polling:
 
 - Notify subscribers when the durable high-water mark advances.
@@ -89,7 +97,8 @@ removing constant per-consumer polling:
 - Batch redb reads, writes, and acknowledgements where safe.
 - Move synchronous storage work onto a dedicated blocking boundary.
 - Limit active subscriptions to protect memory and file descriptors.
-- Define duplicate consumer-name and consumer-group behavior.
+- Define duplicate consumer-name and consumer-group behavior. DONE for the
+  ordered-cursor mode; shared groups are deferred to leased-message delivery.
 - Benchmark 1, 10, 100, and 1,000 consumers.
 
 Complete when additional consumers have measured, bounded resource costs and a
@@ -124,6 +133,7 @@ observable behavior.
 
 ## Current Next Step
 
-Add fault-injection restart tests around transaction persistence and PostgreSQL
-acknowledgement, followed by the PostgreSQL reconnect supervisor. Improve
-consumer fanout after the durability contract is proven.
+Add session-scoped acknowledgement validation so a consumer cannot acknowledge
+an event it was not delivered. Then broaden `pgoutput` correctness coverage and
+add transaction size accounting and limits before introducing parallel leased
+delivery.

@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
@@ -7,6 +11,9 @@ use lightcdc_postgres::ReplicationReader;
 use lightcdc_storage::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+const RECONNECT_INITIAL_DELAY_MS: u64 = 250;
+const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
 
 /// Parses the top-level lightcdc command line.
 #[derive(Debug, Parser)]
@@ -175,26 +182,13 @@ async fn capture_with_store(
     max_events: Option<usize>,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
-    let next_sequence = store
-        .next_sequence()
-        .context("failed to read next event sequence from redb")?;
     let source_name = config.source.name.clone();
-    let source_offset = store
-        .source_offset(&source_name)
-        .context("failed to read source offset from redb")?;
 
     info!(
         data_dir = %storage.data_dir.display(),
         database_file = %storage.database_file,
-        next_sequence,
-        source_offset = ?source_offset,
         "opened local event store"
     );
-
-    lightcdc_postgres::validate_source_config(&config.source).await?;
-    let mut reader =
-        ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref()).await?;
-    reader.set_next_sequence(next_sequence);
 
     warn!(
         max_events = ?max_events,
@@ -202,45 +196,141 @@ async fn capture_with_store(
     );
 
     let mut captured = 0usize;
+    let mut source_validated = false;
+    let mut retry_attempt = 0u32;
+    let mut reconnect_count = 0u64;
+
     loop {
         if max_events.is_some_and(|max| captured >= max) {
-            break;
+            return Ok(());
         }
 
-        let Some(transaction) = reader.next_transaction().await? else {
-            break;
-        };
-        let ack_lsn = transaction.ack_lsn;
+        if !source_validated {
+            if let Err(error) = lightcdc_postgres::validate_source_config(&config.source).await {
+                wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+                retry_attempt = retry_attempt.saturating_add(1);
+                reconnect_count = reconnect_count.saturating_add(1);
+                continue;
+            }
+            source_validated = true;
+        }
 
-        match store
-            .persist_transaction(&transaction.events, &source_name, &ack_lsn.to_string())
-            .context("failed to persist captured transaction to redb")?
-        {
-            PersistTransactionOutcome::Persisted => {
-                for event in &transaction.events {
-                    println!("{}", event_to_json(event, false)?);
+        let next_sequence = store
+            .next_sequence()
+            .context("failed to read next event sequence from redb")?;
+        let source_offset = store
+            .source_offset(&source_name)
+            .context("failed to read source offset from redb")?;
+
+        let mut reader =
+            match ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref())
+                .await
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    reconnect_count = reconnect_count.saturating_add(1);
+                    continue;
                 }
-                captured += transaction.events.len();
+            };
+
+        reader.set_next_sequence(next_sequence);
+        retry_attempt = 0;
+        info!(
+            reconnect_count,
+            next_sequence,
+            source_offset = ?source_offset,
+            "PostgreSQL capture connection is ready"
+        );
+
+        let disconnect_reason = loop {
+            if max_events.is_some_and(|max| captured >= max) {
+                reader.shutdown().await?;
+                return Ok(());
             }
-            PersistTransactionOutcome::AlreadyPersisted => {
-                warn!(
-                    event_count = transaction.events.len(),
-                    %ack_lsn,
-                    "skipping replayed transaction already present in redb"
-                );
-                reader.set_next_sequence(
-                    store
-                        .next_sequence()
-                        .context("failed to reset sequence after transaction replay")?,
-                );
+
+            let transaction = match reader.next_transaction().await {
+                Ok(Some(transaction)) => transaction,
+                Ok(None) => break "replication stream ended".to_owned(),
+                Err(error) => break error.to_string(),
+            };
+            let ack_lsn = transaction.ack_lsn;
+
+            match store
+                .persist_transaction(&transaction.events, &source_name, &ack_lsn.to_string())
+                .context("failed to persist captured transaction to redb")?
+            {
+                PersistTransactionOutcome::Persisted => {
+                    for event in &transaction.events {
+                        println!("{}", event_to_json(event, false)?);
+                    }
+                    captured += transaction.events.len();
+                }
+                PersistTransactionOutcome::AlreadyPersisted => {
+                    warn!(
+                        event_count = transaction.events.len(),
+                        %ack_lsn,
+                        "skipping replayed transaction already present in redb"
+                    );
+                    reader.set_next_sequence(
+                        store
+                            .next_sequence()
+                            .context("failed to reset sequence after transaction replay")?,
+                    );
+                }
             }
+
+            reader.ack(ack_lsn);
+        };
+
+        if let Err(error) = reader.shutdown().await {
+            warn!(%error, "failed to close disconnected PostgreSQL capture session");
         }
 
-        reader.ack(ack_lsn);
+        let delay = reconnect_delay(retry_attempt);
+        warn!(
+            reason = %disconnect_reason,
+            reconnect_count,
+            retry_in_ms = delay.as_millis(),
+            "PostgreSQL capture disconnected; retrying from the durable source LSN"
+        );
+        tokio::time::sleep(delay).await;
+        retry_attempt = retry_attempt.saturating_add(1);
+        reconnect_count = reconnect_count.saturating_add(1);
     }
+}
 
-    reader.shutdown().await?;
-    Ok(())
+/// Logs a failed connection attempt and waits using capped exponential backoff.
+async fn wait_before_reconnect(
+    retry_attempt: u32,
+    reconnect_count: u64,
+    error: &impl std::fmt::Display,
+) {
+    let delay = reconnect_delay(retry_attempt);
+    warn!(
+        %error,
+        reconnect_count,
+        retry_in_ms = delay.as_millis(),
+        "PostgreSQL capture is unavailable; retrying from the durable source LSN"
+    );
+    tokio::time::sleep(delay).await;
+}
+
+/// Returns capped exponential retry delay with up to 25 percent positive jitter.
+fn reconnect_delay(attempt: u32) -> Duration {
+    let exponent = attempt.min(16);
+    let base_ms = RECONNECT_INITIAL_DELAY_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(RECONNECT_MAX_DELAY_MS);
+    let jitter_window = (base_ms / 4).max(1);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % jitter_window;
+
+    Duration::from_millis((base_ms + jitter_ms).min(RECONNECT_MAX_DELAY_MS))
 }
 
 /// Replays stored events to stdout, optionally filtering by stream.
@@ -683,6 +773,19 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 2);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_is_capped() {
+        let first = reconnect_delay(0);
+        let second = reconnect_delay(1);
+        let capped = reconnect_delay(30);
+
+        assert!(first >= Duration::from_millis(RECONNECT_INITIAL_DELAY_MS));
+        assert!(first < Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 2));
+        assert!(second >= Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 2));
+        assert!(second < Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 4));
+        assert_eq!(capped, Duration::from_millis(RECONNECT_MAX_DELAY_MS));
     }
 
     fn event(sequence: u64, schema: &str, table: &str) -> ChangeEvent {

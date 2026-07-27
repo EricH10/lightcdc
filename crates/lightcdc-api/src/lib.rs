@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use lightcdc_core::{ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
 use lightcdc_storage::RedbEventStore;
@@ -24,6 +29,21 @@ pub struct LightCdcService {
     config: Arc<Config>,
     store: Arc<RedbEventStore>,
     poll_interval: Duration,
+    active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
+}
+
+type SubscriptionKey = (String, String);
+
+/// Removes a subscription identity from the active set when its task exits.
+struct ActiveSubscription {
+    key: SubscriptionKey,
+    active: Arc<Mutex<HashSet<SubscriptionKey>>>,
+}
+
+impl Drop for ActiveSubscription {
+    fn drop(&mut self) {
+        active_subscriptions(&self.active).remove(&self.key);
+    }
 }
 
 impl LightCdcService {
@@ -33,6 +53,7 @@ impl LightCdcService {
             config: Arc::new(config),
             store: Arc::new(store),
             poll_interval: Duration::from_millis(250),
+            active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -64,6 +85,7 @@ impl LightCdc for LightCdcService {
         let request = request.into_inner();
         let consumer = validate_consumer(&request.consumer)?;
         let stream = self.stream(&request.stream)?;
+        let subscription = self.claim_subscription(&stream.name, consumer)?;
         let start_offset = self
             .store
             .consumer_offset(&stream.name, consumer)
@@ -75,6 +97,7 @@ impl LightCdc for LightCdcService {
         let poll_interval = self.poll_interval;
 
         tokio::spawn(async move {
+            let _subscription = subscription;
             let mut next_sequence = start_offset + 1;
             let mut emitted = 0usize;
 
@@ -92,7 +115,10 @@ impl LightCdc for LightCdcService {
                 };
 
                 if batch.is_empty() {
-                    sleep(poll_interval).await;
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        _ = sleep(poll_interval) => {}
+                    }
                     continue;
                 }
 
@@ -159,6 +185,28 @@ impl LightCdc for LightCdcService {
 }
 
 impl LightCdcService {
+    /// Claims the one active subscription allowed for a stream and consumer.
+    fn claim_subscription(
+        &self,
+        stream: &str,
+        consumer: &str,
+    ) -> Result<ActiveSubscription, Status> {
+        let key = (stream.to_owned(), consumer.to_owned());
+        let mut active = active_subscriptions(&self.active_subscriptions);
+
+        if !active.insert(key.clone()) {
+            return Err(Status::already_exists(format!(
+                "consumer {consumer:?} already has an active subscription to stream {stream:?}"
+            )));
+        }
+        drop(active);
+
+        Ok(ActiveSubscription {
+            key,
+            active: Arc::clone(&self.active_subscriptions),
+        })
+    }
+
     /// Looks up a configured stream or returns a gRPC status error.
     fn stream(&self, name: &str) -> Result<StreamConfig, Status> {
         if name.is_empty() {
@@ -220,6 +268,15 @@ fn validate_consumer(consumer: &str) -> Result<&str, Status> {
     }
 }
 
+/// Recovers the active-subscription set if another task panicked while holding it.
+fn active_subscriptions(
+    active: &Mutex<HashSet<SubscriptionKey>>,
+) -> std::sync::MutexGuard<'_, HashSet<SubscriptionKey>> {
+    active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Converts internal errors into gRPC internal status errors.
 fn internal(error: impl ToString) -> Status {
     let message = error.to_string();
@@ -235,6 +292,7 @@ mod tests {
     };
     use lightcdc_storage::LogOpenOptions;
     use tempfile::TempDir;
+    use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
 
     use super::*;
@@ -320,6 +378,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_second_active_subscription_for_the_same_consumer() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut first = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("first subscribe response")
+            .into_inner();
+        first
+            .next()
+            .await
+            .expect("first event")
+            .expect("change event");
+
+        let error = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect_err("duplicate active subscription should fail");
+
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_ack_redelivers_the_event() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut first = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("first subscribe response")
+            .into_inner();
+        let first_event = first
+            .next()
+            .await
+            .expect("first stream item")
+            .expect("first change event");
+        drop(first);
+        wait_for_subscription_release(&service, "search-indexer").await;
+
+        let mut resumed = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("resumed subscribe response")
+            .into_inner();
+        let redelivered = resumed
+            .next()
+            .await
+            .expect("resumed stream item")
+            .expect("redelivered change event");
+
+        assert_eq!(redelivered.sequence, first_event.sequence);
+        assert_eq!(
+            service
+                .store
+                .consumer_offset("orders", "search-indexer")
+                .expect("consumer offset"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_ack_resumes_after_the_acknowledged_event() {
+        let service =
+            service_with_events(&[event(1, "public", "orders"), event(2, "public", "orders")]);
+        let mut first = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("first subscribe response")
+            .into_inner();
+        let first_event = first
+            .next()
+            .await
+            .expect("first stream item")
+            .expect("first change event");
+
+        service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: first_event.sequence,
+            }))
+            .await
+            .expect("ack response");
+        drop(first);
+        wait_for_subscription_release(&service, "search-indexer").await;
+
+        let mut resumed = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("resumed subscribe response")
+            .into_inner();
+        let next_event = resumed
+            .next()
+            .await
+            .expect("resumed stream item")
+            .expect("next change event");
+
+        assert_eq!(next_event.sequence, 2);
+    }
+
+    #[tokio::test]
     async fn seek_latest_sets_consumer_offset_to_last_sequence() {
         let service = service_with_events(&[
             event(1, "public", "orders"),
@@ -362,6 +519,28 @@ mod tests {
         let mut config = config();
         config.runtime.data_dir = temp.path().display().to_string();
         LightCdcService::new(config, store)
+    }
+
+    fn subscription(consumer: &str, limit: u32) -> SubscribeRequest {
+        SubscribeRequest {
+            stream: "orders".to_owned(),
+            consumer: consumer.to_owned(),
+            limit,
+        }
+    }
+
+    async fn wait_for_subscription_release(service: &LightCdcService, consumer: &str) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let key = ("orders".to_owned(), consumer.to_owned());
+                if !active_subscriptions(&service.active_subscriptions).contains(&key) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription task should stop after client disconnects");
     }
 
     fn config() -> Config {

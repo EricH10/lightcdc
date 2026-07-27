@@ -7,7 +7,6 @@ The intended data path is:
 ```text
 PostgreSQL logical replication
     -> replication reader
-    -> bounded Tokio channel
     -> redb-backed local event store
     -> configured stream
     -> replay CLI or gRPC consumer
@@ -35,6 +34,12 @@ tables = ["public.orders"]
 ```
 
 External consumers connect to a stream by name and provide their own consumer identity. Offsets are scoped by both stream and consumer, so `search-indexer` on `orders` does not collide with `search-indexer` on another stream.
+
+Each `(stream, consumer)` currently has one ordered cursor and allows one active
+subscription. Its acknowledgement is cumulative, so consumers process and
+acknowledge events sequentially. See
+[`consumer-delivery.md`](consumer-delivery.md) for the full contract and the
+planned leased-message model for parallel worker pools.
 
 The gRPC API exposes:
 

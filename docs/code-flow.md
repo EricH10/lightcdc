@@ -3,18 +3,23 @@
 ## Runtime Flow
 
 1. `lightcdc run` loads `lightcdc.example.toml`, opens redb once, starts gRPC, and starts capture.
-2. `capture_with_store` resumes from the stored source LSN and chooses the next local event sequence.
+2. `capture_with_store` supervises PostgreSQL capture and reloads the durable
+   source LSN and next local sequence before every connection.
 3. `ReplicationReader` connects to PostgreSQL logical replication and waits for pgoutput messages.
 4. `PgOutputDecoder` turns pgoutput bytes into relation metadata and row changes.
 5. `ReplicationReader::row_change` converts each row change into a buffered `ChangeEvent`.
 6. PostgreSQL `Commit` makes the reader emit a `CapturedTransaction` with all buffered events.
 7. `RedbEventStore::persist_transaction` stores all events and the commit LSN in one redb transaction.
 8. `ReplicationReader::ack` tells PostgreSQL the commit WAL position is durable.
-9. `LightCdcService::subscribe` replays stored events for a named stream and keeps polling for new ones.
-10. `StreamConfig::matches_event` filters events by configured table patterns.
-11. `LightCdcService::ack` records a consumer's last handled event sequence.
-12. `LightCdcService::seek` moves a consumer to earliest, latest, or a specific sequence.
-13. The example consumer subscribes, prints each event, and acks it after successful printing.
+9. A PostgreSQL disconnect drops the current reader, waits with capped
+   exponential backoff and jitter, and reconnects from the redb source LSN.
+10. `LightCdcService::subscribe` claims one active `(stream, consumer)`, replays
+   stored events, and keeps polling for new ones.
+11. `StreamConfig::matches_event` filters events by configured table patterns.
+12. `LightCdcService::ack` records a consumer's last handled event sequence.
+13. `LightCdcService::seek` moves a consumer to earliest, latest, or a specific sequence.
+14. The example consumer processes, prints, and acknowledges each event in
+    sequence.
 
 ## Main Objects
 

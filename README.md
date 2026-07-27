@@ -11,6 +11,9 @@ local MVP to a production-ready runtime.
 See [`docs/debugging.md`](docs/debugging.md) for the project VS Code debugger
 setup and a Rust debugging walkthrough.
 
+See [`docs/consumer-delivery.md`](docs/consumer-delivery.md) for the current
+ordered consumer and acknowledgement contract.
+
 ## Prerequisites
 
 - Rust 1.89 or newer
@@ -115,7 +118,8 @@ Implemented basics:
 - Combined capture plus gRPC serving command
 - Basic `pgoutput` relation, insert, update, and delete decoding
 - Source offset persistence and idempotent duplicate replay handling
-- Docker-backed integration tests for capture and resume
+- Docker-backed integration tests for capture, abrupt process recovery, and
+  PostgreSQL reconnect
 - Config-defined streams
 - Stream-filtered replay
 - gRPC `Subscribe`, `Ack`, and `Seek`
