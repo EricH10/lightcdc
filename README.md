@@ -1,9 +1,13 @@
 # lightcdc
 
-`lightcdc` is a lightweight Rust CDC runtime for PostgreSQL. The long-term goal is to capture logical replication changes, persist them to a local embedded event store, replay them independently per consumer, and eventually run sandboxed WASM transforms before delivery.
+`lightcdc` is a lightweight Rust CDC runtime for PostgreSQL and MySQL. The
+long-term goal is to capture database changes, persist them to a local embedded
+event store, replay them independently per consumer, and eventually run
+sandboxed WASM transforms before delivery.
 
-This repository currently has a local end-to-end MVP with PostgreSQL capture,
-durable redb replay, config-defined streams, and named gRPC consumers.
+This repository currently has a local end-to-end MVP with PostgreSQL logical
+replication or MySQL row-binlog capture, durable redb replay, config-defined
+streams, and named gRPC consumers.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the ordered path from the current
 local MVP to a production-ready runtime.
@@ -14,6 +18,9 @@ setup and a Rust debugging walkthrough.
 See [`docs/consumer-delivery.md`](docs/consumer-delivery.md) for the current
 ordered consumer and acknowledgement contract.
 
+See [`docs/mysql.md`](docs/mysql.md) for MySQL server requirements, checkpoint
+behavior, and current connector limitations.
+
 ## Prerequisites
 
 - Rust 1.89 or newer
@@ -21,16 +28,19 @@ ordered consumer and acknowledgement contract.
 
 ## Local Setup
 
-Start PostgreSQL with logical replication enabled:
+Start the source database:
 
 ```bash
 docker compose up -d postgres
+# or
+docker compose up -d mysql
 ```
 
-Run the CLI:
+Run PostgreSQL or MySQL capture:
 
 ```bash
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
+cargo run -p lightcdc-cli -- capture --config lightcdc.mysql.example.toml
 ```
 
 For a bounded local smoke test:
@@ -101,8 +111,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 Run Docker-backed integration tests:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres mysql
 cargo test -p lightcdc-cli --test capture_integration -- --ignored --test-threads=1
+cargo test -p lightcdc-cli --test mysql_capture_integration -- --ignored --test-threads=1
 ```
 
 ## Current Scope
@@ -112,24 +123,26 @@ Implemented basics:
 - Cargo workspace
 - Core event and config types
 - CLI command shape
-- PostgreSQL connectivity check
+- PostgreSQL and MySQL source validation
 - redb-backed local event store scaffold
-- Logical replication stream connection
+- PostgreSQL logical replication and MySQL row-binlog stream connections
 - Combined capture plus gRPC serving command
 - Basic `pgoutput` relation, insert, update, and delete decoding
+- MySQL insert, update, and delete row decoding
 - Source offset persistence and idempotent duplicate replay handling
 - Docker-backed integration tests for capture, abrupt process recovery, and
   PostgreSQL reconnect
 - Config-defined streams
 - Stream-filtered replay
 - gRPC `Subscribe`, `Ack`, and `Seek`
-- Local Docker Compose PostgreSQL
-- Init SQL for a demo table and publication
+- Local Docker Compose PostgreSQL and MySQL
+- Init SQL for PostgreSQL and MySQL demo tables
 - Architecture and local development notes
 
 Not implemented yet:
 
 - Complete `pgoutput` coverage
+- MySQL GTID checkpoints, TLS, and schema-change event handling
 - Durable recovery policy tests
 - WASM transform runtime
 - Webhook destinations

@@ -1,23 +1,27 @@
 # Architecture
 
-`lightcdc` is designed as a single-process CDC runtime with a narrow first target: PostgreSQL logical replication.
+`lightcdc` is designed as a single-process CDC runtime with PostgreSQL logical
+replication and MySQL row-binlog source connectors.
 
 The intended data path is:
 
 ```text
-PostgreSQL logical replication
-    -> replication reader
+PostgreSQL logical replication or MySQL binary log
+    -> source-specific replication reader
     -> redb-backed local event store
     -> configured stream
     -> replay CLI or gRPC consumer
 ```
 
-Milestone 0 established the workspace, local database, configuration model, and CLI entrypoint. Milestone 1 is now underway with basic logical replication protocol usage and `pgoutput` decoding for relation, insert, update, and delete messages.
+Both source readers buffer row changes until the source transaction commits.
+The CLI then atomically stores the transaction's normalized events and its
+source-specific checkpoint in redb.
 
 ## Crate Boundaries
 
 - `lightcdc-core`: shared config, event, and error types.
 - `lightcdc-postgres`: PostgreSQL connectivity and replication support.
+- `lightcdc-mysql`: MySQL connectivity, validation, and row-binlog support.
 - `lightcdc-storage`: redb-backed event, source offset, and consumer offset storage.
 - `lightcdc-api`: gRPC Subscribe, Ack, and Seek service.
 - `lightcdc-cli`: user-facing binary.
@@ -60,6 +64,21 @@ Reasoning:
 Open concern:
 
 - The current decoder supports the first useful subset: relation metadata, insert, update, delete, and truncate metadata. More `pgoutput` message types need explicit tests before broader claims.
+
+## MySQL Client Choice
+
+Initial dependency: `mysql_async` with its binlog feature.
+
+Reasoning:
+
+- It uses Tokio, matching the runtime already used by the CLI and API.
+- It handles the MySQL replication protocol, table-map events, row events, and
+  compressed transaction payloads.
+- LightCDC still owns normalization and transaction/checkpoint persistence.
+
+The initial resume cursor is binary-log filename plus position. A first launch
+starts at the current binlog end; GTID-based failover is deferred. See
+[`mysql.md`](mysql.md) for server requirements and current limitations.
 
 ## Local Storage Choice
 

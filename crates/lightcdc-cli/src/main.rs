@@ -6,8 +6,12 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
-use lightcdc_core::{ChangeEvent, Config, Operation, StreamConfig};
-use lightcdc_postgres::ReplicationReader;
+use lightcdc_core::{
+    ChangeEvent, Config, MySqlSourceConfig, Operation, PostgresSourceConfig, SourceConfig,
+    StreamConfig,
+};
+use lightcdc_mysql::ReplicationReader as MySqlReplicationReader;
+use lightcdc_postgres::ReplicationReader as PostgresReplicationReader;
 use lightcdc_storage::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -18,7 +22,7 @@ const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
 /// Parses the top-level lightcdc command line.
 #[derive(Debug, Parser)]
 #[command(name = "lightcdc")]
-#[command(about = "Lightweight PostgreSQL CDC runtime")]
+#[command(about = "Lightweight PostgreSQL and MySQL CDC runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -175,14 +179,13 @@ async fn run(
     }
 }
 
-/// Captures PostgreSQL changes into an already-opened event store.
+/// Dispatches capture to the configured database connector.
 async fn capture_with_store(
     config: Config,
     store: RedbEventStore,
     max_events: Option<usize>,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
-    let source_name = config.source.name.clone();
 
     info!(
         data_dir = %storage.data_dir.display(),
@@ -192,9 +195,22 @@ async fn capture_with_store(
 
     warn!(
         max_events = ?max_events,
-        "capture is running; insert, update, or delete rows in the published tables"
+        "capture is running; insert, update, or delete rows in the configured database"
     );
 
+    match config.source {
+        SourceConfig::Postgres(source) => capture_postgres(source, store, max_events).await,
+        SourceConfig::Mysql(source) => capture_mysql(source, store, max_events).await,
+    }
+}
+
+/// Supervises PostgreSQL logical replication and durable checkpointing.
+async fn capture_postgres(
+    source: PostgresSourceConfig,
+    store: RedbEventStore,
+    max_events: Option<usize>,
+) -> anyhow::Result<()> {
+    let source_name = source.name.clone();
     let mut captured = 0usize;
     let mut source_validated = false;
     let mut retry_attempt = 0u32;
@@ -206,8 +222,8 @@ async fn capture_with_store(
         }
 
         if !source_validated {
-            if let Err(error) = lightcdc_postgres::validate_source_config(&config.source).await {
-                wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+            if let Err(error) = lightcdc_postgres::validate_source_config(&source).await {
+                wait_before_reconnect("PostgreSQL", retry_attempt, reconnect_count, &error).await;
                 retry_attempt = retry_attempt.saturating_add(1);
                 reconnect_count = reconnect_count.saturating_add(1);
                 continue;
@@ -223,12 +239,13 @@ async fn capture_with_store(
             .context("failed to read source offset from redb")?;
 
         let mut reader =
-            match ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref())
+            match PostgresReplicationReader::connect_from(source.clone(), source_offset.as_deref())
                 .await
             {
                 Ok(reader) => reader,
                 Err(error) => {
-                    wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+                    wait_before_reconnect("PostgreSQL", retry_attempt, reconnect_count, &error)
+                        .await;
                     retry_attempt = retry_attempt.saturating_add(1);
                     reconnect_count = reconnect_count.saturating_add(1);
                     continue;
@@ -301,8 +318,119 @@ async fn capture_with_store(
     }
 }
 
+/// Supervises MySQL binlog replication and durable checkpointing.
+async fn capture_mysql(
+    source: MySqlSourceConfig,
+    store: RedbEventStore,
+    max_events: Option<usize>,
+) -> anyhow::Result<()> {
+    let source_name = source.name.clone();
+    let mut captured = 0usize;
+    let mut source_validated = false;
+    let mut retry_attempt = 0u32;
+    let mut reconnect_count = 0u64;
+
+    loop {
+        if max_events.is_some_and(|max| captured >= max) {
+            return Ok(());
+        }
+
+        if !source_validated {
+            if let Err(error) = lightcdc_mysql::validate_source_config(&source).await {
+                wait_before_reconnect("MySQL", retry_attempt, reconnect_count, &error).await;
+                retry_attempt = retry_attempt.saturating_add(1);
+                reconnect_count = reconnect_count.saturating_add(1);
+                continue;
+            }
+            source_validated = true;
+        }
+
+        let next_sequence = store
+            .next_sequence()
+            .context("failed to read next event sequence from redb")?;
+        let source_offset = store
+            .source_offset(&source_name)
+            .context("failed to read MySQL source offset from redb")?;
+        let mut reader =
+            match MySqlReplicationReader::connect_from(source.clone(), source_offset.as_deref())
+                .await
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    wait_before_reconnect("MySQL", retry_attempt, reconnect_count, &error).await;
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    reconnect_count = reconnect_count.saturating_add(1);
+                    continue;
+                }
+            };
+
+        reader.set_next_sequence(next_sequence);
+        retry_attempt = 0;
+        info!(
+            reconnect_count,
+            next_sequence,
+            source_offset = ?source_offset,
+            "MySQL capture connection is ready"
+        );
+
+        let disconnect_reason = loop {
+            if max_events.is_some_and(|max| captured >= max) {
+                reader.shutdown().await?;
+                return Ok(());
+            }
+
+            let transaction = match reader.next_transaction().await {
+                Ok(Some(transaction)) => transaction,
+                Ok(None) => break "binlog stream ended".to_owned(),
+                Err(error) => break error.to_string(),
+            };
+            let checkpoint = transaction.checkpoint.to_string();
+
+            match store
+                .persist_transaction(&transaction.events, &source_name, &checkpoint)
+                .context("failed to persist captured MySQL transaction to redb")?
+            {
+                PersistTransactionOutcome::Persisted => {
+                    for event in &transaction.events {
+                        println!("{}", event_to_json(event, false)?);
+                    }
+                    captured += transaction.events.len();
+                }
+                PersistTransactionOutcome::AlreadyPersisted => {
+                    warn!(
+                        event_count = transaction.events.len(),
+                        %checkpoint,
+                        "skipping replayed MySQL transaction already present in redb"
+                    );
+                    reader.set_next_sequence(
+                        store
+                            .next_sequence()
+                            .context("failed to reset sequence after MySQL transaction replay")?,
+                    );
+                }
+            }
+        };
+
+        if let Err(error) = reader.shutdown().await {
+            warn!(%error, "failed to close disconnected MySQL capture session");
+        }
+
+        let delay = reconnect_delay(retry_attempt);
+        warn!(
+            reason = %disconnect_reason,
+            reconnect_count,
+            retry_in_ms = delay.as_millis(),
+            "MySQL capture disconnected; retrying from the durable binlog position"
+        );
+        tokio::time::sleep(delay).await;
+        retry_attempt = retry_attempt.saturating_add(1);
+        reconnect_count = reconnect_count.saturating_add(1);
+    }
+}
+
 /// Logs a failed connection attempt and waits using capped exponential backoff.
 async fn wait_before_reconnect(
+    connector: &str,
     retry_attempt: u32,
     reconnect_count: u64,
     error: &impl std::fmt::Display,
@@ -310,9 +438,10 @@ async fn wait_before_reconnect(
     let delay = reconnect_delay(retry_attempt);
     warn!(
         %error,
+        connector,
         reconnect_count,
         retry_in_ms = delay.as_millis(),
-        "PostgreSQL capture is unavailable; retrying from the durable source LSN"
+        "database capture is unavailable; retrying from the durable source position"
     );
     tokio::time::sleep(delay).await;
 }

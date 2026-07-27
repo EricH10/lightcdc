@@ -3,7 +3,7 @@
 `lightcdc` currently has an end-to-end local MVP:
 
 ```text
-PostgreSQL -> logical replication -> pgoutput decoding -> redb
+PostgreSQL/MySQL -> source decoding -> redb
     -> configured stream -> gRPC consumer -> acknowledgement
 ```
 
@@ -126,9 +126,11 @@ observable behavior.
 ## Milestone 8: Product Features
 
 - Add a consistent initial table snapshot before live streaming.
+- Extend initial MySQL support with GTID checkpoints, TLS, DDL handling, and
+  failover tests.
 - Add webhook delivery with retries and a dead-letter queue.
 - Add sandboxed WASM transforms with transform versioning and replay.
-- Add multiple PostgreSQL sources and additional output adapters.
+- Add multiple simultaneous database sources and additional output adapters.
 - Keep the storage boundary replaceable if one-node redb storage is outgrown.
 
 ## Current Next Step

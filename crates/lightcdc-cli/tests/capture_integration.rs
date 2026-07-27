@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use lightcdc_core::{ChangeEvent, Config, Operation, SourceConfig};
+use lightcdc_core::{ChangeEvent, Config, Operation, PostgresSourceConfig};
 use lightcdc_postgres::ReplicationReader;
 use lightcdc_storage::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore};
 use tempfile::TempDir;
@@ -363,9 +363,13 @@ async fn crash_capture_worker() -> anyhow::Result<()> {
     let marker = PathBuf::from(required_env(CRASH_MARKER_ENV)?);
     let config = Config::from_path(config_path)?;
     let store = open_store(PathBuf::from(&config.runtime.data_dir))?;
-    let source_offset = store.source_offset(&config.source.name)?;
+    let source = match config.source {
+        lightcdc_core::SourceConfig::Postgres(source) => source,
+        lightcdc_core::SourceConfig::Mysql(_) => anyhow::bail!("expected postgres source"),
+    };
+    let source_offset = store.source_offset(&source.name)?;
     let mut reader =
-        ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref()).await?;
+        ReplicationReader::connect_from(source.clone(), source_offset.as_deref()).await?;
     reader.set_next_sequence(store.next_sequence()?);
 
     let transaction = timeout(Duration::from_secs(15), reader.next_transaction())
@@ -377,11 +381,7 @@ async fn crash_capture_worker() -> anyhow::Result<()> {
     }
 
     let ack_lsn = transaction.ack_lsn;
-    store.persist_transaction(
-        &transaction.events,
-        &config.source.name,
-        &ack_lsn.to_string(),
-    )?;
+    store.persist_transaction(&transaction.events, &source.name, &ack_lsn.to_string())?;
 
     if stage == "after_persist" {
         signal_ready_and_wait_for_kill(&marker)?;
@@ -434,7 +434,7 @@ fn open_store(path: PathBuf) -> anyhow::Result<RedbEventStore> {
 }
 
 async fn connect_reader(
-    source: &SourceConfig,
+    source: &PostgresSourceConfig,
     source_offset: Option<&str>,
 ) -> anyhow::Result<ReplicationReader> {
     timeout(Duration::from_secs(15), async {
@@ -470,6 +470,7 @@ fn write_test_config(
         config_path,
         format!(
             r#"[source]
+type = "postgres"
 name = {source_name}
 host = {host}
 port = {port}
@@ -601,7 +602,7 @@ fn assert_json_field(bytes: Option<&[u8]>, field: &str, expected: &str) -> anyho
 
 struct PgFixture {
     client: Client,
-    source: SourceConfig,
+    source: PostgresSourceConfig,
     source_name: String,
     table: String,
     publication: String,
@@ -616,7 +617,7 @@ impl PgFixture {
         let slot = format!("slot_{suffix}");
         let source_name = format!("lightcdc:{slot}");
 
-        let source = SourceConfig {
+        let source = PostgresSourceConfig {
             name: "default".to_owned(),
             host: "localhost".to_owned(),
             port: 5432,

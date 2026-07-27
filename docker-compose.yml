@@ -25,6 +25,32 @@ services:
       timeout: 5s
       retries: 12
 
-volumes:
-  postgres-data:
+  mysql:
+    image: mysql:8.4
+    container_name: lightcdc-mysql
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-expire-logs-seconds=86400
+    environment:
+      MYSQL_DATABASE: lightcdc
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -proot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
+volumes:
+  mysql-data:
+  postgres-data:

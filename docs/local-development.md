@@ -1,9 +1,9 @@
 # Local Development
 
-Start PostgreSQL:
+Start PostgreSQL and MySQL:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres mysql
 ```
 
 Check health:
@@ -16,6 +16,12 @@ Run the CLI:
 
 ```bash
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
+```
+
+Run MySQL capture instead:
+
+```bash
+cargo run -p lightcdc-cli -- capture --config lightcdc.mysql.example.toml
 ```
 
 Run capture and gRPC together for live consumers:
@@ -78,6 +84,7 @@ Run integration tests:
 
 ```bash
 cargo test -p lightcdc-cli --test capture_integration -- --ignored --test-threads=1
+cargo test -p lightcdc-cli --test mysql_capture_integration -- --ignored --test-threads=1
 ```
 
 Stop services:

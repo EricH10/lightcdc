@@ -287,8 +287,8 @@ fn internal(error: impl ToString) -> Status {
 #[cfg(test)]
 mod tests {
     use lightcdc_core::{
-        ChangeEvent as CoreChangeEvent, LoggingConfig, Operation as CoreOperation, RuntimeConfig,
-        SourceConfig, SourceMetadata, StreamConfig,
+        ChangeEvent as CoreChangeEvent, LoggingConfig, Operation as CoreOperation,
+        PostgresSourceConfig, RuntimeConfig, SourceConfig, SourceMetadata, StreamConfig,
     };
     use lightcdc_storage::LogOpenOptions;
     use tempfile::TempDir;
@@ -545,7 +545,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            source: SourceConfig {
+            source: SourceConfig::Postgres(PostgresSourceConfig {
                 name: "default".to_owned(),
                 host: "localhost".to_owned(),
                 port: 5432,
@@ -554,7 +554,7 @@ mod tests {
                 password: "lightcdc".to_owned(),
                 publication: "publication".to_owned(),
                 slot: "slot".to_owned(),
-            },
+            }),
             runtime: RuntimeConfig {
                 data_dir: "data".to_owned(),
                 storage_file: "lightcdc.redb".to_owned(),

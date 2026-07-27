@@ -5,6 +5,9 @@ pub mod error;
 /// Shared CDC event types.
 pub mod event;
 
-pub use config::{Config, LoggingConfig, RuntimeConfig, SourceConfig, StreamConfig};
+pub use config::{
+    Config, LoggingConfig, MySqlSourceConfig, PostgresSourceConfig, RuntimeConfig, SourceConfig,
+    StreamConfig,
+};
 pub use error::{Error, Result};
 pub use event::{ChangeEvent, Operation, SourceMetadata, TransactionMetadata};

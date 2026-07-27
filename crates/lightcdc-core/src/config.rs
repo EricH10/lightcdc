@@ -14,9 +14,17 @@ pub struct Config {
     pub streams: Vec<StreamConfig>,
 }
 
-/// Describes the PostgreSQL source used for logical replication.
+/// Describes the configured database and connector-specific replication settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SourceConfig {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceConfig {
+    Postgres(PostgresSourceConfig),
+    Mysql(MySqlSourceConfig),
+}
+
+/// Describes a PostgreSQL source used for logical replication.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PostgresSourceConfig {
     #[serde(default = "default_source_name")]
     pub name: String,
     pub host: String,
@@ -26,6 +34,20 @@ pub struct SourceConfig {
     pub password: String,
     pub publication: String,
     pub slot: String,
+}
+
+/// Describes a MySQL source used for row-based binlog replication.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MySqlSourceConfig {
+    #[serde(default = "default_source_name")]
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_mysql_port")]
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub server_id: u32,
 }
 
 /// Describes local runtime settings such as storage paths and buffer sizes.
@@ -75,6 +97,24 @@ impl Config {
 }
 
 impl SourceConfig {
+    /// Returns the stable name used to scope this source's durable checkpoint.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Postgres(source) => &source.name,
+            Self::Mysql(source) => &source.name,
+        }
+    }
+
+    /// Builds a connection description that hides the password.
+    pub fn redacted_connection_string(&self) -> String {
+        match self {
+            Self::Postgres(source) => source.redacted_connection_string(),
+            Self::Mysql(source) => source.redacted_connection_string(),
+        }
+    }
+}
+
+impl PostgresSourceConfig {
     /// Builds a PostgreSQL connection string for client libraries.
     pub fn connection_string(&self) -> String {
         format!(
@@ -82,12 +122,24 @@ impl SourceConfig {
             self.host, self.port, self.database, self.user, self.password
         )
     }
+}
 
-    /// Builds a PostgreSQL connection string that hides the password.
+impl PostgresSourceConfig {
+    /// Builds a PostgreSQL connection description that hides the password.
     pub fn redacted_connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password=<redacted>",
             self.host, self.port, self.database, self.user
+        )
+    }
+}
+
+impl MySqlSourceConfig {
+    /// Builds a MySQL connection description that hides the password.
+    pub fn redacted_connection_string(&self) -> String {
+        format!(
+            "mysql://{}:<redacted>@{}:{}/{}",
+            self.user, self.host, self.port, self.database
         )
     }
 }
@@ -128,6 +180,10 @@ fn default_source_name() -> String {
     "default".to_owned()
 }
 
+fn default_mysql_port() -> u16 {
+    3306
+}
+
 fn default_stream_tables() -> Vec<String> {
     vec!["*".to_owned()]
 }
@@ -136,7 +192,70 @@ fn default_stream_tables() -> Vec<String> {
 mod tests {
     use crate::{Operation, SourceMetadata};
 
-    use super::StreamConfig;
+    use super::{Config, SourceConfig, StreamConfig};
+
+    #[test]
+    fn parses_postgres_source_config() {
+        let config: Config = toml::from_str(
+            r#"
+            [source]
+            type = "postgres"
+            name = "default"
+            host = "localhost"
+            port = 5432
+            database = "lightcdc"
+            user = "lightcdc"
+            password = "secret"
+            publication = "publication"
+            slot = "slot"
+
+            [runtime]
+            data_dir = "data"
+            storage_file = "events.redb"
+            channel_capacity = 32
+            shutdown_timeout_ms = 1000
+
+            [logging]
+            level = "info"
+            "#,
+        )
+        .expect("postgres config");
+
+        assert!(matches!(config.source, SourceConfig::Postgres(_)));
+        assert_eq!(config.source.name(), "default");
+    }
+
+    #[test]
+    fn parses_mysql_source_config_with_default_port() {
+        let config: Config = toml::from_str(
+            r#"
+            [source]
+            type = "mysql"
+            name = "mysql"
+            host = "localhost"
+            database = "lightcdc"
+            user = "lightcdc"
+            password = "secret"
+            server_id = 5401
+
+            [runtime]
+            data_dir = "data"
+            storage_file = "events.redb"
+            channel_capacity = 32
+            shutdown_timeout_ms = 1000
+
+            [logging]
+            level = "info"
+            "#,
+        )
+        .expect("mysql config");
+
+        let SourceConfig::Mysql(source) = config.source else {
+            panic!("expected mysql source");
+        };
+        assert_eq!(source.port, 3306);
+        assert_eq!(source.server_id, 5401);
+    }
 
     #[test]
     fn stream_matches_exact_qualified_table() {

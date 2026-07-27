@@ -1,7 +1,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use lightcdc_core::{ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata};
+use lightcdc_core::{
+    ChangeEvent, Operation, PostgresSourceConfig, SourceMetadata, TransactionMetadata,
+};
 use pgwire_replication::{
     client::{ReplicationClient, ReplicationEvent},
     config::{ReplicationConfig, TlsConfig},
@@ -30,7 +32,7 @@ pub enum PostgresError {
 
 /// Reads PostgreSQL logical replication messages and emits committed transactions.
 pub struct ReplicationReader {
-    source: SourceConfig,
+    source: PostgresSourceConfig,
     client: ReplicationClient,
     decoder: PgOutputDecoder,
     sequence: u64,
@@ -50,13 +52,13 @@ pub struct CapturedTransaction {
 
 impl ReplicationReader {
     /// Connects to PostgreSQL from the start of the replication slot.
-    pub async fn connect(source: SourceConfig) -> Result<Self, PostgresError> {
+    pub async fn connect(source: PostgresSourceConfig) -> Result<Self, PostgresError> {
         Self::connect_from(source, None).await
     }
 
     /// Connects to PostgreSQL from a previously saved LSN when provided.
     pub async fn connect_from(
-        source: SourceConfig,
+        source: PostgresSourceConfig,
         start_lsn: Option<&str>,
     ) -> Result<Self, PostgresError> {
         let start_lsn = match start_lsn {
@@ -237,7 +239,7 @@ impl ReplicationReader {
 }
 
 /// Checks that PostgreSQL accepts a normal connection for the configured source.
-pub async fn validate_source_config(config: &SourceConfig) -> Result<(), PostgresError> {
+pub async fn validate_source_config(config: &PostgresSourceConfig) -> Result<(), PostgresError> {
     let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
 
     tokio::spawn(async move {

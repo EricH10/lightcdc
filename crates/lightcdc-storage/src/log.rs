@@ -294,7 +294,7 @@ impl RedbEventStore {
         Ok(output)
     }
 
-    /// Persists the last acknowledged PostgreSQL LSN for a source.
+    /// Persists the durable replication checkpoint for a source.
     pub fn set_source_offset(&self, source_name: &str, lsn: &str) -> Result<(), StorageError> {
         let write = self.db.begin_write().map_err(redb_error)?;
 
@@ -307,7 +307,7 @@ impl RedbEventStore {
         Ok(())
     }
 
-    /// Reads the last acknowledged PostgreSQL LSN for a source.
+    /// Reads the durable replication checkpoint for a source.
     pub fn source_offset(&self, source_name: &str) -> Result<Option<String>, StorageError> {
         let read = self.db.begin_read().map_err(redb_error)?;
         let offsets = read.open_table(SOURCE_OFFSETS).map_err(redb_error)?;

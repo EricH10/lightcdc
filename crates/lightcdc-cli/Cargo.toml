@@ -15,6 +15,7 @@ anyhow.workspace = true
 clap.workspace = true
 lightcdc-core = { path = "../lightcdc-core" }
 lightcdc-api = { path = "../lightcdc-api" }
+lightcdc-mysql = { path = "../lightcdc-mysql" }
 lightcdc-postgres = { path = "../lightcdc-postgres" }
 lightcdc-storage = { path = "../lightcdc-storage" }
 serde_json.workspace = true
@@ -23,5 +24,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+mysql_async.workspace = true
 tempfile = "3"
 tokio-postgres.workspace = true
