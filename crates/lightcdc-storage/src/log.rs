@@ -129,6 +129,11 @@ impl RedbEventStore {
         })
     }
 
+    /// Exposes the exact pre-commit boundary for deterministic rollback testing.
+    ///
+    /// Production passes a no-op closure. Tests inject an error after every
+    /// table write is staged but before redb commits, proving that events,
+    /// event IDs, and the source offset roll back together.
     fn persist_transaction_before_commit<F>(
         &self,
         transaction_events: &[ChangeEvent],
