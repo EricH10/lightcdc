@@ -8,7 +8,10 @@ use std::{
 
 use lightcdc_core::{ChangeEvent, Config, Operation, SourceConfig};
 use lightcdc_postgres::ReplicationReader;
-use lightcdc_storage::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore};
+use lightcdc_storage::{
+    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, TransactionBufferError,
+    TransactionBufferOptions, TransactionEvents,
+};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 use tokio_postgres::{Client, NoTls};
@@ -18,6 +21,7 @@ const CRASH_WORKER_ENV: &str = "LIGHTCDC_CRASH_CAPTURE_WORKER";
 const CRASH_CONFIG_ENV: &str = "LIGHTCDC_CRASH_CONFIG";
 const CRASH_STAGE_ENV: &str = "LIGHTCDC_CRASH_STAGE";
 const CRASH_MARKER_ENV: &str = "LIGHTCDC_CRASH_MARKER";
+const LARGE_TRANSACTION_ROWS: usize = 1_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose postgres on localhost:5432"]
@@ -113,14 +117,14 @@ async fn resumes_from_redb_after_persisting_without_acknowledging_postgres() -> 
         .ok_or_else(|| anyhow::anyhow!("replication stream ended before transaction commit"))?;
     let first_ack_lsn = first_transaction.ack_lsn;
     assert_eq!(
-        store.persist_transaction(
+        store.persist_transaction_events(
             &first_transaction.events,
             &fixture.source_name,
             &first_ack_lsn.to_string(),
         )?,
         PersistTransactionOutcome::Persisted
     );
-    let first_events = first_transaction.events;
+    let first_events = first_transaction.events.load()?;
 
     // Deliberately do not call first_reader.ack(first_ack_lsn).
     first_reader.shutdown().await?;
@@ -196,7 +200,7 @@ async fn does_not_emit_or_persist_an_uncommitted_source_transaction() -> anyhow:
     let ack_lsn = transaction.ack_lsn;
     assert_eq!(transaction.events.len(), 1);
     assert_eq!(
-        store.persist_transaction(
+        store.persist_transaction_events(
             &transaction.events,
             &fixture.source_name,
             &ack_lsn.to_string(),
@@ -218,6 +222,336 @@ async fn does_not_emit_or_persist_an_uncommitted_source_transaction() -> anyhow:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose postgres on localhost:5432"]
+async fn captures_a_large_transaction_as_one_atomic_batch() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let store = open_store(temp.path().to_path_buf())?;
+    let buffer_options = test_buffer_options(temp.path(), &fixture.source_name, 1_024, 10_000);
+    let mut reader =
+        ReplicationReader::connect_from_with_buffer(fixture.source.clone(), None, buffer_options)
+            .await?;
+    reader.set_next_sequence(store.next_sequence()?);
+
+    fixture
+        .client
+        .execute(
+            &format!(
+                r#"
+                INSERT INTO public.{table} (customer_email, total_cents)
+                SELECT
+                    'bulk-' || value || '@example.com',
+                    value
+                FROM generate_series(1, {row_count}) AS value
+                "#,
+                table = fixture.table,
+                row_count = LARGE_TRANSACTION_ROWS,
+            ),
+            &[],
+        )
+        .await?;
+
+    let transaction = next_transaction(&mut reader).await?;
+    assert!(transaction.events.is_staged());
+    let TransactionEvents::Staged(staged) = &transaction.events else {
+        unreachable!("staged transaction variant");
+    };
+    let staging_path = staged.path().to_path_buf();
+    assert!(staging_path.exists());
+    let events = transaction.events.load()?;
+    assert_eq!(events.len(), LARGE_TRANSACTION_ROWS);
+    assert_eq!(events.first().map(|event| event.sequence), Some(1));
+    assert_eq!(
+        events.last().map(|event| event.sequence),
+        Some(LARGE_TRANSACTION_ROWS as u64)
+    );
+    let transaction_id = events[0]
+        .transaction
+        .as_ref()
+        .and_then(|metadata| metadata.transaction_id);
+    assert!(transaction_id.is_some());
+    assert!(events.iter().all(|event| {
+        event.operation == Operation::Insert
+            && event
+                .transaction
+                .as_ref()
+                .is_some_and(|metadata| metadata.transaction_id == transaction_id)
+    }));
+
+    let ack_lsn = transaction.ack_lsn;
+    assert_eq!(
+        store.persist_transaction_events(
+            &transaction.events,
+            &fixture.source_name,
+            &ack_lsn.to_string(),
+        )?,
+        PersistTransactionOutcome::Persisted
+    );
+    reader.ack(ack_lsn);
+    reader.shutdown().await?;
+    drop(transaction);
+    assert!(!staging_path.exists());
+
+    assert_eq!(
+        store.replay_from(1, LARGE_TRANSACTION_ROWS + 1)?.len(),
+        LARGE_TRANSACTION_ROWS
+    );
+    assert_eq!(
+        store.source_offset(&fixture.source_name)?,
+        Some(ack_lsn.to_string())
+    );
+
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn hard_transaction_limit_fails_without_persisting_or_acknowledging() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let store = open_store(temp.path().to_path_buf())?;
+    let buffer_options = test_buffer_options(temp.path(), &fixture.source_name, 1, 1);
+    let staging_dir = buffer_options
+        .staging_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("test staging directory is missing"))?;
+    let mut reader =
+        ReplicationReader::connect_from_with_buffer(fixture.source.clone(), None, buffer_options)
+            .await?;
+    reader.set_next_sequence(store.next_sequence()?);
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            r#"
+            BEGIN;
+            INSERT INTO public.{table} (customer_email, total_cents)
+            VALUES ('limit-1@example.com', 1);
+            INSERT INTO public.{table} (customer_email, total_cents)
+            VALUES ('limit-2@example.com', 2);
+            COMMIT;
+            "#,
+            table = fixture.table,
+        ))
+        .await?;
+
+    let error = match timeout(Duration::from_secs(15), reader.next_transaction()).await? {
+        Ok(_) => anyhow::bail!("transaction should exceed the event limit"),
+        Err(error) => error,
+    };
+    assert!(error.is_fatal_capture_error());
+    assert!(matches!(
+        error,
+        lightcdc_postgres::PostgresError::TransactionBuffer(
+            TransactionBufferError::EventLimitExceeded {
+                attempted: 2,
+                maximum: 1
+            }
+        )
+    ));
+    assert!(store.replay_from(1, 10)?.is_empty());
+    assert_eq!(store.source_offset(&fixture.source_name)?, None);
+    reader.shutdown().await?;
+    drop(reader);
+    assert_eq!(staging_file_count(&staging_dir)?, 0);
+
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn captures_primary_key_for_delete_with_default_replica_identity() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER TABLE public.{} REPLICA IDENTITY DEFAULT",
+            fixture.table
+        ))
+        .await?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(1);
+
+    fixture.insert("delete-key@example.com", 8100).await?;
+    let inserted = next_nonempty_transaction(&mut reader).await?;
+    assert_eq!(inserted.events.len(), 1);
+
+    fixture
+        .client
+        .execute(
+            &format!(
+                "DELETE FROM public.{} WHERE customer_email = $1",
+                fixture.table
+            ),
+            &[&"delete-key@example.com"],
+        )
+        .await?;
+    let deleted = next_nonempty_transaction(&mut reader).await?;
+    reader.shutdown().await?;
+    let deleted_events = deleted.events.load()?;
+
+    assert_eq!(deleted_events.len(), 1);
+    assert_eq!(deleted_events[0].operation, Operation::Delete);
+    assert_json_field(deleted_events[0].key.as_deref(), "id", "1")?;
+    assert!(deleted_events[0].before.is_none());
+    assert!(deleted_events[0].after.is_none());
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn marks_an_unchanged_toast_value_without_losing_the_old_value() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER TABLE public.{} ADD COLUMN description TEXT",
+            fixture.table
+        ))
+        .await?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(1);
+
+    fixture
+        .client
+        .execute(
+            &format!(
+                r#"
+                INSERT INTO public.{table} (customer_email, total_cents, description)
+                SELECT
+                    'toast@example.com',
+                    8200,
+                    string_agg(md5(value::text), '')
+                FROM generate_series(1, 2_000) AS value
+                "#,
+                table = fixture.table,
+            ),
+            &[],
+        )
+        .await?;
+    let inserted = next_nonempty_transaction(&mut reader).await?;
+    assert_eq!(inserted.events.len(), 1);
+
+    fixture
+        .client
+        .execute(
+            &format!(
+                "UPDATE public.{} SET status = 'paid' WHERE customer_email = $1",
+                fixture.table
+            ),
+            &[&"toast@example.com"],
+        )
+        .await?;
+    let updated = next_nonempty_transaction(&mut reader).await?;
+    reader.shutdown().await?;
+    let updated_events = updated.events.load()?;
+
+    assert_eq!(updated_events.len(), 1);
+    let before = json_payload(updated_events[0].before.as_deref())?;
+    let after = json_payload(updated_events[0].after.as_deref())?;
+    assert!(
+        before["description"]
+            .as_str()
+            .is_some_and(|description| description.len() > 10_000)
+    );
+    assert_eq!(
+        after["description"],
+        serde_json::json!({ "__unchanged_toast": true })
+    );
+    assert_eq!(after["status"], "paid");
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn emits_a_truncate_event_for_the_affected_table() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(1);
+
+    fixture.insert("truncate@example.com", 8300).await?;
+    let inserted = next_nonempty_transaction(&mut reader).await?;
+    assert_eq!(inserted.events.len(), 1);
+
+    fixture
+        .client
+        .batch_execute(&format!("TRUNCATE TABLE public.{}", fixture.table))
+        .await?;
+    let truncated = next_transaction(&mut reader).await?;
+    reader.shutdown().await?;
+    let truncated_events = truncated.events.load()?;
+
+    assert_eq!(truncated_events.len(), 1);
+    assert_eq!(truncated_events[0].operation, Operation::Truncate);
+    assert_eq!(truncated_events[0].schema, "public");
+    assert_eq!(truncated_events[0].table, fixture.table);
+    assert!(truncated_events[0].key.is_none());
+    assert!(truncated_events[0].before.is_none());
+    assert!(truncated_events[0].after.is_none());
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn refreshes_relation_metadata_after_adding_a_column() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(1);
+
+    fixture.insert("before-schema@example.com", 8400).await?;
+    let before_schema_change = next_nonempty_transaction(&mut reader).await?;
+    assert_eq!(before_schema_change.events.len(), 1);
+    let before_schema_events = before_schema_change.events.load()?;
+    assert!(
+        !json_payload(before_schema_events[0].after.as_deref())?
+            .as_object()
+            .is_some_and(|row| row.contains_key("priority"))
+    );
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER TABLE public.{} ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+            fixture.table
+        ))
+        .await?;
+    fixture
+        .client
+        .execute(
+            &format!(
+                "INSERT INTO public.{} (customer_email, total_cents, priority) VALUES ($1, $2, $3)",
+                fixture.table
+            ),
+            &[&"after-schema@example.com", &8500_i64, &"urgent"],
+        )
+        .await?;
+
+    let after_schema_change = next_nonempty_transaction(&mut reader).await?;
+    reader.shutdown().await?;
+    let after_schema_events = after_schema_change.events.load()?;
+
+    assert_eq!(after_schema_events.len(), 1);
+    assert_json_field(
+        after_schema_events[0].after.as_deref(),
+        "priority",
+        "urgent",
+    )?;
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
 async fn process_kill_before_redb_commit_replays_the_transaction() -> anyhow::Result<()> {
     let fixture = PgFixture::create().await?;
     let temp = TempDir::new()?;
@@ -229,14 +563,21 @@ async fn process_kill_before_redb_commit_replays_the_transaction() -> anyhow::Re
     let mut worker = spawn_crash_worker(&config_path, &marker, "before_persist")?;
     wait_for_path(&marker).await?;
     worker.kill_and_wait()?;
+    let buffer_options = test_buffer_options(temp.path(), &fixture.source_name, 1, 10_000);
+    let staging_dir = buffer_options
+        .staging_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("test staging directory is missing"))?;
+    assert!(staging_file_count(&staging_dir)? > 0);
 
     let store = open_store(temp.path().to_path_buf())?;
     assert!(store.replay_from(1, 10)?.is_empty());
     assert_eq!(store.source_offset(&fixture.source_name)?, None);
 
-    let mut reader = connect_reader(&fixture.source, None).await?;
+    let mut reader = connect_reader(&fixture.source, None, buffer_options).await?;
     reader.set_next_sequence(store.next_sequence()?);
     let events = capture_new_events(&mut reader, &store, &fixture.source_name, 1).await?;
+    assert_eq!(staging_file_count(&staging_dir)?, 0);
     reader.shutdown().await?;
 
     assert_eq!(events.len(), 1);
@@ -268,16 +609,24 @@ async fn process_kill_after_redb_commit_resumes_without_duplicate_events() -> an
     let mut worker = spawn_crash_worker(&config_path, &marker, "after_persist")?;
     wait_for_path(&marker).await?;
     worker.kill_and_wait()?;
+    let buffer_options = test_buffer_options(temp.path(), &fixture.source_name, 1, 10_000);
+    let staging_dir = buffer_options
+        .staging_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("test staging directory is missing"))?;
+    assert!(staging_file_count(&staging_dir)? > 0);
 
     let store = open_store(temp.path().to_path_buf())?;
     let stored_offset = store.source_offset(&fixture.source_name)?;
     assert_eq!(store.replay_from(1, 10)?.len(), 1);
     assert!(stored_offset.is_some());
 
-    let mut reader = connect_reader(&fixture.source, stored_offset.as_deref()).await?;
+    let mut reader =
+        connect_reader(&fixture.source, stored_offset.as_deref(), buffer_options).await?;
     reader.set_next_sequence(store.next_sequence()?);
     fixture.insert("after-restart@example.com", 6200).await?;
     let events = capture_new_events(&mut reader, &store, &fixture.source_name, 1).await?;
+    assert_eq!(staging_file_count(&staging_dir)?, 0);
     reader.shutdown().await?;
 
     assert_eq!(events.len(), 1);
@@ -352,6 +701,42 @@ async fn capture_reconnects_after_postgres_terminates_replication_backend() -> a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_exits_for_a_missing_publication_instead_of_retrying() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    fixture
+        .client
+        .batch_execute(&format!("DROP PUBLICATION {}", fixture.publication))
+        .await?;
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let status = capture.wait_for_exit().await?;
+    assert!(
+        !status.success(),
+        "capture should stop for a missing publication"
+    );
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "internal child process used by process-kill tests"]
 async fn crash_capture_worker() -> anyhow::Result<()> {
     if env::var_os(CRASH_WORKER_ENV).is_none() {
@@ -364,8 +749,13 @@ async fn crash_capture_worker() -> anyhow::Result<()> {
     let config = Config::from_path(config_path)?;
     let store = open_store(PathBuf::from(&config.runtime.data_dir))?;
     let source_offset = store.source_offset(&config.source.name)?;
-    let mut reader =
-        ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref()).await?;
+    let buffer_options = config_buffer_options(&config);
+    let mut reader = ReplicationReader::connect_from_with_buffer(
+        config.source.clone(),
+        source_offset.as_deref(),
+        buffer_options,
+    )
+    .await?;
     reader.set_next_sequence(store.next_sequence()?);
 
     let transaction = timeout(Duration::from_secs(15), reader.next_transaction())
@@ -377,7 +767,7 @@ async fn crash_capture_worker() -> anyhow::Result<()> {
     }
 
     let ack_lsn = transaction.ack_lsn;
-    store.persist_transaction(
+    store.persist_transaction_events(
         &transaction.events,
         &config.source.name,
         &ack_lsn.to_string(),
@@ -405,13 +795,13 @@ async fn capture_new_events(
             };
             let ack_lsn = transaction.ack_lsn;
 
-            match store.persist_transaction(
+            match store.persist_transaction_events(
                 &transaction.events,
                 source_name,
                 &ack_lsn.to_string(),
             )? {
                 PersistTransactionOutcome::Persisted => {
-                    events.extend(transaction.events);
+                    events.extend(transaction.events.load()?);
                 }
                 PersistTransactionOutcome::AlreadyPersisted => {
                     reader.set_next_sequence(store.next_sequence()?);
@@ -426,6 +816,31 @@ async fn capture_new_events(
     .await?
 }
 
+async fn next_transaction(
+    reader: &mut ReplicationReader,
+) -> anyhow::Result<lightcdc_postgres::CapturedTransaction> {
+    timeout(Duration::from_secs(30), reader.next_transaction())
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("replication stream ended before transaction commit"))
+}
+
+async fn next_nonempty_transaction(
+    reader: &mut ReplicationReader,
+) -> anyhow::Result<lightcdc_postgres::CapturedTransaction> {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let transaction = reader
+                .next_transaction()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("replication stream ended before row change"))?;
+            if !transaction.events.is_empty() {
+                return Ok(transaction);
+            }
+        }
+    })
+    .await?
+}
+
 fn open_store(path: PathBuf) -> anyhow::Result<RedbEventStore> {
     Ok(RedbEventStore::open(&LogOpenOptions {
         data_dir: path,
@@ -436,10 +851,17 @@ fn open_store(path: PathBuf) -> anyhow::Result<RedbEventStore> {
 async fn connect_reader(
     source: &SourceConfig,
     source_offset: Option<&str>,
+    buffer_options: TransactionBufferOptions,
 ) -> anyhow::Result<ReplicationReader> {
     timeout(Duration::from_secs(15), async {
         loop {
-            match ReplicationReader::connect_from(source.clone(), source_offset).await {
+            match ReplicationReader::connect_from_with_buffer(
+                source.clone(),
+                source_offset,
+                buffer_options.clone(),
+            )
+            .await
+            {
                 Ok(reader) => return Ok(reader),
                 Err(error) => {
                     eprintln!("waiting for killed replication connection to close: {error}");
@@ -484,6 +906,9 @@ data_dir = {data_dir}
 storage_file = "capture-test.redb"
 channel_capacity = 1024
 shutdown_timeout_ms = 10000
+transaction_memory_threshold_bytes = 1
+max_transaction_bytes = 67108864
+max_transaction_events = 10000
 
 [logging]
 level = "info"
@@ -542,6 +967,48 @@ fn required_env(name: &str) -> anyhow::Result<String> {
     env::var(name).map_err(|_| anyhow::anyhow!("required environment variable {name} is missing"))
 }
 
+fn config_buffer_options(config: &Config) -> TransactionBufferOptions {
+    TransactionBufferOptions::bounded(
+        std::path::Path::new(&config.runtime.data_dir).join("staging"),
+        &config.source.name,
+        config.runtime.transaction_memory_threshold_bytes,
+        config.runtime.max_transaction_bytes,
+        config.runtime.max_transaction_events,
+    )
+}
+
+fn test_buffer_options(
+    data_dir: &std::path::Path,
+    source_name: &str,
+    memory_threshold_bytes: u64,
+    max_transaction_events: usize,
+) -> TransactionBufferOptions {
+    TransactionBufferOptions::bounded(
+        data_dir.join("staging"),
+        source_name,
+        memory_threshold_bytes,
+        64 * 1024 * 1024,
+        max_transaction_events,
+    )
+}
+
+fn staging_file_count(staging_dir: &std::path::Path) -> anyhow::Result<usize> {
+    if !staging_dir.exists() {
+        return Ok(0);
+    }
+
+    Ok(std::fs::read_dir(staging_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("lightcdc-stage")
+        })
+        .count())
+}
+
 struct ChildGuard {
     child: Option<Child>,
 }
@@ -593,10 +1060,14 @@ fn operations(events: &[ChangeEvent]) -> Vec<Operation> {
 }
 
 fn assert_json_field(bytes: Option<&[u8]>, field: &str, expected: &str) -> anyhow::Result<()> {
-    let bytes = bytes.ok_or_else(|| anyhow::anyhow!("missing row payload"))?;
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let value = json_payload(bytes)?;
     assert_eq!(value[field], expected);
     Ok(())
+}
+
+fn json_payload(bytes: Option<&[u8]>) -> anyhow::Result<serde_json::Value> {
+    let bytes = bytes.ok_or_else(|| anyhow::anyhow!("missing row payload"))?;
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 struct PgFixture {

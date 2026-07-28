@@ -10,6 +10,10 @@ operator and should remain stable across restarts.
 - Events are delivered in increasing local sequence order.
 - `Ack N` is cumulative: it means every event from that stream through sequence
   `N` has finished successfully.
+- An acknowledgement is accepted only when `N` is no greater than the highest
+  sequence LightCDC has made available to that stream and consumer.
+- A consumer cannot acknowledge before LightCDC has delivered at least one
+  event to it.
 - A consumer should process one event completely, acknowledge it, and then move
   on. It must not fan events out for out-of-order processing under one consumer
   identity.
@@ -19,6 +23,10 @@ operator and should remain stable across restarts.
   downstream processing should be idempotent.
 - A consumer that intentionally does not need missed events can seek to
   `latest` before subscribing.
+- Delivery history is retained across ordinary reconnects, so a delayed
+  acknowledgement from an earlier connection remains valid. An explicit seek
+  clears that history and requires a new delivery before another
+  acknowledgement.
 
 This deliberately simple model resembles a classic Kafka partition cursor. It
 keeps acknowledgement meaning unambiguous while LightCDC's capture and recovery

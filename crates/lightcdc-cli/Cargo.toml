@@ -17,6 +17,7 @@ lightcdc-core = { path = "../lightcdc-core" }
 lightcdc-api = { path = "../lightcdc-api" }
 lightcdc-postgres = { path = "../lightcdc-postgres" }
 lightcdc-storage = { path = "../lightcdc-storage" }
+hdrhistogram.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

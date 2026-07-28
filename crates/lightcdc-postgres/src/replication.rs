@@ -2,16 +2,20 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use lightcdc_core::{ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata};
+use lightcdc_storage::{
+    TransactionBuffer, TransactionBufferError, TransactionBufferOptions, TransactionEvents,
+};
 use pgwire_replication::{
     client::{ReplicationClient, ReplicationEvent},
     config::{ReplicationConfig, TlsConfig},
+    error::PgWireError,
     lsn::Lsn,
 };
 use thiserror::Error;
 use tokio_postgres::NoTls;
 use tracing::{debug, info};
 
-use crate::decoder::{DecodeError, PgOutputDecoder, PgOutputMessage, RowChange};
+use crate::decoder::{DecodeError, PgOutputDecoder, PgOutputMessage, Relation, RowChange};
 
 const POSTGRES_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 
@@ -22,10 +26,19 @@ pub enum PostgresError {
     Connect(#[from] tokio_postgres::Error),
 
     #[error("replication protocol error: {0}")]
-    Replication(String),
+    Replication(#[from] PgWireError),
+
+    #[error("invalid PostgreSQL source configuration: {0}")]
+    Configuration(String),
+
+    #[error("invalid replication stream state: {0}")]
+    StreamState(String),
 
     #[error("pgoutput decode error: {0}")]
     Decode(#[from] DecodeError),
+
+    #[error("transaction buffering error: {0}")]
+    TransactionBuffer(#[from] TransactionBufferError),
 }
 
 /// Reads PostgreSQL logical replication messages and emits committed transactions.
@@ -36,14 +49,13 @@ pub struct ReplicationReader {
     sequence: u64,
     transaction: Option<TransactionMetadata>,
     commit_timestamp_ms: Option<i64>,
-    pending_events: Vec<ChangeEvent>,
+    pending_events: TransactionBuffer,
 }
 
 /// Bundles the events from one committed transaction with its checkpoint.
-#[derive(Debug, Clone)]
 pub struct CapturedTransaction {
     /// The normalized CDC events to persist atomically.
-    pub events: Vec<ChangeEvent>,
+    pub events: TransactionEvents,
     /// The commit WAL position to acknowledge after durable persistence.
     pub ack_lsn: Lsn,
 }
@@ -59,8 +71,24 @@ impl ReplicationReader {
         source: SourceConfig,
         start_lsn: Option<&str>,
     ) -> Result<Self, PostgresError> {
+        Self::connect_from_with_buffer(
+            source,
+            start_lsn,
+            TransactionBufferOptions::unbounded_in_memory(),
+        )
+        .await
+    }
+
+    /// Connects with bounded transaction memory and file-backed staging options.
+    pub async fn connect_from_with_buffer(
+        source: SourceConfig,
+        start_lsn: Option<&str>,
+        buffer_options: TransactionBufferOptions,
+    ) -> Result<Self, PostgresError> {
         let start_lsn = match start_lsn {
-            Some(lsn) => Lsn::from_str(lsn).map_err(replication_error)?,
+            Some(lsn) => Lsn::from_str(lsn).map_err(|error| {
+                PostgresError::StreamState(format!("invalid durable source LSN {lsn:?}: {error}"))
+            })?,
             None => Lsn::ZERO,
         };
 
@@ -85,9 +113,10 @@ impl ReplicationReader {
             "starting logical replication"
         );
 
-        let client = ReplicationClient::connect(replication_config)
-            .await
-            .map_err(replication_error)?;
+        let client = ReplicationClient::connect(replication_config).await?;
+        // The client starts a background worker, so cleanup waits until recv()
+        // proves that worker acquired the replication stream.
+        let pending_events = TransactionBuffer::new_with_deferred_orphan_cleanup(buffer_options)?;
 
         Ok(Self {
             source,
@@ -96,7 +125,7 @@ impl ReplicationReader {
             sequence: 0,
             transaction: None,
             commit_timestamp_ms: None,
-            pending_events: Vec::new(),
+            pending_events,
         })
     }
 
@@ -108,10 +137,18 @@ impl ReplicationReader {
     /// Waits for the next committed PostgreSQL transaction.
     pub async fn next_transaction(&mut self) -> Result<Option<CapturedTransaction>, PostgresError> {
         loop {
-            let event = match self.client.recv().await.map_err(replication_error)? {
+            let event = match self.client.recv().await? {
                 Some(event) => event,
                 None => return Ok(None),
             };
+            let removed_orphans = self.pending_events.cleanup_orphaned_files()?;
+            if removed_orphans > 0 {
+                info!(
+                    source = %self.source.name,
+                    removed = removed_orphans,
+                    "removed orphaned transaction staging files"
+                );
+            }
 
             match event {
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
@@ -123,7 +160,7 @@ impl ReplicationReader {
                     commit_time_micros,
                 } => {
                     if self.transaction.is_some() || !self.pending_events.is_empty() {
-                        return Err(PostgresError::Replication(
+                        return Err(PostgresError::StreamState(
                             "received transaction begin while another transaction is pending"
                                 .to_owned(),
                         ));
@@ -134,6 +171,7 @@ impl ReplicationReader {
                         begin_lsn: None,
                         commit_lsn: Some(final_lsn.to_string()),
                     });
+                    self.pending_events.begin(xid as u64)?;
                     self.commit_timestamp_ms = Some(pg_time_to_unix_ms(commit_time_micros));
 
                     debug!(
@@ -153,10 +191,19 @@ impl ReplicationReader {
                         commit_timestamp_ms = pg_time_to_unix_ms(commit_time_micros),
                         "received transaction commit"
                     );
+                    let events = self.pending_events.finish()?;
+                    let stats = events.stats();
+                    debug!(
+                        event_count = stats.event_count,
+                        decoded_bytes = stats.decoded_bytes,
+                        staged_bytes = stats.staged_bytes,
+                        staged = events.is_staged(),
+                        "finished decoded source transaction"
+                    );
                     self.transaction = None;
                     self.commit_timestamp_ms = None;
                     return Ok(Some(CapturedTransaction {
-                        events: std::mem::take(&mut self.pending_events),
+                        events,
                         ack_lsn: end_lsn,
                     }));
                 }
@@ -173,18 +220,21 @@ impl ReplicationReader {
                     }
                     PgOutputMessage::Insert(row) => {
                         let event = self.row_change(Operation::Insert, row, wal_start);
-                        self.pending_events.push(event);
+                        self.pending_events.push(event)?;
                     }
                     PgOutputMessage::Update(row) => {
                         let event = self.row_change(Operation::Update, row, wal_start);
-                        self.pending_events.push(event);
+                        self.pending_events.push(event)?;
                     }
                     PgOutputMessage::Delete(row) => {
                         let event = self.row_change(Operation::Delete, row, wal_start);
-                        self.pending_events.push(event);
+                        self.pending_events.push(event)?;
                     }
-                    PgOutputMessage::Truncate(relation_ids) => {
-                        debug!(?relation_ids, "decoded truncate message");
+                    PgOutputMessage::Truncate(relations) => {
+                        for relation in relations {
+                            let event = self.truncate_change(relation, wal_start);
+                            self.pending_events.push(event)?;
+                        }
                     }
                     PgOutputMessage::Ignored => {}
                 },
@@ -206,7 +256,8 @@ impl ReplicationReader {
 
     /// Gracefully closes the replication connection.
     pub async fn shutdown(&mut self) -> Result<(), PostgresError> {
-        self.client.shutdown().await.map_err(replication_error)
+        self.client.shutdown().await?;
+        Ok(())
     }
 
     /// Converts one decoded row change into a normalized captured event.
@@ -234,6 +285,57 @@ impl ReplicationReader {
             commit_timestamp_ms: self.commit_timestamp_ms,
         }
     }
+
+    /// Converts one truncated relation into a normalized captured event.
+    fn truncate_change(&mut self, relation: Relation, wal_start: Lsn) -> ChangeEvent {
+        self.sequence += 1;
+
+        ChangeEvent {
+            sequence: self.sequence,
+            event_id: format!(
+                "postgres:{}:{}:{}:truncate:{}",
+                self.source.database, self.source.slot, wal_start, relation.id
+            ),
+            source: SourceMetadata {
+                database: self.source.database.clone(),
+                slot: self.source.slot.clone(),
+                lsn: wal_start.to_string(),
+            },
+            transaction: self.transaction.clone(),
+            schema: relation.namespace,
+            table: relation.name,
+            operation: Operation::Truncate,
+            key: None,
+            before: None,
+            after: None,
+            commit_timestamp_ms: self.commit_timestamp_ms,
+        }
+    }
+}
+
+impl PostgresError {
+    /// Returns true when retrying later may succeed without operator changes.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Connect(error) => error
+                .code()
+                .is_none_or(|code| is_retryable_sqlstate(code.code())),
+            Self::Replication(error) if error.is_transient() => true,
+            Self::Replication(PgWireError::Server(message)) => {
+                replication_server_sqlstate(message).is_some_and(is_retryable_sqlstate)
+            }
+            Self::Configuration(_)
+            | Self::StreamState(_)
+            | Self::Replication(_)
+            | Self::Decode(_)
+            | Self::TransactionBuffer(_) => false,
+        }
+    }
+
+    /// Returns true when capture must stop for operator intervention.
+    pub fn is_fatal_capture_error(&self) -> bool {
+        !self.is_retryable()
+    }
 }
 
 /// Checks that PostgreSQL accepts a normal connection for the configured source.
@@ -248,7 +350,16 @@ pub async fn validate_source_config(config: &SourceConfig) -> Result<(), Postgre
 
     let row = client
         .query_one(
-            "SELECT current_setting('wal_level'), current_database(), current_user",
+            r#"
+            SELECT
+                current_setting('wal_level'),
+                current_database(),
+                current_user,
+                role.rolsuper,
+                role.rolreplication
+            FROM pg_roles AS role
+            WHERE role.rolname = current_user
+            "#,
             &[],
         )
         .await?;
@@ -256,11 +367,79 @@ pub async fn validate_source_config(config: &SourceConfig) -> Result<(), Postgre
     let wal_level: String = row.get(0);
     let database: String = row.get(1);
     let user: String = row.get(2);
+    let is_superuser: bool = row.get(3);
+    let can_replicate: bool = row.get(4);
+
+    if wal_level != "logical" {
+        return Err(PostgresError::Configuration(format!(
+            "wal_level is {wal_level:?}; expected \"logical\""
+        )));
+    }
+    if !is_superuser && !can_replicate {
+        return Err(PostgresError::Configuration(format!(
+            "role {user:?} does not have PostgreSQL REPLICATION privilege"
+        )));
+    }
+
+    let publication_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+            &[&config.publication],
+        )
+        .await?
+        .get(0);
+    if !publication_exists {
+        return Err(PostgresError::Configuration(format!(
+            "publication {:?} does not exist",
+            config.publication
+        )));
+    }
+
+    let slot = client
+        .query_opt(
+            r#"
+            SELECT slot_type, plugin, database
+            FROM pg_replication_slots
+            WHERE slot_name = $1
+            "#,
+            &[&config.slot],
+        )
+        .await?
+        .ok_or_else(|| {
+            PostgresError::Configuration(format!(
+                "replication slot {:?} does not exist",
+                config.slot
+            ))
+        })?;
+    let slot_type: String = slot.get(0);
+    let plugin: Option<String> = slot.get(1);
+    let slot_database: Option<String> = slot.get(2);
+
+    if slot_type != "logical" {
+        return Err(PostgresError::Configuration(format!(
+            "replication slot {:?} has type {slot_type:?}; expected \"logical\"",
+            config.slot
+        )));
+    }
+    if plugin.as_deref() != Some("pgoutput") {
+        return Err(PostgresError::Configuration(format!(
+            "replication slot {:?} uses plugin {plugin:?}; expected \"pgoutput\"",
+            config.slot
+        )));
+    }
+    if slot_database.as_deref() != Some(config.database.as_str()) {
+        return Err(PostgresError::Configuration(format!(
+            "replication slot {:?} belongs to database {slot_database:?}; expected {:?}",
+            config.slot, config.database
+        )));
+    }
 
     info!(
         wal_level,
         database,
         user,
+        is_superuser,
+        can_replicate,
         publication = %config.publication,
         slot = %config.slot,
         "validated PostgreSQL source config"
@@ -273,6 +452,85 @@ fn pg_time_to_unix_ms(pg_micros: i64) -> i64 {
     POSTGRES_EPOCH_UNIX_MS + (pg_micros / 1_000)
 }
 
-fn replication_error(error: impl ToString) -> PostgresError {
-    PostgresError::Replication(error.to_string())
+fn is_retryable_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        || matches!(code, "55006" | "57P01" | "57P02" | "57P03")
+}
+
+fn replication_server_sqlstate(message: &str) -> Option<&str> {
+    let sqlstate = message.rsplit_once("(SQLSTATE ")?.1.strip_suffix(')')?;
+    (sqlstate.len() == 5).then_some(sqlstate)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use pgwire_replication::error::PgWireError;
+
+    use super::{PostgresError, is_retryable_sqlstate, replication_server_sqlstate};
+
+    #[test]
+    fn retries_transient_replication_failures() {
+        let io_error = PgWireError::from(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+
+        assert!(PostgresError::Replication(io_error).is_retryable());
+        assert!(
+            PostgresError::Replication(PgWireError::Task("worker stopped".to_owned()))
+                .is_retryable()
+        );
+        assert!(
+            PostgresError::Replication(PgWireError::Server(
+                "replication slot is active (SQLSTATE 55006)".to_owned()
+            ))
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn stops_for_configuration_and_protocol_failures() {
+        assert!(!PostgresError::Configuration("publication is missing".to_owned()).is_retryable());
+        assert!(
+            !PostgresError::Replication(PgWireError::Auth("bad password".to_owned()))
+                .is_retryable()
+        );
+        assert!(
+            !PostgresError::Replication(PgWireError::Protocol("bad frame".to_owned()))
+                .is_retryable()
+        );
+        assert!(
+            !PostgresError::Replication(PgWireError::Server(
+                "publication does not exist (SQLSTATE 42704)".to_owned()
+            ))
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn classifies_retryable_postgres_sqlstates() {
+        assert!(is_retryable_sqlstate("08006"));
+        assert!(is_retryable_sqlstate("53300"));
+        assert!(is_retryable_sqlstate("57P03"));
+        assert!(is_retryable_sqlstate("55006"));
+        assert!(!is_retryable_sqlstate("28P01"));
+        assert!(!is_retryable_sqlstate("3D000"));
+        assert!(!is_retryable_sqlstate("42704"));
+    }
+
+    #[test]
+    fn extracts_pgwire_server_sqlstate() {
+        assert_eq!(
+            replication_server_sqlstate("object in use (SQLSTATE 55006)"),
+            Some("55006")
+        );
+        assert_eq!(replication_server_sqlstate("missing code"), None);
+        assert_eq!(
+            replication_server_sqlstate("malformed (SQLSTATE 123)"),
+            None
+        );
+    }
 }

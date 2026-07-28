@@ -1,0 +1,303 @@
+use std::{
+    fs::{self, File},
+    io::{self, BufWriter, Write},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use hdrhistogram::Histogram;
+use serde_json::json;
+
+const SAMPLE_CHANNEL_CAPACITY: usize = 8_192;
+
+/// Sends transaction-level capture samples to a dedicated aggregation thread.
+pub struct CaptureMetrics {
+    sender: Option<SyncSender<CaptureSample>>,
+    dropped_samples: Arc<AtomicU64>,
+    worker: Option<JoinHandle<io::Result<()>>>,
+}
+
+#[derive(Debug)]
+enum CaptureSample {
+    Persisted {
+        event_count: u64,
+        decoded_bytes: u64,
+        staged_bytes: u64,
+        persist_latency_ns: u64,
+        staged: bool,
+    },
+    Reconnect,
+}
+
+#[derive(Default)]
+struct Totals {
+    transactions: u64,
+    events: u64,
+    decoded_bytes: u64,
+    staged_bytes: u64,
+    staged_transactions: u64,
+    reconnects: u64,
+}
+
+#[derive(Default)]
+struct IntervalTotals {
+    transactions: u64,
+    events: u64,
+    decoded_bytes: u64,
+    staged_bytes: u64,
+}
+
+impl CaptureMetrics {
+    /// Starts an opt-in metrics writer. No metrics object exists in normal runs.
+    pub fn start(path: &Path, report_interval: Duration) -> io::Result<Self> {
+        if report_interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capture metrics interval must be greater than zero",
+            ));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = File::create(path)?;
+        let (sender, receiver) = sync_channel(SAMPLE_CHANNEL_CAPACITY);
+        let dropped_samples = Arc::new(AtomicU64::new(0));
+        let worker_dropped_samples = Arc::clone(&dropped_samples);
+        let worker = thread::Builder::new()
+            .name("lightcdc-capture-metrics".to_owned())
+            .spawn(move || {
+                aggregate_metrics(receiver, file, report_interval, worker_dropped_samples)
+            })?;
+
+        Ok(Self {
+            sender: Some(sender),
+            dropped_samples,
+            worker: Some(worker),
+        })
+    }
+
+    /// Records one durable source transaction without blocking capture.
+    pub fn record_persisted(
+        &self,
+        event_count: usize,
+        decoded_bytes: u64,
+        staged_bytes: u64,
+        persist_latency: Duration,
+        staged: bool,
+    ) {
+        self.try_send(CaptureSample::Persisted {
+            event_count: event_count as u64,
+            decoded_bytes,
+            staged_bytes,
+            persist_latency_ns: duration_ns(persist_latency),
+            staged,
+        });
+    }
+
+    /// Records one retryable capture disconnection.
+    pub fn record_reconnect(&self) {
+        self.try_send(CaptureSample::Reconnect);
+    }
+
+    fn try_send(&self, sample: CaptureSample) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        if matches!(
+            sender.try_send(sample),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+        ) {
+            self.dropped_samples.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for CaptureMetrics {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("capture metrics writer failed: {error}"),
+                Err(_) => eprintln!("capture metrics writer panicked"),
+            }
+        }
+    }
+}
+
+fn aggregate_metrics(
+    receiver: Receiver<CaptureSample>,
+    file: File,
+    report_interval: Duration,
+    dropped_samples: Arc<AtomicU64>,
+) -> io::Result<()> {
+    let mut writer = BufWriter::new(file);
+    let started = Instant::now();
+    let mut last_report = started;
+    let mut next_report = started + report_interval;
+    let mut totals = Totals::default();
+    let mut interval = IntervalTotals::default();
+    let mut persist_latency = Histogram::<u64>::new(3).map_err(io::Error::other)?;
+
+    loop {
+        let now = Instant::now();
+        let wait = next_report.saturating_duration_since(now);
+        match receiver.recv_timeout(wait) {
+            Ok(sample) => record_sample(sample, &mut totals, &mut interval, &mut persist_latency),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if interval.transactions > 0 || totals.reconnects > 0 {
+                    write_report(
+                        &mut writer,
+                        started,
+                        last_report,
+                        &totals,
+                        &interval,
+                        &persist_latency,
+                        dropped_samples.load(Ordering::Relaxed),
+                    )?;
+                }
+                return writer.flush();
+            }
+        }
+
+        let now = Instant::now();
+        if now >= next_report {
+            write_report(
+                &mut writer,
+                started,
+                last_report,
+                &totals,
+                &interval,
+                &persist_latency,
+                dropped_samples.load(Ordering::Relaxed),
+            )?;
+            interval = IntervalTotals::default();
+            persist_latency.reset();
+            last_report = now;
+            next_report = now + report_interval;
+        }
+    }
+}
+
+fn record_sample(
+    sample: CaptureSample,
+    totals: &mut Totals,
+    interval: &mut IntervalTotals,
+    persist_latency: &mut Histogram<u64>,
+) {
+    match sample {
+        CaptureSample::Persisted {
+            event_count,
+            decoded_bytes,
+            staged_bytes,
+            persist_latency_ns,
+            staged,
+        } => {
+            totals.transactions += 1;
+            totals.events += event_count;
+            totals.decoded_bytes += decoded_bytes;
+            totals.staged_bytes += staged_bytes;
+            totals.staged_transactions += u64::from(staged);
+            interval.transactions += 1;
+            interval.events += event_count;
+            interval.decoded_bytes += decoded_bytes;
+            interval.staged_bytes += staged_bytes;
+            let _ = persist_latency.record(persist_latency_ns.max(1));
+        }
+        CaptureSample::Reconnect => totals.reconnects += 1,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_report(
+    writer: &mut BufWriter<File>,
+    started: Instant,
+    last_report: Instant,
+    totals: &Totals,
+    interval: &IntervalTotals,
+    persist_latency: &Histogram<u64>,
+    dropped_samples: u64,
+) -> io::Result<()> {
+    let now = Instant::now();
+    let interval_seconds = now.duration_since(last_report).as_secs_f64().max(0.000_001);
+    let latency_ms = |quantile| persist_latency.value_at_quantile(quantile) as f64 / 1_000_000.0;
+    let report = json!({
+        "timestamp_ms": unix_timestamp_ms(),
+        "elapsed_seconds": now.duration_since(started).as_secs_f64(),
+        "interval_seconds": interval_seconds,
+        "events_per_second": interval.events as f64 / interval_seconds,
+        "transactions_per_second": interval.transactions as f64 / interval_seconds,
+        "decoded_bytes_per_second": interval.decoded_bytes as f64 / interval_seconds,
+        "staged_bytes_per_second": interval.staged_bytes as f64 / interval_seconds,
+        "events_total": totals.events,
+        "transactions_total": totals.transactions,
+        "decoded_bytes_total": totals.decoded_bytes,
+        "staged_bytes_total": totals.staged_bytes,
+        "staged_transactions_total": totals.staged_transactions,
+        "reconnects_total": totals.reconnects,
+        "dropped_samples_total": dropped_samples,
+        "persist_latency_ms": {
+            "p50": latency_ms(0.50),
+            "p95": latency_ms(0.95),
+            "p99": latency_ms(0.99),
+            "max": persist_latency.max() as f64 / 1_000_000.0,
+        }
+    });
+
+    serde_json::to_writer(&mut *writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, thread};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn writes_transaction_metrics_as_json_lines() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("capture.jsonl");
+        {
+            let metrics = CaptureMetrics::start(&path, Duration::from_millis(10)).expect("metrics");
+            metrics.record_persisted(25, 1_000, 1_500, Duration::from_millis(2), true);
+            metrics.record_reconnect();
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let reports = fs::read_to_string(path).expect("metrics output");
+        let report: serde_json::Value =
+            serde_json::from_str(reports.lines().next().expect("report line"))
+                .expect("JSON report");
+        assert_eq!(report["events_total"], 25);
+        assert_eq!(report["transactions_total"], 1);
+        assert_eq!(report["staged_transactions_total"], 1);
+        assert_eq!(report["reconnects_total"], 1);
+        assert_eq!(report["dropped_samples_total"], 0);
+    }
+}

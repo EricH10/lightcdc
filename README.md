@@ -39,6 +39,20 @@ For a bounded local smoke test:
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml --max-events 3
 ```
 
+Transaction buffering is bounded by three `[runtime]` settings:
+
+```toml
+transaction_memory_threshold_bytes = 16777216
+max_transaction_bytes = 1073741824
+max_transaction_events = 1000000
+```
+
+Transactions stay in memory through the threshold, then spill to
+`data_dir/staging/<source>/`. The staged file is scratch space: redb stores the
+committed transaction and source LSN atomically, PostgreSQL is acknowledged only
+after that commit, and source-scoped leftovers from an abrupt exit are removed
+after the replacement capture acquires the replication slot.
+
 Run capture and the gRPC API together:
 
 ```bash
@@ -105,6 +119,19 @@ docker compose up -d postgres
 cargo test -p lightcdc-cli --test capture_integration -- --ignored --test-threads=1
 ```
 
+Run a short end-to-end load test:
+
+```bash
+docker compose up -d postgres
+DURATION_SECONDS=10 CLIENTS=4 THREADS=2 bench/run-local.sh
+```
+
+The harness uses release binaries, disables per-event output, drives PostgreSQL
+with a parameterized `pgbench` workload, and records capture, redb, gRPC,
+acknowledgement, WAL, CPU, memory, and disk measurements. See
+[`bench/README.md`](bench/README.md) for fixed-rate limit discovery, environment
+guidance, and the instrumentation overhead policy.
+
 ## Current Scope
 
 Implemented basics:
@@ -116,10 +143,13 @@ Implemented basics:
 - redb-backed local event store scaffold
 - Logical replication stream connection
 - Combined capture plus gRPC serving command
-- Basic `pgoutput` relation, insert, update, and delete decoding
+- `pgoutput` relation, insert, update, delete, and truncate decoding
 - Source offset persistence and idempotent duplicate replay handling
-- Docker-backed integration tests for capture, abrupt process recovery, and
-  PostgreSQL reconnect
+- Bounded transaction accounting with disk-backed spill staging and crash cleanup
+- Opt-in transaction-level capture metrics and an end-to-end load-test harness
+- Docker-backed integration tests for capture, abrupt process recovery,
+  PostgreSQL reconnect, large transactions, delete identities, TOAST values,
+  truncates, and relation refresh after schema changes
 - Config-defined streams
 - Stream-filtered replay
 - gRPC `Subscribe`, `Ack`, and `Seek`
@@ -130,6 +160,6 @@ Implemented basics:
 Not implemented yet:
 
 - Complete `pgoutput` coverage
-- Durable recovery policy tests
+- Durable event-format versioning and migrations
 - WASM transform runtime
 - Webhook destinations

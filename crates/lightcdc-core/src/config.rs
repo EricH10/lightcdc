@@ -35,6 +35,12 @@ pub struct RuntimeConfig {
     pub storage_file: String,
     pub channel_capacity: usize,
     pub shutdown_timeout_ms: u64,
+    #[serde(default = "default_transaction_memory_threshold_bytes")]
+    pub transaction_memory_threshold_bytes: u64,
+    #[serde(default = "default_max_transaction_bytes")]
+    pub max_transaction_bytes: u64,
+    #[serde(default = "default_max_transaction_events")]
+    pub max_transaction_events: usize,
 }
 
 /// Describes process logging settings.
@@ -132,11 +138,56 @@ fn default_stream_tables() -> Vec<String> {
     vec!["*".to_owned()]
 }
 
+fn default_transaction_memory_threshold_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_max_transaction_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_max_transaction_events() -> usize {
+    1_000_000
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Operation, SourceMetadata};
 
     use super::StreamConfig;
+
+    #[test]
+    fn transaction_limits_have_bounded_defaults() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [source]
+            host = "localhost"
+            port = 5432
+            database = "lightcdc"
+            user = "lightcdc"
+            password = "secret"
+            publication = "publication"
+            slot = "slot"
+
+            [runtime]
+            data_dir = "data"
+            storage_file = "events.redb"
+            channel_capacity = 32
+            shutdown_timeout_ms = 1000
+
+            [logging]
+            level = "info"
+            "#,
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.runtime.transaction_memory_threshold_bytes,
+            16 * 1024 * 1024
+        );
+        assert_eq!(config.runtime.max_transaction_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.runtime.max_transaction_events, 1_000_000);
+    }
 
     #[test]
     fn stream_matches_exact_qualified_table() {

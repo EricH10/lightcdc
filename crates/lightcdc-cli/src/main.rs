@@ -1,16 +1,22 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use lightcdc_core::{ChangeEvent, Config, Operation, StreamConfig};
 use lightcdc_postgres::ReplicationReader;
-use lightcdc_storage::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore};
+use lightcdc_storage::{
+    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, TransactionBufferOptions,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+use crate::capture_metrics::CaptureMetrics;
+
+mod capture_metrics;
 
 const RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
@@ -33,6 +39,15 @@ enum Command {
 
         #[arg(long)]
         max_events: Option<usize>,
+
+        #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
+        output: CaptureOutput,
+
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 1)]
+        metrics_interval_seconds: u64,
     },
 
     Run {
@@ -44,6 +59,15 @@ enum Command {
 
         #[arg(long)]
         max_events: Option<usize>,
+
+        #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
+        output: CaptureOutput,
+
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 1)]
+        metrics_interval_seconds: u64,
     },
 
     Replay {
@@ -83,18 +107,65 @@ enum Command {
     },
 }
 
+/// Controls whether capture writes each durable event to standard output.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CaptureOutput {
+    Json,
+    None,
+}
+
+/// Holds optional capture behavior used by bounded runs and benchmarks.
+struct CaptureOptions {
+    max_events: Option<usize>,
+    output: CaptureOutput,
+    metrics_file: Option<PathBuf>,
+    metrics_interval: Duration,
+}
+
 /// Parses CLI arguments and dispatches to the requested command.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Capture { config, max_events } => capture(config, max_events).await,
+        Command::Capture {
+            config,
+            max_events,
+            output,
+            metrics_file,
+            metrics_interval_seconds,
+        } => {
+            capture(
+                config,
+                CaptureOptions {
+                    max_events,
+                    output,
+                    metrics_file,
+                    metrics_interval: Duration::from_secs(metrics_interval_seconds),
+                },
+            )
+            .await
+        }
         Command::Run {
             config,
             addr,
             max_events,
-        } => run(config, addr, max_events).await,
+            output,
+            metrics_file,
+            metrics_interval_seconds,
+        } => {
+            run(
+                config,
+                addr,
+                CaptureOptions {
+                    max_events,
+                    output,
+                    metrics_file,
+                    metrics_interval: Duration::from_secs(metrics_interval_seconds),
+                },
+            )
+            .await
+        }
         Command::Replay {
             config,
             stream,
@@ -112,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Runs capture only and writes changes into the local event store.
-async fn capture(config_path: PathBuf, max_events: Option<usize>) -> anyhow::Result<()> {
+async fn capture(config_path: PathBuf, options: CaptureOptions) -> anyhow::Result<()> {
     let config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
 
@@ -125,14 +196,14 @@ async fn capture(config_path: PathBuf, max_events: Option<usize>) -> anyhow::Res
     );
 
     let store = open_event_store(&config)?;
-    capture_with_store(config, store, max_events).await
+    capture_with_store(config, store, options).await
 }
 
 /// Runs capture and the gRPC server in one process sharing one event store.
 async fn run(
     config_path: PathBuf,
     addr: SocketAddr,
-    max_events: Option<usize>,
+    options: CaptureOptions,
 ) -> anyhow::Result<()> {
     let config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
@@ -151,7 +222,7 @@ async fn run(
     let server_store = store.clone();
     let mut server =
         tokio::spawn(async move { lightcdc_api::serve(addr, server_config, server_store).await });
-    let capture = capture_with_store(config, store, max_events);
+    let capture = capture_with_store(config, store, options);
     tokio::pin!(capture);
 
     tokio::select! {
@@ -179,19 +250,37 @@ async fn run(
 async fn capture_with_store(
     config: Config,
     store: RedbEventStore,
-    max_events: Option<usize>,
+    options: CaptureOptions,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
     let source_name = config.source.name.clone();
+    let transaction_buffer_options = TransactionBufferOptions::bounded(
+        storage.data_dir.join("staging"),
+        &source_name,
+        config.runtime.transaction_memory_threshold_bytes,
+        config.runtime.max_transaction_bytes,
+        config.runtime.max_transaction_events,
+    );
+    let metrics = options
+        .metrics_file
+        .as_deref()
+        .map(|path| CaptureMetrics::start(path, options.metrics_interval))
+        .transpose()
+        .context("failed to start capture metrics writer")?;
 
     info!(
         data_dir = %storage.data_dir.display(),
         database_file = %storage.database_file,
+        transaction_memory_threshold_bytes = config.runtime.transaction_memory_threshold_bytes,
+        max_transaction_bytes = config.runtime.max_transaction_bytes,
+        max_transaction_events = config.runtime.max_transaction_events,
+        event_output = ?options.output,
+        metrics_file = ?options.metrics_file,
         "opened local event store"
     );
 
     warn!(
-        max_events = ?max_events,
+        max_events = ?options.max_events,
         "capture is running; insert, update, or delete rows in the published tables"
     );
 
@@ -201,18 +290,27 @@ async fn capture_with_store(
     let mut reconnect_count = 0u64;
 
     loop {
-        if max_events.is_some_and(|max| captured >= max) {
+        if options.max_events.is_some_and(|max| captured >= max) {
             return Ok(());
         }
 
         if !source_validated {
-            if let Err(error) = lightcdc_postgres::validate_source_config(&config.source).await {
-                wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
-                retry_attempt = retry_attempt.saturating_add(1);
-                reconnect_count = reconnect_count.saturating_add(1);
-                continue;
+            match lightcdc_postgres::validate_source_config(&config.source).await {
+                Ok(()) => source_validated = true,
+                Err(error) if error.is_retryable() => {
+                    if let Some(metrics) = &metrics {
+                        metrics.record_reconnect();
+                    }
+                    wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    reconnect_count = reconnect_count.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .context("PostgreSQL source configuration requires operator action");
+                }
             }
-            source_validated = true;
         }
 
         let next_sequence = store
@@ -222,18 +320,27 @@ async fn capture_with_store(
             .source_offset(&source_name)
             .context("failed to read source offset from redb")?;
 
-        let mut reader =
-            match ReplicationReader::connect_from(config.source.clone(), source_offset.as_deref())
-                .await
-            {
-                Ok(reader) => reader,
-                Err(error) => {
-                    wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
-                    retry_attempt = retry_attempt.saturating_add(1);
-                    reconnect_count = reconnect_count.saturating_add(1);
-                    continue;
+        let mut reader = match ReplicationReader::connect_from_with_buffer(
+            config.source.clone(),
+            source_offset.as_deref(),
+            transaction_buffer_options.clone(),
+        )
+        .await
+        {
+            Ok(reader) => reader,
+            Err(error) if error.is_fatal_capture_error() => {
+                return Err(error).context("failed to initialize transaction buffering");
+            }
+            Err(error) => {
+                if let Some(metrics) = &metrics {
+                    metrics.record_reconnect();
                 }
-            };
+                wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
+                retry_attempt = retry_attempt.saturating_add(1);
+                reconnect_count = reconnect_count.saturating_add(1);
+                continue;
+            }
+        };
 
         reader.set_next_sequence(next_sequence);
         retry_attempt = 0;
@@ -245,7 +352,7 @@ async fn capture_with_store(
         );
 
         let disconnect_reason = loop {
-            if max_events.is_some_and(|max| captured >= max) {
+            if options.max_events.is_some_and(|max| captured >= max) {
                 reader.shutdown().await?;
                 return Ok(());
             }
@@ -253,23 +360,54 @@ async fn capture_with_store(
             let transaction = match reader.next_transaction().await {
                 Ok(Some(transaction)) => transaction,
                 Ok(None) => break "replication stream ended".to_owned(),
+                Err(error) if error.is_fatal_capture_error() => {
+                    if let Err(shutdown_error) = reader.shutdown().await {
+                        warn!(%shutdown_error, "failed to close PostgreSQL capture after transaction buffer failure");
+                    }
+                    return Err(error)
+                        .context("capture stopped without acknowledging the source transaction");
+                }
                 Err(error) => break error.to_string(),
             };
             let ack_lsn = transaction.ack_lsn;
+            let transaction_stats = transaction.events.stats();
+            let transaction_was_staged = transaction.events.is_staged();
+            let persist_started = metrics.as_ref().map(|_| Instant::now());
 
-            match store
-                .persist_transaction(&transaction.events, &source_name, &ack_lsn.to_string())
-                .context("failed to persist captured transaction to redb")?
-            {
+            let persist_outcome = store
+                .persist_transaction_events(&transaction.events, &source_name, &ack_lsn.to_string())
+                .context("failed to persist captured transaction to redb")?;
+            let persist_latency = persist_started.map(|started| started.elapsed());
+
+            match persist_outcome {
                 PersistTransactionOutcome::Persisted => {
-                    for event in &transaction.events {
-                        println!("{}", event_to_json(event, false)?);
+                    if let (Some(metrics), Some(persist_latency)) = (&metrics, persist_latency) {
+                        metrics.record_persisted(
+                            transaction_stats.event_count,
+                            transaction_stats.decoded_bytes,
+                            transaction_stats.staged_bytes,
+                            persist_latency,
+                            transaction_was_staged,
+                        );
                     }
-                    captured += transaction.events.len();
+                    if matches!(options.output, CaptureOutput::Json) {
+                        for event in transaction
+                            .events
+                            .iter()
+                            .context("failed to open captured transaction events")?
+                        {
+                            let event =
+                                event.context("failed to read captured transaction event")?;
+                            println!("{}", event_to_json(&event, false)?);
+                        }
+                    }
+                    captured += transaction_stats.event_count;
                 }
                 PersistTransactionOutcome::AlreadyPersisted => {
                     warn!(
-                        event_count = transaction.events.len(),
+                        event_count = transaction_stats.event_count,
+                        decoded_bytes = transaction_stats.decoded_bytes,
+                        staged_bytes = transaction_stats.staged_bytes,
                         %ack_lsn,
                         "skipping replayed transaction already present in redb"
                     );
@@ -288,6 +426,9 @@ async fn capture_with_store(
             warn!(%error, "failed to close disconnected PostgreSQL capture session");
         }
 
+        if let Some(metrics) = &metrics {
+            metrics.record_reconnect();
+        }
         let delay = reconnect_delay(retry_attempt);
         warn!(
             reason = %disconnect_reason,

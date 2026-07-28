@@ -8,6 +8,8 @@ use lightcdc_core::ChangeEvent;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use thiserror::Error;
 
+use crate::{TransactionBufferError, TransactionEvents};
+
 const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
 const EVENT_IDS: TableDefinition<&str, u64> = TableDefinition::new("event_ids");
 const SOURCE_OFFSETS: TableDefinition<&str, &str> = TableDefinition::new("source_offsets");
@@ -129,6 +131,25 @@ impl RedbEventStore {
         })
     }
 
+    /// Atomically persists an in-memory or staged source transaction and its LSN.
+    pub fn persist_transaction_events(
+        &self,
+        transaction_events: &TransactionEvents,
+        source_name: &str,
+        source_lsn: &str,
+    ) -> Result<PersistTransactionOutcome, StorageError> {
+        let events = transaction_events
+            .iter()?
+            .map(|event| event.map_err(StorageError::from));
+        self.persist_transaction_iter(
+            transaction_events.len(),
+            events,
+            source_name,
+            source_lsn,
+            || Ok(()),
+        )
+    }
+
     /// Exposes the exact pre-commit boundary for deterministic rollback testing.
     ///
     /// Production passes a no-op closure. Tests inject an error after every
@@ -144,10 +165,27 @@ impl RedbEventStore {
     where
         F: FnOnce() -> Result<(), StorageError>,
     {
-        let payloads = transaction_events
-            .iter()
-            .map(serde_json::to_vec)
-            .collect::<Result<Vec<_>, _>>()?;
+        self.persist_transaction_iter(
+            transaction_events.len(),
+            transaction_events.iter().cloned().map(Ok),
+            source_name,
+            source_lsn,
+            before_commit,
+        )
+    }
+
+    fn persist_transaction_iter<I, F>(
+        &self,
+        event_count: usize,
+        transaction_events: I,
+        source_name: &str,
+        source_lsn: &str,
+        before_commit: F,
+    ) -> Result<PersistTransactionOutcome, StorageError>
+    where
+        I: IntoIterator<Item = Result<ChangeEvent, StorageError>>,
+        F: FnOnce() -> Result<(), StorageError>,
+    {
         let write = self.db.begin_write().map_err(redb_error)?;
 
         let outcome = {
@@ -155,43 +193,51 @@ impl RedbEventStore {
             let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
             let mut source_offsets = write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
             let mut duplicate_count = 0;
+            let mut new_count = 0;
 
             for event in transaction_events {
+                let event = event?;
                 if event_ids
                     .get(event.event_id.as_str())
                     .map_err(redb_error)?
                     .is_some()
                 {
                     duplicate_count += 1;
+                    if new_count > 0 {
+                        return Err(StorageError::PartiallyPersistedTransaction {
+                            duplicate_count,
+                            event_count,
+                        });
+                    }
                     continue;
+                }
+
+                if duplicate_count > 0 {
+                    return Err(StorageError::PartiallyPersistedTransaction {
+                        duplicate_count,
+                        event_count,
+                    });
                 }
 
                 if events.get(event.sequence).map_err(redb_error)?.is_some() {
                     return Err(StorageError::DuplicateSequence(event.sequence));
                 }
+
+                let payload = serde_json::to_vec(&event)?;
+                events
+                    .insert(event.sequence, payload.as_slice())
+                    .map_err(redb_error)?;
+                event_ids
+                    .insert(event.event_id.as_str(), event.sequence)
+                    .map_err(redb_error)?;
+                new_count += 1;
             }
 
-            if duplicate_count > 0 && duplicate_count != transaction_events.len() {
-                return Err(StorageError::PartiallyPersistedTransaction {
-                    duplicate_count,
-                    event_count: transaction_events.len(),
-                });
-            }
-
-            let outcome =
-                if duplicate_count == transaction_events.len() && !transaction_events.is_empty() {
-                    PersistTransactionOutcome::AlreadyPersisted
-                } else {
-                    for (event, payload) in transaction_events.iter().zip(&payloads) {
-                        events
-                            .insert(event.sequence, payload.as_slice())
-                            .map_err(redb_error)?;
-                        event_ids
-                            .insert(event.event_id.as_str(), event.sequence)
-                            .map_err(redb_error)?;
-                    }
-                    PersistTransactionOutcome::Persisted
-                };
+            let outcome = if duplicate_count == event_count && event_count > 0 {
+                PersistTransactionOutcome::AlreadyPersisted
+            } else {
+                PersistTransactionOutcome::Persisted
+            };
 
             source_offsets
                 .insert(source_name, source_lsn)
@@ -415,6 +461,9 @@ pub enum StorageError {
     #[error("event serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("transaction buffer error: {0}")]
+    TransactionBuffer(#[from] TransactionBufferError),
+
     #[error("duplicate event id: {0}")]
     DuplicateEventId(String),
 
@@ -454,6 +503,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore, StorageError};
+    use crate::{TransactionBuffer, TransactionBufferOptions, TransactionEvents};
 
     #[test]
     fn replay_from_returns_events_in_sequence_order() {
@@ -628,6 +678,44 @@ mod tests {
             store.source_offset("default").expect("source offset"),
             Some("0/3".to_owned())
         );
+    }
+
+    #[test]
+    fn staged_transaction_is_streamed_into_one_atomic_redb_commit() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        let options = TransactionBufferOptions::bounded(temp.path(), "default", 1, 1_000_000, 10);
+        let mut buffer = TransactionBuffer::new(options).expect("transaction buffer");
+        buffer.begin(42).expect("begin transaction");
+        buffer.push(event(1, "0/1")).expect("event 1");
+        buffer.push(event(2, "0/2")).expect("event 2");
+        let events = buffer.finish().expect("finish transaction");
+        assert!(events.is_staged());
+        let TransactionEvents::Staged(staged) = &events else {
+            panic!("expected staged transaction");
+        };
+        let staging_path = staged.path().to_path_buf();
+
+        let outcome = store
+            .persist_transaction_events(&events, "default", "0/3")
+            .expect("persist staged transaction");
+
+        assert_eq!(outcome, PersistTransactionOutcome::Persisted);
+        assert_eq!(
+            store.replay_from(1, 10).expect("replay staged transaction"),
+            [event(1, "0/1"), event(2, "0/2")]
+        );
+        assert_eq!(
+            store.source_offset("default").expect("source offset"),
+            Some("0/3".to_owned())
+        );
+        assert!(staging_path.exists());
+        drop(events);
+        assert!(!staging_path.exists());
     }
 
     #[test]

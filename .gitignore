@@ -1,5 +1,7 @@
 /target/
 /data/
+/bench/.data/
+/bench/results/
 /.idea/
 *.log
 *.redb

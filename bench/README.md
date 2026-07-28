@@ -1,0 +1,131 @@
+# lightcdc Load Tests
+
+This harness measures the complete local path:
+
+```text
+pgbench -> PostgreSQL WAL -> lightcdc capture -> redb -> gRPC -> Ack
+```
+
+It is intended for repeatable comparisons and limit discovery. A result is not
+portable across different CPUs, disks, PostgreSQL settings, build profiles, or
+virtualization environments, so every run records its configuration and tool
+versions.
+
+## Instrumentation Overhead Policy
+
+Normal `lightcdc` runs do not create counters, histograms, clocks, channels, or
+metrics threads. They perform only predictable disabled `Option` checks at the
+committed-transaction boundary, with no per-event instrumentation.
+
+Passing `--metrics-file` opts into capture instrumentation:
+
+- One `Instant` measurement and one nonblocking fixed-size channel send occur
+  per durable source transaction, not per event.
+- A dedicated standard thread owns all counters, rate calculations, histogram
+  updates, JSON serialization, and file I/O.
+- A bounded channel prevents instrumentation from applying backpressure.
+  `dropped_samples_total` must be zero for a valid run.
+
+The benchmark consumer performs its own latency histograms outside the lightcdc
+runtime. `--output none` prevents event JSON serialization and terminal output
+from dominating capture measurements.
+
+## Prerequisites
+
+- A release Rust toolchain
+- The repository's PostgreSQL 17 container
+- Local `psql` and `pgbench` commands, or the running PostgreSQL container
+- No other process using `lightcdc_benchmark_slot` or `bench/.data`
+
+Start PostgreSQL:
+
+```bash
+docker compose up -d postgres
+```
+
+## Quick Run
+
+```bash
+DURATION_SECONDS=10 CLIENTS=4 THREADS=2 bench/run-local.sh
+```
+
+The default workload inserts one 256-byte row per transaction at the maximum
+rate `pgbench` can produce.
+
+Useful controls:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `DURATION_SECONDS` | `60` | Workload duration |
+| `CLIENTS` | `8` | Concurrent PostgreSQL sessions |
+| `THREADS` | `4` | pgbench worker threads |
+| `RATE` | `0` | Target transactions/second; `0` means unthrottled |
+| `ROWS_PER_TRANSACTION` | `1` | Inserted CDC events per source transaction |
+| `PAYLOAD_BYTES` | `256` | Text payload size |
+| `ACK_EVERY` | `1` | Events processed per cumulative acknowledgement |
+| `WORKLOAD` | `insert` | `insert` or `update` |
+| `PRELOAD_ROWS` | `100000` | Rows prepared for the update workload |
+
+The generated payload is intentionally compressible. Add an incompressible
+payload scenario before using these results to size TOAST-heavy production
+traffic.
+
+## Find The Sustainable Limit
+
+Run fixed-rate steps before an unthrottled run:
+
+```bash
+RATES="500 1000 2500 5000 10000 0" \
+REPETITIONS=3 \
+DURATION_SECONDS=120 \
+bench/run-matrix.sh
+```
+
+The sustainable limit is the highest fixed rate where:
+
+- PostgreSQL retained WAL does not grow continuously.
+- Capture and consumer event rates converge on the generated event rate.
+- `dropped_samples_total` and process errors remain zero.
+- p95 and p99 latency settle rather than increasing throughout the run.
+- CPU, memory, and disk usage remain acceptable for the target environment.
+
+Use at least a 30-minute soak after locating the approximate limit.
+
+## Results
+
+Each run creates `bench/results/<run-id>/` containing:
+
+- `environment.txt`: Git state, tool versions, and scenario parameters.
+- `pgbench.log`: generated transaction rate, schedule lag, and SQL latency.
+- `capture.jsonl`: redb persistence throughput and latency percentiles.
+- `consumer.jsonl`: delivery, end-to-end, and acknowledgement percentiles.
+- `postgres.csv`: WAL retention, slot activity, and PostgreSQL decoding spills.
+- `process.csv`: lightcdc CPU, resident memory, and local data size.
+- `lightcdc.log`, `consumer.log`, and sampler logs for diagnosis.
+
+The runner recreates the dedicated `lightcdc_benchmark_slot` after setup so
+capture, consumer, and generated totals begin at the same WAL boundary. It does
+not modify the development `lightcdc_slot`.
+
+End-to-end latency compares the PostgreSQL commit timestamp with the consumer's
+wall clock. Keep machines synchronized with NTP when components run on separate
+hosts; negative samples are counted as `clock_skew_samples_total`.
+
+## Environment Progression
+
+1. Use a quiet desktop with a stable SSD for development baselines.
+2. Repeat important tests on a fixed, non-burstable Linux server with local
+   NVMe.
+3. For production-style numbers, place PostgreSQL and lightcdc on separate
+   hosts and run pgbench close to PostgreSQL.
+
+Do not compare Docker Desktop results directly with bare-metal Linux results.
+Use flamegraphs or Tokio Console only after a normal run identifies a
+bottleneck, since profilers change the measured workload.
+
+Primary tool references:
+
+- [PostgreSQL pgbench](https://www.postgresql.org/docs/17/pgbench.html)
+- [PostgreSQL monitoring statistics](https://www.postgresql.org/docs/17/monitoring-stats.html)
+- [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph)
+- [Tokio Console](https://github.com/tokio-rs/console)

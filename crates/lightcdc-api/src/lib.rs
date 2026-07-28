@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -30,6 +30,7 @@ pub struct LightCdcService {
     store: Arc<RedbEventStore>,
     poll_interval: Duration,
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
+    delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
 }
 
 type SubscriptionKey = (String, String);
@@ -54,6 +55,7 @@ impl LightCdcService {
             store: Arc::new(store),
             poll_interval: Duration::from_millis(250),
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -95,6 +97,8 @@ impl LightCdc for LightCdcService {
         let (tx, rx) = mpsc::channel(32);
         let store = Arc::clone(&self.store);
         let poll_interval = self.poll_interval;
+        let delivery_key = (stream.name.clone(), consumer.to_owned());
+        let delivery_high_watermarks = Arc::clone(&self.delivery_high_watermarks);
 
         tokio::spawn(async move {
             let _subscription = subscription;
@@ -128,9 +132,12 @@ impl LightCdc for LightCdcService {
                         continue;
                     }
 
-                    if tx.send(Ok(event.into())).await.is_err() {
-                        return;
-                    }
+                    let permit = match tx.reserve().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    record_delivery(&delivery_high_watermarks, &delivery_key, event.sequence);
+                    permit.send(Ok(event.into()));
                     emitted += 1;
 
                     if limit > 0 && emitted >= limit {
@@ -148,6 +155,24 @@ impl LightCdc for LightCdcService {
         let request = request.into_inner();
         let consumer = validate_consumer(&request.consumer)?;
         let stream = self.stream(&request.stream)?;
+        let key = (stream.name.clone(), consumer.to_owned());
+        let highest_delivered = delivery_high_watermarks(&self.delivery_high_watermarks)
+            .get(&key)
+            .copied()
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "consumer {consumer:?} has not been delivered an event from stream {:?}",
+                    stream.name
+                ))
+            })?;
+
+        if request.sequence > highest_delivered {
+            return Err(Status::out_of_range(format!(
+                "cannot acknowledge sequence {} because the highest sequence delivered to \
+                 consumer {consumer:?} on stream {:?} is {highest_delivered}",
+                request.sequence, stream.name
+            )));
+        }
 
         let offset = self
             .store
@@ -179,6 +204,8 @@ impl LightCdc for LightCdcService {
         self.store
             .set_consumer_offset(&stream.name, consumer, offset)
             .map_err(internal)?;
+        delivery_high_watermarks(&self.delivery_high_watermarks)
+            .remove(&(stream.name.clone(), consumer.to_owned()));
 
         Ok(Response::new(SeekResponse { offset }))
     }
@@ -277,6 +304,27 @@ fn active_subscriptions(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Recovers the delivery map if another task panicked while holding it.
+fn delivery_high_watermarks(
+    high_watermarks: &Mutex<HashMap<SubscriptionKey, u64>>,
+) -> std::sync::MutexGuard<'_, HashMap<SubscriptionKey, u64>> {
+    high_watermarks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Records the highest sequence made available to one stream consumer.
+fn record_delivery(
+    high_watermarks: &Mutex<HashMap<SubscriptionKey, u64>>,
+    key: &SubscriptionKey,
+    sequence: u64,
+) {
+    delivery_high_watermarks(high_watermarks)
+        .entry(key.clone())
+        .and_modify(|highest| *highest = (*highest).max(sequence))
+        .or_insert(sequence);
+}
+
 /// Converts internal errors into gRPC internal status errors.
 fn internal(error: impl ToString) -> Status {
     let message = error.to_string();
@@ -327,13 +375,23 @@ mod tests {
 
     #[tokio::test]
     async fn ack_persists_stream_scoped_consumer_offset() {
-        let service = service_with_events(&[]);
+        let service = service_with_events(&[event(42, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        let delivered = subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
 
         let response = service
             .ack(Request::new(AckRequest {
                 stream: "orders".to_owned(),
                 consumer: "search-indexer".to_owned(),
-                sequence: 42,
+                sequence: delivered.sequence,
             }))
             .await
             .expect("ack response")
@@ -351,7 +409,17 @@ mod tests {
 
     #[tokio::test]
     async fn ack_does_not_move_consumer_offset_backward() {
-        let service = service_with_events(&[]);
+        let service = service_with_events(&[event(41, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        let delivered = subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
         service
             .store
             .set_consumer_offset("orders", "search-indexer", 42)
@@ -361,7 +429,7 @@ mod tests {
             .ack(Request::new(AckRequest {
                 stream: "orders".to_owned(),
                 consumer: "search-indexer".to_owned(),
-                sequence: 41,
+                sequence: delivered.sequence,
             }))
             .await
             .expect("ack response")
@@ -375,6 +443,55 @@ mod tests {
                 .expect("consumer offset"),
             Some(42)
         );
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_a_sequence_above_the_highest_delivered() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: 2,
+            }))
+            .await
+            .expect_err("ack above delivered high-water mark should fail");
+
+        assert_eq!(error.code(), tonic::Code::OutOfRange);
+        assert_eq!(
+            service
+                .store
+                .consumer_offset("orders", "search-indexer")
+                .expect("consumer offset"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_a_consumer_without_a_delivery() {
+        let service = service_with_events(&[]);
+
+        let error = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: 1,
+            }))
+            .await
+            .expect_err("ack without a delivery should fail");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -434,6 +551,35 @@ mod tests {
                 .expect("consumer offset"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_ack_after_disconnect_remains_valid() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        let delivered = subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+        drop(subscription);
+        wait_for_subscription_release(&service, "search-indexer").await;
+
+        let response = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: delivered.sequence,
+            }))
+            .await
+            .expect("delayed ack response")
+            .into_inner();
+
+        assert_eq!(response.offset, delivered.sequence);
     }
 
     #[tokio::test]
@@ -504,6 +650,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn seek_clears_the_previous_delivery_high_water_mark() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        service
+            .seek(Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                position: SeekPosition::Earliest as i32,
+                sequence: 0,
+            }))
+            .await
+            .expect("seek response");
+
+        let error = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: 1,
+            }))
+            .await
+            .expect_err("seek should require a new delivery before ack");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
     fn service_with_events(events: &[CoreChangeEvent]) -> LightCdcService {
         let temp = TempDir::new().expect("temp dir");
         let store = RedbEventStore::open(&LogOpenOptions {
@@ -560,6 +742,9 @@ mod tests {
                 storage_file: "lightcdc.redb".to_owned(),
                 channel_capacity: 1024,
                 shutdown_timeout_ms: 10000,
+                transaction_memory_threshold_bytes: 16 * 1024 * 1024,
+                max_transaction_bytes: 1024 * 1024 * 1024,
+                max_transaction_events: 1_000_000,
             },
             logging: LoggingConfig {
                 level: "info".to_owned(),

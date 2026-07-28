@@ -36,7 +36,7 @@ pub enum PgOutputMessage {
     Insert(RowChange),
     Update(RowChange),
     Delete(RowChange),
-    Truncate(Vec<u32>),
+    Truncate(Vec<Relation>),
     Ignored,
 }
 
@@ -102,7 +102,7 @@ impl PgOutputDecoder {
             'I' => self.decode_insert(&mut reader),
             'U' => self.decode_update(&mut reader),
             'D' => self.decode_delete(&mut reader),
-            'T' => decode_truncate(&mut reader),
+            'T' => self.decode_truncate(&mut reader),
             'O' | 'Y' => Ok(PgOutputMessage::Ignored),
             other => Err(DecodeError::UnsupportedMessage(other)),
         }
@@ -188,6 +188,22 @@ impl PgOutputDecoder {
         }))
     }
 
+    /// Resolves a truncate message into the affected table relations.
+    fn decode_truncate(
+        &self,
+        reader: &mut PgOutputReader<'_>,
+    ) -> Result<PgOutputMessage, DecodeError> {
+        let relation_count = reader.read_u32()? as usize;
+        let _options = reader.read_u8()?;
+        let mut relations = Vec::with_capacity(relation_count);
+
+        for _ in 0..relation_count {
+            relations.push(self.relation(reader.read_u32()?)?.clone());
+        }
+
+        Ok(PgOutputMessage::Truncate(relations))
+    }
+
     /// Finds relation metadata previously announced by pgoutput.
     fn relation(&self, relation_id: u32) -> Result<&Relation, DecodeError> {
         self.relations
@@ -221,19 +237,6 @@ fn decode_relation(reader: &mut PgOutputReader<'_>) -> Result<Relation, DecodeEr
         replica_identity,
         columns,
     })
-}
-
-/// Decodes a truncate message into the affected relation ids.
-fn decode_truncate(reader: &mut PgOutputReader<'_>) -> Result<PgOutputMessage, DecodeError> {
-    let relation_count = reader.read_u32()? as usize;
-    let _options = reader.read_u8()?;
-    let mut relation_ids = Vec::with_capacity(relation_count);
-
-    for _ in 0..relation_count {
-        relation_ids.push(reader.read_u32()?);
-    }
-
-    Ok(PgOutputMessage::Truncate(relation_ids))
 }
 
 /// Decodes a pgoutput tuple into JSON bytes keyed by column name.
