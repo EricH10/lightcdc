@@ -93,6 +93,9 @@ Use at least a 30-minute soak after locating the approximate limit.
 
 ## Results
 
+A dated baseline report is available at
+[Windows baseline benchmark — 2026-07-28](../docs/benchmarks/2026-07-28-windows-baseline.md).
+
 Each run creates `bench/results/<run-id>/` containing:
 
 - `environment.txt`: Git state, tool versions, and scenario parameters.
