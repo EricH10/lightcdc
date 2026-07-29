@@ -1,3 +1,5 @@
+//! Defines the user configuration schema and compiles stream table selections.
+
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
@@ -12,9 +14,13 @@ use crate::{ChangeEvent, Error, Result};
 /// Holds all user-configurable settings loaded from TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    /// The PostgreSQL source captured by this process.
     pub source: SourceConfig,
+    /// Local buffering, batching, heartbeat, and retention settings.
     pub runtime: RuntimeConfig,
+    /// Process logging configuration.
     pub logging: LoggingConfig,
+    /// Durable consumer-facing stream definitions.
     #[serde(default = "default_streams")]
     pub streams: Vec<StreamConfig>,
 }
@@ -22,46 +28,70 @@ pub struct Config {
 /// Describes the PostgreSQL source used for logical replication.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
+    /// Stable local identity used to scope checkpoints and staging files.
     #[serde(default = "default_source_name")]
     pub name: String,
+    /// PostgreSQL server hostname.
     pub host: String,
+    /// PostgreSQL server port.
     pub port: u16,
+    /// Database that owns the publication and replication slot.
     pub database: String,
+    /// Login role with replication privileges.
     pub user: String,
+    /// Login password used by PostgreSQL clients.
     pub password: String,
+    /// Operator-managed publication read by pgoutput.
     pub publication: String,
+    /// Durable logical replication slot assigned to this LightCDC source.
     pub slot: String,
 }
 
 /// Describes local runtime settings such as storage paths and buffer sizes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
+    /// Directory containing redb and transaction staging data.
     pub data_dir: String,
+    /// redb filename inside `data_dir`.
     pub storage_file: String,
+    /// Reserved for future pipeline channel sizing; currently unused.
     pub channel_capacity: usize,
+    /// Reserved for graceful shutdown coordination; currently unused.
     pub shutdown_timeout_ms: u64,
+    /// Delay between transactional logical heartbeat messages.
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
+    /// Decoded transaction bytes retained before spilling to disk.
     #[serde(default = "default_transaction_memory_threshold_bytes")]
     pub transaction_memory_threshold_bytes: u64,
+    /// Hard decoded or staged byte limit for one source transaction.
     #[serde(default = "default_max_transaction_bytes")]
     pub max_transaction_bytes: u64,
+    /// Hard event-count limit for one source transaction.
     #[serde(default = "default_max_transaction_events")]
     pub max_transaction_events: usize,
+    /// Maximum complete source transactions grouped into one redb commit.
     #[serde(default = "default_capture_batch_max_transactions")]
     pub capture_batch_max_transactions: usize,
+    /// Soft event boundary for one grouped redb commit.
     #[serde(default = "default_capture_batch_max_events")]
     pub capture_batch_max_events: usize,
+    /// Soft decoded-byte boundary for one grouped redb commit.
     #[serde(default = "default_capture_batch_max_bytes")]
     pub capture_batch_max_bytes: u64,
+    /// Maximum time the oldest transaction waits for a grouped redb commit.
     #[serde(default = "default_capture_batch_max_delay_ms")]
     pub capture_batch_max_delay_ms: u64,
+    /// Optional maximum number of event payloads retained locally.
     #[serde(default)]
     pub retention_max_events: Option<u64>,
+    /// Optional maximum age of event payloads retained locally.
     #[serde(default)]
     pub retention_max_age_seconds: Option<u64>,
+    /// Delay between background retention sweeps.
     #[serde(default = "default_retention_check_interval_ms")]
     pub retention_check_interval_ms: u64,
+    /// Maximum event prefix removed by one retention sweep.
     #[serde(default = "default_retention_delete_batch_size")]
     pub retention_delete_batch_size: usize,
 }
@@ -69,15 +99,19 @@ pub struct RuntimeConfig {
 /// Describes process logging settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
+    /// Default tracing filter when `RUST_LOG` is absent.
     pub level: String,
 }
 
 /// Names a consumable stream and the tables it includes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamConfig {
+    /// Stable name clients pass to subscribe, acknowledge, and seek.
     pub name: String,
+    /// Source identity whose events feed this stream.
     #[serde(default = "default_stream_source")]
     pub source: String,
+    /// Included table patterns using `*`, `schema.*`, or `schema.table`.
     #[serde(default = "default_stream_tables")]
     pub tables: Vec<String>,
 }
@@ -191,6 +225,7 @@ impl StreamConfig {
 }
 
 impl CapturePlan {
+    /// Validates streams and combines their table patterns into one source plan.
     fn from_streams(
         source_name: &str,
         streams: &[StreamConfig],
@@ -293,6 +328,7 @@ impl TablePattern {
     }
 }
 
+/// Parses `*`, `schema.*`, or `schema.table` into a reusable matcher.
 fn parse_table_pattern(pattern: &str) -> Option<TablePattern> {
     if pattern == "*" {
         return Some(TablePattern::All);

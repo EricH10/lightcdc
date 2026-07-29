@@ -1,3 +1,5 @@
+//! Serves durable redb events through the generated LightCDC gRPC contract.
+
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -25,13 +27,18 @@ use proto::{
 /// Implements the lightcdc gRPC service against a local event store.
 #[derive(Clone)]
 pub struct LightCdcService {
+    /// Immutable stream definitions shared with spawned subscription tasks.
     config: Arc<Config>,
+    /// Durable log shared by RPC handlers and long-lived subscription tasks.
     store: Arc<RedbEventStore>,
     event_notifier: EventNotifier,
+    /// Prevents two workers from advancing the same consumer concurrently.
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
+    /// Bounds acknowledgements to sequences this process actually delivered.
     delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
 }
 
+/// Identifies one consumer independently within one configured stream.
 type SubscriptionKey = (String, String);
 
 /// Wakes live subscribers after capture durably commits new events.
@@ -52,6 +59,7 @@ impl EventNotifier {
         self.sender.send_replace(());
     }
 
+    /// Creates a receiver that wakes when capture commits another batch.
     fn subscribe(&self) -> watch::Receiver<()> {
         self.sender.subscribe()
     }
@@ -118,6 +126,7 @@ pub async fn serve_with_notifier(
     serve_service(addr, service).await
 }
 
+/// Registers an already-built service with tonic and listens on the address.
 async fn serve_service(
     addr: SocketAddr,
     service: LightCdcService,
@@ -157,6 +166,7 @@ impl LightCdc for LightCdcService {
         let delivery_key = (stream.name.clone(), consumer.to_owned());
         let delivery_high_watermarks = Arc::clone(&self.delivery_high_watermarks);
 
+        // This worker owns cloned state because it can outlive the subscribe RPC.
         tokio::spawn(async move {
             let _subscription = subscription;
             let mut next_sequence = start_offset + 1;

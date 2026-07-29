@@ -1,3 +1,5 @@
+//! Decodes stateful PostgreSQL `pgoutput` messages into relation-aware row changes.
+
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -32,11 +34,17 @@ pub enum DecodeError {
 /// Represents one decoded pgoutput protocol message.
 #[derive(Debug, Clone)]
 pub enum PgOutputMessage {
+    /// Announces or refreshes metadata for a table relation id.
     Relation(Relation),
+    /// Contains the new tuple for an inserted row.
     Insert(RowChange),
+    /// Contains the available old/key tuple and required new tuple.
     Update(RowChange),
+    /// Contains the replica-identity key or old tuple for a deleted row.
     Delete(RowChange),
+    /// Names every relation affected by one truncate command.
     Truncate(Vec<Relation>),
+    /// Represents protocol metadata that capture does not currently consume.
     Ignored,
 }
 
@@ -363,6 +371,7 @@ impl<'a> PgOutputReader<'a> {
     }
 }
 
+/// Provides a serialization-friendly view of cached relation metadata.
 #[derive(Debug, Serialize)]
 pub struct RelationSummary<'a> {
     pub id: u32,
@@ -372,6 +381,7 @@ pub struct RelationSummary<'a> {
 }
 
 impl Relation {
+    /// Borrows the relation fields needed for diagnostic output.
     pub fn summary(&self) -> RelationSummary<'_> {
         RelationSummary {
             id: self.id,

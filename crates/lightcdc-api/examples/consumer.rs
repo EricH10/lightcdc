@@ -1,3 +1,5 @@
+//! Demonstrates seeking, subscribing, printing, and acknowledging through gRPC.
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};

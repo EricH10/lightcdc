@@ -1,3 +1,5 @@
+//! Defines errors produced while loading and validating core configuration.
+
 use thiserror::Error as ThisError;
 
 /// Core crate result type.

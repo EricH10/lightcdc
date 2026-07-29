@@ -1,3 +1,5 @@
+//! Shares configuration and canonical event types across LightCDC crates.
+
 /// Configuration loading and stream matching.
 pub mod config;
 /// Shared error types for the core crate.

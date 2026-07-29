@@ -1,3 +1,5 @@
+//! Parses CLI commands and orchestrates capture, storage, retention, and serving.
+
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -43,6 +45,7 @@ struct Cli {
 /// Lists the CLI commands supported by lightcdc.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Captures PostgreSQL changes without starting the consumer API.
     Capture {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
@@ -61,6 +64,7 @@ enum Command {
         metrics_interval_seconds: u64,
     },
 
+    /// Runs capture and the consumer API against one shared redb handle.
     Run {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
@@ -82,6 +86,7 @@ enum Command {
         metrics_interval_seconds: u64,
     },
 
+    /// Prints retained events from a local sequence, optionally by stream.
     Replay {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
@@ -99,6 +104,7 @@ enum Command {
         pretty: bool,
     },
 
+    /// Displays redb table counts, offsets, and recent events.
     Inspect {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
@@ -110,6 +116,7 @@ enum Command {
         sequence: Option<u64>,
     },
 
+    /// Serves retained events without running PostgreSQL capture.
     Serve {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
@@ -136,24 +143,35 @@ struct CaptureOptions {
     metrics_interval: Duration,
 }
 
+/// Distinguishes a newly persisted batch from a safely detected source replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistCaptureBatchOutcome {
+    /// A new durable commit containing this many consumer events.
     Persisted(usize),
+    /// A source transaction redelivered after its earlier durable commit.
     Replayed,
 }
 
+/// Represents whichever side of the capture/storage pipeline makes progress first.
 enum CaptureProgress {
+    /// A PostgreSQL transaction result, timeout, stream end, or read error.
     Transaction(Result<TransactionRead, PostgresError>),
+    /// The result of the one in-flight redb batch.
     Storage(anyhow::Result<StorageCompletion>),
 }
 
+/// Tracks the queued batch, in-flight redb write, and replay recovery state.
 struct CapturePipeline {
+    /// Complete source transactions waiting to be submitted.
     batch: CaptureBatch,
+    /// The single batch currently owned by the storage thread.
     pending_write: Option<PendingCaptureWrite>,
+    /// Whether sequence assignment is known to follow durable redb state.
     replay_reconciled: bool,
 }
 
 impl CapturePipeline {
+    /// Creates an empty pipeline with the connector's initial replay state.
     fn new(replay_reconciled: bool) -> Self {
         Self {
             batch: CaptureBatch::default(),
@@ -162,18 +180,21 @@ impl CapturePipeline {
         }
     }
 
+    /// Counts durable, in-flight, and queued events toward a bounded run.
     fn buffered_event_count(&self, captured: usize) -> usize {
         captured
             .saturating_add(self.pending_event_count())
             .saturating_add(self.batch.event_count)
     }
 
+    /// Returns the event count owned by the in-flight redb write.
     fn pending_event_count(&self) -> usize {
         self.pending_write
             .as_ref()
             .map_or(0, |pending_write| pending_write.event_count)
     }
 
+    /// Enables the batch deadline only when waiting can safely trigger a flush.
     fn read_deadline(&self, limits: CaptureBatchLimits) -> Option<tokio::time::Instant> {
         if self.batch.is_empty() || !self.replay_reconciled || self.pending_write.is_some() {
             None
@@ -183,12 +204,16 @@ impl CapturePipeline {
     }
 }
 
+/// Combines a retention policy with its background sweep interval.
 #[derive(Clone, Copy)]
 struct CaptureRetention {
+    /// Count and age boundaries applied to retained event payloads.
     policy: RetentionPolicy,
+    /// Frequency at which the runtime asks storage to enforce the policy.
     check_interval: Duration,
 }
 
+/// Borrows immutable capture dependencies shared by the supervision functions.
 struct CaptureContext<'a> {
     config: &'a Config,
     store: &'a RedbEventStore,
@@ -203,8 +228,11 @@ struct CaptureContext<'a> {
     transaction_buffer_options: TransactionBufferOptions,
 }
 
+/// Tells the supervisor whether a session completed by request or needs reconnecting.
 enum CaptureSessionExit {
+    /// The optional bounded-run event target has completed durably.
     RequestedEventCountReached,
+    /// The session should reconnect from the durable source checkpoint.
     Disconnected(String),
 }
 
@@ -417,6 +445,7 @@ async fn capture_with_store(
     capture_result
 }
 
+/// Periodically queues bounded retention work on the shared storage writer.
 async fn run_retention_sweeps(storage: CaptureStorageHandle, retention: CaptureRetention) {
     let mut interval = tokio::time::interval(retention.check_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -445,6 +474,7 @@ async fn run_retention_sweeps(storage: CaptureStorageHandle, retention: CaptureR
     }
 }
 
+/// Validates the source, owns the heartbeat task, and supervises capture sessions.
 async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Result<()> {
     let mut captured = 0usize;
     let mut retry_attempt = 0u32;
@@ -471,6 +501,7 @@ async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Result<()> {
     capture_result
 }
 
+/// Reconnects replication sessions until capture completes or a fatal error occurs.
 async fn supervise_capture_sessions(
     context: &CaptureContext<'_>,
     captured: &mut usize,
@@ -501,6 +532,7 @@ async fn supervise_capture_sessions(
     }
 }
 
+/// Retries transient validation failures while surfacing configuration failures.
 async fn validate_source_until_ready(
     context: &CaptureContext<'_>,
     retry_attempt: &mut u32,
@@ -535,6 +567,7 @@ async fn validate_source_until_ready(
     }
 }
 
+/// Reopens replication from the durable redb LSN and local sequence.
 async fn connect_capture_reader(
     context: &CaptureContext<'_>,
     retry_attempt: &mut u32,
@@ -581,6 +614,7 @@ async fn connect_capture_reader(
     }
 }
 
+/// Pipelines committed source transactions with one in-flight redb write.
 async fn run_capture_session(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -645,6 +679,7 @@ async fn run_capture_session(
     }
 }
 
+/// Waits for either another PostgreSQL transaction or the pending storage result.
 async fn wait_for_capture_progress(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -670,6 +705,7 @@ async fn wait_for_capture_progress(
     }
 }
 
+/// Adds one whole source transaction and flushes when a batch boundary is reached.
 async fn buffer_captured_transaction(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -722,6 +758,7 @@ async fn buffer_captured_transaction(
     Ok(None)
 }
 
+/// Flushes a batch whose maximum group-commit delay has elapsed.
 async fn flush_expired_capture_batch(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -738,6 +775,7 @@ async fn flush_expired_capture_batch(
     Ok(None)
 }
 
+/// Drains durable and queued work before reconnecting an ended replication stream.
 async fn finish_capture_stream(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -759,6 +797,7 @@ async fn finish_capture_stream(
     ))
 }
 
+/// Preserves completed work and classifies a replication read failure.
 async fn finish_capture_read_error(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -780,6 +819,7 @@ async fn finish_capture_read_error(
     Ok(CaptureSessionExit::Disconnected(error.to_string()))
 }
 
+/// Moves the queued batch into the dedicated writer without awaiting its commit.
 async fn submit_capture_batch(
     context: &CaptureContext<'_>,
     pipeline: &mut CapturePipeline,
@@ -798,6 +838,7 @@ async fn submit_capture_batch(
     Ok(())
 }
 
+/// Submits the queued batch and waits for its durable result.
 async fn submit_and_complete_capture_batch(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -810,6 +851,7 @@ async fn submit_and_complete_capture_batch(
         .context("the submitted capture batch has no pending write")
 }
 
+/// Awaits and applies the in-flight write when one exists.
 async fn complete_pending_capture_write(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -826,6 +868,7 @@ async fn complete_pending_capture_write(
     complete_and_apply_capture_write(context, reader, pipeline, captured, completion).map(Some)
 }
 
+/// Applies a storage result already received by `tokio::select!`.
 fn complete_pipelined_capture_write(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -840,6 +883,7 @@ fn complete_pipelined_capture_write(
     )
 }
 
+/// Finalizes one storage completion and updates pipeline accounting.
 fn complete_and_apply_capture_write(
     context: &CaptureContext<'_>,
     reader: &mut ReplicationReader,
@@ -859,6 +903,7 @@ fn complete_and_apply_capture_write(
     Ok(outcome)
 }
 
+/// Checks whether the in-flight durable write will finish a bounded run.
 fn pending_write_reaches_requested_event_count(
     options: &CaptureOptions,
     captured: usize,
@@ -869,18 +914,21 @@ fn pending_write_reaches_requested_event_count(
         .is_some_and(|max| captured.saturating_add(pipeline.pending_event_count()) >= max)
 }
 
+/// Requests reconnect so sequence assignment restarts from durable storage.
 fn reconnect_after_replayed_batch(batch_state: &str) -> CaptureSessionExit {
     CaptureSessionExit::Disconnected(format!(
         "replayed {batch_state} batch required sequence reconciliation"
     ))
 }
 
+/// Attempts graceful replication shutdown without masking the session result.
 async fn shutdown_capture_reader(reader: &mut ReplicationReader) {
     if let Err(error) = reader.shutdown().await {
         warn!(%error, "failed to close PostgreSQL capture session");
     }
 }
 
+/// Records and delays a reconnect after an established session disconnects.
 async fn wait_before_session_reconnect(
     context: &CaptureContext<'_>,
     retry_attempt: &mut u32,
@@ -899,23 +947,27 @@ async fn wait_before_session_reconnect(
     advance_reconnect_state(retry_attempt, reconnect_count);
 }
 
+/// Records a reconnect only when opt-in metrics are active.
 fn record_capture_reconnect(metrics: &Option<CaptureMetrics>) {
     if let Some(metrics) = metrics {
         metrics.record_reconnect();
     }
 }
 
+/// Advances saturating retry counters after one backoff delay.
 fn advance_reconnect_state(retry_attempt: &mut u32, reconnect_count: &mut u64) {
     *retry_attempt = retry_attempt.saturating_add(1);
     *reconnect_count = reconnect_count.saturating_add(1);
 }
 
+/// Returns true when a user-requested bounded run has durably completed.
 fn requested_event_count_reached(options: &CaptureOptions, captured: usize) -> bool {
     options
         .stop_after_events
         .is_some_and(|target| captured >= target)
 }
 
+/// Validates group-commit settings and converts them to runtime limits.
 fn capture_batch_limits(config: &Config) -> anyhow::Result<CaptureBatchLimits> {
     let runtime = &config.runtime;
     if runtime.capture_batch_max_transactions == 0 {
@@ -947,6 +999,7 @@ fn capture_batch_limits(config: &Config) -> anyhow::Result<CaptureBatchLimits> {
     })
 }
 
+/// Validates and converts the logical heartbeat interval.
 fn capture_heartbeat_interval(config: &Config) -> anyhow::Result<Duration> {
     if config.runtime.heartbeat_interval_ms == 0 {
         return Err(anyhow!(
@@ -956,6 +1009,7 @@ fn capture_heartbeat_interval(config: &Config) -> anyhow::Result<Duration> {
     Ok(Duration::from_millis(config.runtime.heartbeat_interval_ms))
 }
 
+/// Emits transactional logical messages and reconnects its ordinary SQL client.
 async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
     let content = format!("source={};slot={}", source.name, source.slot);
     loop {
@@ -987,6 +1041,7 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
     }
 }
 
+/// Builds an optional validated retention schedule from runtime settings.
 fn capture_retention(config: &Config) -> anyhow::Result<Option<CaptureRetention>> {
     let runtime = &config.runtime;
     if runtime.retention_max_events.is_none() && runtime.retention_max_age_seconds.is_none() {
@@ -1023,6 +1078,7 @@ fn capture_retention(config: &Config) -> anyhow::Result<Option<CaptureRetention>
     }))
 }
 
+/// Returns a saturating Unix timestamp for age-based retention.
 fn unix_timestamp_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1031,6 +1087,7 @@ fn unix_timestamp_ms_i64() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+/// Adapts bounded and unbounded reader calls into one progress enum.
 async fn next_capture_transaction(
     reader: &mut ReplicationReader,
     deadline: Option<tokio::time::Instant>,
@@ -1047,6 +1104,7 @@ async fn next_capture_transaction(
     }
 }
 
+/// Publishes side effects and acknowledges PostgreSQL only after redb succeeds.
 fn complete_capture_write(
     completion: StorageCompletion,
     reader: &mut ReplicationReader,
@@ -1120,6 +1178,7 @@ fn complete_capture_write(
     Ok(outcome)
 }
 
+/// Updates bounded-run counts and replay reconciliation after storage completes.
 fn apply_capture_batch_outcome(
     outcome: PersistCaptureBatchOutcome,
     captured: &mut usize,

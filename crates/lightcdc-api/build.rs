@@ -1,3 +1,6 @@
+//! Generates tonic client and server types from the LightCDC protobuf contract.
+
+/// Rebuilds generated gRPC code whenever the protobuf definition changes.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     unsafe {

@@ -1,3 +1,5 @@
+//! Provides durable event-log storage and bounded transaction staging.
+
 /// redb-backed local event log storage.
 pub mod log;
 /// Bounded in-memory and file-backed source transaction buffering.

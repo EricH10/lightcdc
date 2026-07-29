@@ -1,3 +1,5 @@
+//! Defines the canonical CDC event model shared across connectors and storage.
+
 use serde::{Deserialize, Serialize};
 
 /// Represents one captured database change in the local event log.

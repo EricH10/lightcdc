@@ -1,3 +1,5 @@
+//! Buffers one source transaction in memory or a crash-cleaned staging file.
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
@@ -17,9 +19,13 @@ static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Configures transaction memory, disk staging, and hard safety limits.
 #[derive(Debug, Clone)]
 pub struct TransactionBufferOptions {
+    /// Source-scoped directory for transactions that exceed memory threshold.
     pub staging_dir: Option<PathBuf>,
+    /// Estimated decoded bytes retained before spilling the transaction.
     pub memory_threshold_bytes: u64,
+    /// Hard limit applied to decoded and staged transaction size.
     pub max_transaction_bytes: u64,
+    /// Hard event-count limit for one source transaction.
     pub max_transaction_events: usize,
 }
 
@@ -54,6 +60,7 @@ impl TransactionBufferOptions {
         }
     }
 
+    /// Rejects option combinations that cannot enforce their stated bounds.
     fn validate(&self) -> Result<(), TransactionBufferError> {
         if self.max_transaction_events == 0 {
             return Err(TransactionBufferError::InvalidOptions(
@@ -83,8 +90,11 @@ impl TransactionBufferOptions {
 /// Reports the resources consumed by one decoded source transaction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionStats {
+    /// Number of captured events in the source transaction.
     pub event_count: usize,
+    /// Estimated bytes owned by decoded events.
     pub decoded_bytes: u64,
+    /// Length-prefixed bytes the same events require when staged.
     pub staged_bytes: u64,
 }
 
@@ -216,6 +226,7 @@ impl TransactionBuffer {
         self.stats.event_count == 0
     }
 
+    /// Enforces hard event and byte limits before accepting another event.
     fn check_limits(&self, stats: TransactionStats) -> Result<(), TransactionBufferError> {
         if stats.event_count > self.options.max_transaction_events {
             return Err(TransactionBufferError::EventLimitExceeded {
@@ -235,6 +246,7 @@ impl TransactionBuffer {
         Ok(())
     }
 
+    /// Moves all in-memory events into a staging file without splitting ownership.
     fn spill_memory_events(&mut self, transaction_id: u64) -> Result<(), TransactionBufferError> {
         let staging_dir = self.options.staging_dir.as_ref().ok_or_else(|| {
             TransactionBufferError::InvalidOptions(
@@ -253,10 +265,12 @@ impl TransactionBuffer {
 
 /// Owns the committed events from one source transaction.
 pub enum TransactionEvents {
+    /// Events that remained below the configured memory threshold.
     InMemory {
         events: Vec<ChangeEvent>,
         stats: TransactionStats,
     },
+    /// Events streamed from an owned staging file.
     Staged(StagedEvents),
 }
 
@@ -303,7 +317,9 @@ impl TransactionEvents {
 
 /// Iterates over in-memory or file-backed transaction events.
 pub enum TransactionEventIter<'a> {
+    /// Clones events from the in-memory transaction slice.
     InMemory(std::slice::Iter<'a, ChangeEvent>),
+    /// Deserializes events one at a time from disk.
     Staged(StagedEventReader),
 }
 
@@ -337,6 +353,7 @@ impl Drop for StagedEvents {
     }
 }
 
+/// Writes length-prefixed JSON records and removes incomplete files on drop.
 struct StagingWriter {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
@@ -344,6 +361,7 @@ struct StagingWriter {
 }
 
 impl StagingWriter {
+    /// Creates a collision-resistant file for one active source transaction.
     fn create(staging_dir: &Path, transaction_id: u64) -> Result<Self, TransactionBufferError> {
         fs::create_dir_all(staging_dir)?;
         let path = unique_staging_path(staging_dir, transaction_id);
@@ -359,6 +377,7 @@ impl StagingWriter {
         })
     }
 
+    /// Appends one length-prefixed serialized event.
     fn write_record(&mut self, payload: &[u8]) -> Result<(), TransactionBufferError> {
         let writer = self
             .writer
@@ -369,6 +388,7 @@ impl StagingWriter {
         Ok(())
     }
 
+    /// Flushes the file and transfers cleanup ownership to `StagedEvents`.
     fn finish(mut self, stats: TransactionStats) -> Result<StagedEvents, TransactionBufferError> {
         let mut writer = self
             .writer
@@ -394,6 +414,7 @@ impl Drop for StagingWriter {
     }
 }
 
+/// Streams length-prefixed events from one completed staging file.
 pub struct StagedEventReader {
     reader: BufReader<File>,
     remaining: usize,
@@ -472,6 +493,7 @@ impl TransactionBufferError {
     }
 }
 
+/// Removes only staging files inside the configured source-scoped directory.
 fn cleanup_source_staging_files(
     options: &TransactionBufferOptions,
 ) -> Result<usize, TransactionBufferError> {
@@ -496,6 +518,7 @@ fn cleanup_source_staging_files(
     Ok(removed)
 }
 
+/// Estimates owned heap and inline bytes used by a decoded event.
 fn estimated_decoded_bytes(event: &ChangeEvent) -> u64 {
     let transaction_strings = event.transaction.as_ref().map_or(0, |transaction| {
         transaction
@@ -518,6 +541,7 @@ fn estimated_decoded_bytes(event: &ChangeEvent) -> u64 {
     (size_of::<ChangeEvent>() + payload_bytes + string_bytes) as u64
 }
 
+/// Hex-encodes the source name so every source owns a filesystem-safe directory.
 fn source_staging_directory(source_name: &str) -> String {
     let mut encoded = String::with_capacity(source_name.len() * 2 + 7);
     encoded.push_str("source-");
@@ -528,6 +552,7 @@ fn source_staging_directory(source_name: &str) -> String {
     encoded
 }
 
+/// Builds a process-, transaction-, time-, and counter-scoped staging filename.
 fn unique_staging_path(staging_dir: &Path, transaction_id: u64) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

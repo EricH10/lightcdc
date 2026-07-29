@@ -1,3 +1,5 @@
+//! Measures consumer throughput and delivery latency through the LightCDC gRPC API.
+
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
@@ -52,6 +54,7 @@ enum SeekStart {
     Latest,
 }
 
+/// Tracks lifetime counters and resettable interval latency histograms.
 struct ConsumerStats {
     started: Instant,
     last_report: Instant,
@@ -68,6 +71,7 @@ struct ConsumerStats {
 }
 
 impl ConsumerStats {
+    /// Creates empty counters and HDR histograms for one benchmark run.
     fn new() -> Result<Self> {
         let now = Instant::now();
         Ok(Self {
@@ -86,6 +90,7 @@ impl ConsumerStats {
         })
     }
 
+    /// Records payload size and source-commit-to-consumer latency for one event.
     fn record_event(&mut self, event: &ChangeEvent) {
         let payload_bytes = event.key.as_ref().map_or(0, Vec::len)
             + event.before.as_ref().map_or(0, Vec::len)
@@ -113,6 +118,7 @@ impl ConsumerStats {
         }
     }
 
+    /// Records one acknowledgement round-trip.
     fn record_acknowledgement(&mut self, latency: Duration) {
         self.acknowledgements_total += 1;
         let _ = self
@@ -120,6 +126,7 @@ impl ConsumerStats {
             .record(duration_ns(latency).max(1));
     }
 
+    /// Writes one JSON Lines snapshot and resets interval-only measurements.
     fn write_report(&mut self, writer: &mut BufWriter<File>, final_report: bool) -> Result<()> {
         let now = Instant::now();
         let interval_seconds = now
@@ -155,6 +162,7 @@ impl ConsumerStats {
     }
 }
 
+/// Runs a timed subscription and periodically records consumer metrics.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -229,6 +237,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Retries startup connection briefly so benchmark processes can launch together.
 async fn connect_with_retry(endpoint: &str) -> Result<LightCdcClient<tonic::transport::Channel>> {
     let started = Instant::now();
     loop {
@@ -243,6 +252,7 @@ async fn connect_with_retry(endpoint: &str) -> Result<LightCdcClient<tonic::tran
     }
 }
 
+/// Applies the requested initial consumer offset before subscribing.
 async fn seek_consumer(
     client: &mut LightCdcClient<tonic::transport::Channel>,
     args: &Args,
@@ -264,6 +274,7 @@ async fn seek_consumer(
     Ok(())
 }
 
+/// Acknowledges one sequence and returns the gRPC round-trip duration.
 async fn acknowledge(
     client: &mut LightCdcClient<tonic::transport::Channel>,
     stream: &str,
@@ -282,6 +293,7 @@ async fn acknowledge(
     Ok(started.elapsed())
 }
 
+/// Creates the metrics directory and buffered JSON Lines output file.
 fn open_metrics_file(path: &Path) -> Result<BufWriter<File>> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -294,6 +306,7 @@ fn open_metrics_file(path: &Path) -> Result<BufWriter<File>> {
     Ok(BufWriter::new(file))
 }
 
+/// Converts a nanosecond HDR histogram into millisecond quantiles.
 fn latency_report(histogram: &Histogram<u64>) -> serde_json::Value {
     let milliseconds = |quantile| histogram.value_at_quantile(quantile) as f64 / 1_000_000.0;
     json!({
@@ -305,10 +318,12 @@ fn latency_report(histogram: &Histogram<u64>) -> serde_json::Value {
     })
 }
 
+/// Converts a duration into a saturating nanosecond sample.
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
+/// Returns a saturating Unix timestamp for metrics output.
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

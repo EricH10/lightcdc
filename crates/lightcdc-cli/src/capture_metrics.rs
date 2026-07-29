@@ -1,3 +1,5 @@
+//! Records opt-in capture throughput metrics without blocking the capture path.
+
 use std::{
     fs::{self, File},
     io::{self, BufWriter, Write},
@@ -23,6 +25,7 @@ pub struct CaptureMetrics {
     worker: Option<JoinHandle<io::Result<()>>>,
 }
 
+/// Represents one lightweight observation sent to the aggregation thread.
 #[derive(Debug)]
 enum CaptureSample {
     Persisted {
@@ -36,6 +39,7 @@ enum CaptureSample {
     Reconnect,
 }
 
+/// Accumulates process-lifetime counters for each report.
 #[derive(Default)]
 struct Totals {
     storage_commits: u64,
@@ -47,6 +51,7 @@ struct Totals {
     reconnects: u64,
 }
 
+/// Accumulates counters that reset after each reporting interval.
 #[derive(Default)]
 struct IntervalTotals {
     storage_commits: u64,
@@ -113,6 +118,7 @@ impl CaptureMetrics {
         self.try_send(CaptureSample::Reconnect);
     }
 
+    /// Drops a sample instead of adding latency when the metrics worker falls behind.
     fn try_send(&self, sample: CaptureSample) {
         let Some(sender) = &self.sender else {
             return;
@@ -128,6 +134,7 @@ impl CaptureMetrics {
 
 impl Drop for CaptureMetrics {
     fn drop(&mut self) {
+        // Closing the sender lets the worker flush its final report before join.
         self.sender.take();
         if let Some(worker) = self.worker.take() {
             match worker.join() {
@@ -139,6 +146,7 @@ impl Drop for CaptureMetrics {
     }
 }
 
+/// Owns metric aggregation and periodically writes one JSON Lines report.
 fn aggregate_metrics(
     receiver: Receiver<CaptureSample>,
     file: File,
@@ -194,6 +202,7 @@ fn aggregate_metrics(
     }
 }
 
+/// Applies one sample to lifetime totals, interval totals, and latency history.
 fn record_sample(
     sample: CaptureSample,
     totals: &mut Totals,
@@ -227,6 +236,7 @@ fn record_sample(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Serializes the current throughput, totals, and latency quantiles.
 fn write_report(
     writer: &mut BufWriter<File>,
     started: Instant,
@@ -278,10 +288,12 @@ fn write_report(
     writer.flush()
 }
 
+/// Converts a duration to the histogram's bounded nanosecond representation.
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
+/// Returns a saturating Unix timestamp for serialized metric reports.
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

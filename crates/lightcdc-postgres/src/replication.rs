@@ -1,3 +1,5 @@
+//! Turns PostgreSQL logical replication messages into committed source transactions.
+
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
@@ -48,13 +50,21 @@ pub enum PostgresError {
 
 /// Reads PostgreSQL logical replication messages and emits committed transactions.
 pub struct ReplicationReader {
+    /// Connection identity copied into emitted event metadata.
     source: SourceConfig,
+    /// pgwire client that owns the replication protocol worker.
     client: ReplicationClient,
+    /// Stateful decoder that caches relation metadata by relation id.
     decoder: PgOutputDecoder,
+    /// Last locally assigned event sequence.
     sequence: u64,
+    /// Metadata for the source transaction currently being decoded.
     transaction: Option<TransactionMetadata>,
+    /// Commit timestamp announced for the current source transaction.
     commit_timestamp_ms: Option<i64>,
+    /// Events held until PostgreSQL sends the matching commit.
     pending_events: TransactionBuffer,
+    /// Union of configured tables allowed to become local events.
     capture_plan: CapturePlan,
 }
 
@@ -67,6 +77,7 @@ pub struct LogicalHeartbeatEmitter {
 /// Describes how a configured capture plan aligns with its publication.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublicationAlignment {
+    /// Published tables that no configured stream currently requires.
     pub unnecessary_published_tables: Vec<String>,
 }
 
@@ -80,8 +91,11 @@ pub struct CapturedTransaction {
 
 /// Reports whether a bounded transaction read completed, timed out, or ended.
 pub enum TransactionRead {
+    /// A complete committed source transaction ready for durable storage.
     Transaction(CapturedTransaction),
+    /// No commit arrived before the caller's batching deadline.
     TimedOut,
+    /// The replication worker ended without another transaction.
     StreamEnded,
 }
 
@@ -196,6 +210,7 @@ impl ReplicationReader {
         self.read_transaction(Some(deadline)).await
     }
 
+    /// Drives the replication protocol until a commit, deadline, or stream end.
     async fn read_transaction(
         &mut self,
         deadline: Option<Instant>,
@@ -501,6 +516,7 @@ pub async fn validate_source_config_with_plan(
     validate_publication_alignment(&client, config, capture_plan).await
 }
 
+/// Checks server settings, role privileges, publication presence, and slot identity.
 async fn validate_source_client(
     client: &Client,
     config: &SourceConfig,
@@ -605,6 +621,7 @@ async fn validate_source_client(
     Ok(())
 }
 
+/// Compares configured table selection with the operator-managed publication.
 async fn validate_publication_alignment(
     client: &Client,
     config: &SourceConfig,
@@ -680,16 +697,19 @@ async fn validate_publication_alignment(
     })
 }
 
+/// Converts PostgreSQL's 2000-based microsecond timestamp into Unix milliseconds.
 fn pg_time_to_unix_ms(pg_micros: i64) -> i64 {
     POSTGRES_EPOCH_UNIX_MS + (pg_micros / 1_000)
 }
 
+/// Classifies SQLSTATE families that can recover without configuration changes.
 fn is_retryable_sqlstate(code: &str) -> bool {
     code.starts_with("08")
         || code.starts_with("53")
         || matches!(code, "55006" | "57P01" | "57P02" | "57P03")
 }
 
+/// Extracts a SQLSTATE appended to a pgwire replication server error.
 fn replication_server_sqlstate(message: &str) -> Option<&str> {
     let sqlstate = message.rsplit_once("(SQLSTATE ")?.1.strip_suffix(')')?;
     (sqlstate.len() == 5).then_some(sqlstate)

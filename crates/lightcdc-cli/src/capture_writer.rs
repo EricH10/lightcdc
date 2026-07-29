@@ -1,3 +1,5 @@
+//! Serializes synchronous redb capture and retention work on one dedicated thread.
+
 use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -13,25 +15,38 @@ use tokio::time::Instant as TokioInstant;
 
 const STORAGE_COMMAND_CAPACITY: usize = 1;
 
+/// Bounds how many complete source transactions share one redb commit.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CaptureBatchLimits {
+    /// Maximum grouped source transactions.
     pub(crate) max_transactions: usize,
+    /// Soft grouped event boundary.
     pub(crate) max_events: usize,
+    /// Soft grouped decoded-byte boundary.
     pub(crate) max_bytes: u64,
+    /// Maximum wait measured from the first grouped transaction.
     pub(crate) max_delay: Duration,
 }
 
+/// Accumulates complete source transactions and their resource totals.
 #[derive(Default)]
 pub(crate) struct CaptureBatch {
+    /// Whole source transactions preserved in commit order.
     pub(crate) transactions: Vec<CapturedTransaction>,
+    /// Total consumer events across the grouped transactions.
     pub(crate) event_count: usize,
+    /// Total estimated decoded bytes across the group.
     pub(crate) decoded_bytes: u64,
+    /// Total staged representation bytes across the group.
     pub(crate) staged_bytes: u64,
+    /// Transactions whose events currently live in staging files.
     pub(crate) staged_transaction_count: usize,
+    /// Time the first transaction entered this group.
     started_at: Option<TokioInstant>,
 }
 
 impl CaptureBatch {
+    /// Adds a whole source transaction and updates aggregate accounting.
     pub(crate) fn push(&mut self, transaction: CapturedTransaction) {
         let stats = transaction.events.stats();
         if self.transactions.is_empty() {
@@ -44,10 +59,15 @@ impl CaptureBatch {
         self.transactions.push(transaction);
     }
 
+    /// Returns true when the batch contains no source transactions.
     pub(crate) fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
+    /// Checks whether adding a transaction would exceed a non-empty batch's limits.
+    ///
+    /// An empty batch always accepts one transaction so a source transaction is
+    /// never split merely to satisfy redb group-commit limits.
     pub(crate) fn would_exceed(
         &self,
         transaction: &CapturedTransaction,
@@ -62,12 +82,14 @@ impl CaptureBatch {
             || self.decoded_bytes.saturating_add(stats.decoded_bytes) > limits.max_bytes
     }
 
+    /// Returns true when the current batch has met any flush boundary.
     pub(crate) fn reached_limit(&self, limits: CaptureBatchLimits) -> bool {
         self.transactions.len() >= limits.max_transactions
             || self.event_count >= limits.max_events
             || self.decoded_bytes >= limits.max_bytes
     }
 
+    /// Returns when the oldest transaction in this batch must be flushed.
     pub(crate) fn deadline(&self, limits: CaptureBatchLimits) -> TokioInstant {
         self.started_at
             .expect("non-empty capture batch has a start time")
@@ -75,27 +97,32 @@ impl CaptureBatch {
     }
 }
 
+/// Owns the lifetime of the dedicated redb writer thread.
 pub(crate) struct CaptureStorageWriter {
     handle: Option<CaptureStorageHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// Sends serialized storage commands to the dedicated writer.
 #[derive(Clone)]
 pub(crate) struct CaptureStorageHandle {
     sender: mpsc::Sender<StorageCommand>,
 }
 
+/// Tracks one submitted batch until its redb result is available.
 pub(crate) struct PendingCaptureWrite {
     pub(crate) response: oneshot::Receiver<StorageCompletion>,
     pub(crate) event_count: usize,
 }
 
+/// Returns both the original batch and its storage result to the async pipeline.
 pub(crate) struct StorageCompletion {
     pub(crate) batch: CaptureBatch,
     pub(crate) result: Result<PersistTransactionOutcome, StorageError>,
     pub(crate) persist_latency: Option<Duration>,
 }
 
+/// Carries all state required to persist and report one capture batch.
 struct PersistCommand {
     batch: CaptureBatch,
     measure_latency: bool,
@@ -104,6 +131,7 @@ struct PersistCommand {
     response: oneshot::Sender<StorageCompletion>,
 }
 
+/// Enumerates writes that must be serialized against the same redb database.
 enum StorageCommand {
     Persist(PersistCommand),
     Prune {
@@ -114,6 +142,7 @@ enum StorageCommand {
 }
 
 impl CaptureStorageWriter {
+    /// Starts the long-lived OS thread that owns synchronous storage work.
     pub(crate) fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<StorageCommand>(STORAGE_COMMAND_CAPACITY);
         let thread = thread::Builder::new()
@@ -147,6 +176,7 @@ impl CaptureStorageWriter {
         })
     }
 
+    /// Clones a lightweight command handle for retention or other producers.
     pub(crate) fn handle(&self) -> CaptureStorageHandle {
         self.handle
             .as_ref()
@@ -154,6 +184,7 @@ impl CaptureStorageWriter {
             .clone()
     }
 
+    /// Queues one capture batch and returns a receiver for its eventual result.
     pub(crate) async fn submit(
         &self,
         batch: CaptureBatch,
@@ -218,6 +249,7 @@ impl CaptureStorageWriter {
 }
 
 impl CaptureStorageHandle {
+    /// Queues one retention sweep behind any capture write already in progress.
     pub(crate) async fn prune(
         &self,
         policy: RetentionPolicy,
@@ -239,6 +271,7 @@ impl CaptureStorageHandle {
     }
 }
 
+/// Persists a batch and sends its ownership and result back to the async caller.
 fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: PersistCommand) {
     #[cfg(test)]
     if let Some(delay) = command.delay_before_persist {
@@ -269,6 +302,7 @@ fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: Per
 
 impl Drop for CaptureStorageWriter {
     fn drop(&mut self) {
+        // Drop every sender before joining so blocking_recv can observe closure.
         self.handle.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

@@ -1,3 +1,5 @@
+//! Connects PostgreSQL logical replication to LightCDC's transaction model.
+
 /// pgoutput protocol decoding.
 pub mod decoder;
 /// PostgreSQL logical replication capture.

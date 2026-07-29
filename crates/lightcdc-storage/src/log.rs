@@ -1,3 +1,5 @@
+//! Implements the durable redb event log, checkpoints, deduplication, and retention.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -34,32 +36,44 @@ pub struct LogOpenOptions {
 /// Summarizes the rows stored in each LightCDC redb table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreStats {
+    /// Retained event payload rows.
     pub event_count: u64,
+    /// Deduplication identifiers, including any preserved past retention.
     pub event_id_count: u64,
+    /// Durable PostgreSQL source checkpoints.
     pub source_offset_count: u64,
+    /// Durable stream consumer checkpoints.
     pub consumer_offset_count: u64,
 }
 
 /// Describes one persisted PostgreSQL source checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceOffset {
+    /// Configured source identity.
     pub source_name: String,
+    /// Last durably persisted PostgreSQL commit LSN.
     pub lsn: String,
 }
 
 /// Describes one persisted stream consumer checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerOffset {
+    /// Stream whose filtered event sequence is consumed.
     pub stream_name: String,
+    /// Downstream-provided durable consumer identity.
     pub consumer_name: String,
+    /// Last sequence acknowledged or explicitly selected by seek.
     pub sequence: u64,
 }
 
 /// Configures hard event-log retention limits; either limit may delete an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
+    /// Maximum retained event payload count.
     pub max_events: Option<u64>,
+    /// Maximum retained event payload age.
     pub max_age: Option<Duration>,
+    /// Maximum prefix entries deleted in one redb transaction.
     pub delete_batch_size: usize,
 }
 
@@ -73,16 +87,22 @@ impl RetentionPolicy {
 /// Summarizes one atomic event-log retention sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionOutcome {
+    /// Event payload rows removed by the sweep.
     pub deleted_events: u64,
+    /// Deduplication identifiers old enough to remove safely.
     pub deleted_event_ids: u64,
+    /// Oldest sequence whose payload remains after the sweep.
     pub first_retained_sequence: Option<u64>,
+    /// Highest sequence ever assigned, which retention never rewinds.
     pub high_watermark: Option<u64>,
 }
 
 /// Describes whether a committed source transaction was newly stored or replayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistTransactionOutcome {
+    /// The source transaction and checkpoint were newly committed.
     Persisted,
+    /// Every event id was already durable, while the checkpoint was refreshed.
     AlreadyPersisted,
 }
 
@@ -196,6 +216,7 @@ impl RedbEventStore {
         )
     }
 
+    /// Flattens complete source transactions into one atomic redb write.
     fn persist_transaction_batch_before_commit<F>(
         &self,
         transaction_events: &[&TransactionEvents],
@@ -253,6 +274,7 @@ impl RedbEventStore {
         )
     }
 
+    /// Persists streamed events, deduplication IDs, and the source LSN together.
     fn persist_transaction_iter<I, F>(
         &self,
         event_count: usize,
@@ -504,6 +526,8 @@ impl RedbEventStore {
             let mut deleted_event_ids = 0u64;
             for (sequence, event_id) in &candidates {
                 drop(events.remove(*sequence).map_err(redb_error)?);
+                // Keep recent deduplication IDs after payload retention so a
+                // source transaction replay cannot recreate deleted events.
                 if replay_floor.is_some_and(|floor| *sequence < floor)
                     && event_ids
                         .remove(event_id.as_str())
@@ -788,10 +812,12 @@ impl StorageError {
     }
 }
 
+/// Erases redb's operation-specific error types behind the storage error API.
 fn redb_error(error: impl ToString) -> StorageError {
     StorageError::Redb(error.to_string())
 }
 
+/// Encodes a stream and consumer pair into one unambiguous redb string key.
 fn consumer_offset_key(stream_name: &str, consumer_name: &str) -> String {
     format!("{stream_name}{CONSUMER_OFFSET_SEPARATOR}{consumer_name}")
 }

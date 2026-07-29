@@ -1,3 +1,5 @@
+//! Collapses benchmark logs and JSON Lines metrics into one comparable CSV row.
+
 use std::{
     collections::HashMap,
     fs,
@@ -20,6 +22,7 @@ struct Args {
     header: bool,
 }
 
+/// Reads one benchmark result directory and prints its CSV summary.
 fn main() -> Result<()> {
     let args = Args::parse();
     let summary = BenchmarkSummary::read(&args.result_dir)?;
@@ -30,6 +33,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Holds the normalized metrics selected from one benchmark run.
 #[derive(Debug)]
 struct BenchmarkSummary {
     run_id: String,
@@ -53,6 +57,7 @@ struct BenchmarkSummary {
 }
 
 impl BenchmarkSummary {
+    /// Loads environment, capture, consumer, pgbench, and PostgreSQL metrics.
     fn read(result_dir: &Path) -> Result<Self> {
         let environment = read_environment(&result_dir.join("environment.txt"))?;
         let capture = read_json_lines(&result_dir.join("capture.jsonl"))?;
@@ -91,6 +96,7 @@ impl BenchmarkSummary {
         })
     }
 
+    /// Formats the summary in the stable benchmark CSV column order.
     fn csv_row(&self) -> String {
         let target_events_per_second = self.target_tps.saturating_mul(self.rows_per_transaction);
         let actual_events_per_second = self.actual_tps * self.rows_per_transaction as f64;
@@ -126,6 +132,7 @@ impl BenchmarkSummary {
     }
 }
 
+/// Performs division while treating an absent denominator as zero output.
 fn divide(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -134,6 +141,7 @@ fn divide(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+/// Parses the benchmark's line-oriented `key=value` environment snapshot.
 fn read_environment(path: &Path) -> Result<HashMap<String, String>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read benchmark environment {}", path.display()))?;
@@ -144,6 +152,7 @@ fn read_environment(path: &Path) -> Result<HashMap<String, String>> {
         .collect())
 }
 
+/// Reads a required environment snapshot value.
 fn required_environment<'a>(
     environment: &'a HashMap<String, String>,
     key: &str,
@@ -154,6 +163,7 @@ fn required_environment<'a>(
         .with_context(|| format!("benchmark environment is missing {key}"))
 }
 
+/// Parses a required environment snapshot value into its target type.
 fn parse_environment<T>(environment: &HashMap<String, String>, key: &str) -> Result<T>
 where
     T: std::str::FromStr,
@@ -164,6 +174,7 @@ where
         .with_context(|| format!("parse benchmark environment value {key}"))
 }
 
+/// Parses every non-empty JSON Lines metric report in a file.
 fn read_json_lines(path: &Path) -> Result<Vec<Value>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read benchmark metrics {}", path.display()))?;
@@ -174,6 +185,7 @@ fn read_json_lines(path: &Path) -> Result<Vec<Value>> {
         .collect()
 }
 
+/// Finds the largest unsigned top-level metric across reports.
 fn max_u64(reports: &[Value], key: &str) -> u64 {
     reports
         .iter()
@@ -182,6 +194,7 @@ fn max_u64(reports: &[Value], key: &str) -> u64 {
         .unwrap_or_default()
 }
 
+/// Finds the largest floating-point metric at a nested JSON path.
 fn max_f64(reports: &[Value], path: &[&str]) -> f64 {
     reports
         .iter()
@@ -193,6 +206,7 @@ fn max_f64(reports: &[Value], path: &[&str]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Extracts pgbench's completed transaction count.
 fn parse_processed_transactions(log: &str) -> Option<u64> {
     log.lines().find_map(|line| {
         let value = line
@@ -207,6 +221,7 @@ fn parse_processed_transactions(log: &str) -> Option<u64> {
     })
 }
 
+/// Extracts pgbench's measured transactions per second.
 fn parse_actual_tps(log: &str) -> Option<f64> {
     log.lines().find_map(|line| {
         line.trim()
@@ -218,6 +233,7 @@ fn parse_actual_tps(log: &str) -> Option<f64> {
     })
 }
 
+/// Finds the largest retained-WAL sample in PostgreSQL benchmark metrics.
 fn max_retained_wal(path: &Path) -> Result<u64> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read PostgreSQL metrics {}", path.display()))?;
