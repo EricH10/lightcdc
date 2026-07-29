@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use lightcdc_core::ChangeEvent;
@@ -14,7 +15,12 @@ const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
 const EVENT_IDS: TableDefinition<&str, u64> = TableDefinition::new("event_ids");
 const SOURCE_OFFSETS: TableDefinition<&str, &str> = TableDefinition::new("source_offsets");
 const CONSUMER_OFFSETS: TableDefinition<&str, u64> = TableDefinition::new("consumer_offsets");
+const SOURCE_REPLAY_FLOORS: TableDefinition<&str, u64> =
+    TableDefinition::new("source_replay_floors");
+const METADATA: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const CONSUMER_OFFSET_SEPARATOR: char = '\u{1f}';
+const EVENT_HIGH_WATERMARK_KEY: &str = "event_high_watermark";
+const RETENTION_FLOOR_KEY: &str = "retention_floor";
 
 /// Describes where the redb event log should be opened.
 #[derive(Debug, Clone)]
@@ -47,6 +53,30 @@ pub struct ConsumerOffset {
     pub stream_name: String,
     pub consumer_name: String,
     pub sequence: u64,
+}
+
+/// Configures hard event-log retention limits; either limit may delete an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub max_events: Option<u64>,
+    pub max_age: Option<Duration>,
+    pub delete_batch_size: usize,
+}
+
+impl RetentionPolicy {
+    /// Returns true when at least one retention boundary is configured.
+    pub fn is_enabled(self) -> bool {
+        self.max_events.is_some() || self.max_age.is_some()
+    }
+}
+
+/// Summarizes one atomic event-log retention sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub deleted_events: u64,
+    pub deleted_event_ids: u64,
+    pub first_retained_sequence: Option<u64>,
+    pub high_watermark: Option<u64>,
 }
 
 /// Describes whether a committed source transaction was newly stored or replayed.
@@ -94,6 +124,7 @@ impl RedbEventStore {
         {
             let mut events = write.open_table(EVENTS).map_err(redb_error)?;
             let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
+            let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
 
             if events.get(event.sequence).map_err(redb_error)?.is_some() {
                 return Err(StorageError::DuplicateSequence(event.sequence));
@@ -112,6 +143,15 @@ impl RedbEventStore {
                 .map_err(redb_error)?;
             event_ids
                 .insert(event.event_id.as_str(), event.sequence)
+                .map_err(redb_error)?;
+            let high_watermark = metadata
+                .get(EVENT_HIGH_WATERMARK_KEY)
+                .map_err(redb_error)?
+                .map_or(event.sequence, |current| {
+                    current.value().max(event.sequence)
+                });
+            metadata
+                .insert(EVENT_HIGH_WATERMARK_KEY, high_watermark)
                 .map_err(redb_error)?;
         }
 
@@ -138,16 +178,55 @@ impl RedbEventStore {
         source_name: &str,
         source_lsn: &str,
     ) -> Result<PersistTransactionOutcome, StorageError> {
-        let events = transaction_events
-            .iter()?
-            .map(|event| event.map_err(StorageError::from));
-        self.persist_transaction_iter(
-            transaction_events.len(),
-            events,
+        self.persist_transaction_batch(&[transaction_events], source_name, source_lsn)
+    }
+
+    /// Atomically persists several complete source transactions and their final LSN.
+    pub fn persist_transaction_batch(
+        &self,
+        transaction_events: &[&TransactionEvents],
+        source_name: &str,
+        source_lsn: &str,
+    ) -> Result<PersistTransactionOutcome, StorageError> {
+        self.persist_transaction_batch_before_commit(
+            transaction_events,
             source_name,
             source_lsn,
             || Ok(()),
         )
+    }
+
+    fn persist_transaction_batch_before_commit<F>(
+        &self,
+        transaction_events: &[&TransactionEvents],
+        source_name: &str,
+        source_lsn: &str,
+        before_commit: F,
+    ) -> Result<PersistTransactionOutcome, StorageError>
+    where
+        F: FnOnce() -> Result<(), StorageError>,
+    {
+        if transaction_events.is_empty() {
+            return Err(StorageError::EmptyTransactionBatch);
+        }
+
+        let event_count = transaction_events
+            .iter()
+            .try_fold(0usize, |total, transaction| {
+                total
+                    .checked_add(transaction.len())
+                    .ok_or(StorageError::TransactionBatchEventCountOverflow)
+            })?;
+        let event_iterators = transaction_events
+            .iter()
+            .map(|transaction| transaction.iter())
+            .collect::<Result<Vec<_>, _>>()?;
+        let events = event_iterators
+            .into_iter()
+            .flatten()
+            .map(|event| event.map_err(StorageError::from));
+
+        self.persist_transaction_iter(event_count, events, source_name, source_lsn, before_commit)
     }
 
     /// Exposes the exact pre-commit boundary for deterministic rollback testing.
@@ -192,8 +271,13 @@ impl RedbEventStore {
             let mut events = write.open_table(EVENTS).map_err(redb_error)?;
             let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
             let mut source_offsets = write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
+            let mut source_replay_floors =
+                write.open_table(SOURCE_REPLAY_FLOORS).map_err(redb_error)?;
+            let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
             let mut duplicate_count = 0;
             let mut new_count = 0;
+            let mut first_new_sequence = None;
+            let mut last_new_sequence = None;
 
             for event in transaction_events {
                 let event = event?;
@@ -230,6 +314,8 @@ impl RedbEventStore {
                 event_ids
                     .insert(event.event_id.as_str(), event.sequence)
                     .map_err(redb_error)?;
+                first_new_sequence.get_or_insert(event.sequence);
+                last_new_sequence = Some(event.sequence);
                 new_count += 1;
             }
 
@@ -242,6 +328,20 @@ impl RedbEventStore {
             source_offsets
                 .insert(source_name, source_lsn)
                 .map_err(redb_error)?;
+            if let (Some(first_sequence), Some(last_sequence)) =
+                (first_new_sequence, last_new_sequence)
+            {
+                source_replay_floors
+                    .insert(source_name, first_sequence)
+                    .map_err(redb_error)?;
+                let high_watermark = metadata
+                    .get(EVENT_HIGH_WATERMARK_KEY)
+                    .map_err(redb_error)?
+                    .map_or(last_sequence, |current| current.value().max(last_sequence));
+                metadata
+                    .insert(EVENT_HIGH_WATERMARK_KEY, high_watermark)
+                    .map_err(redb_error)?;
+            }
             outcome
         };
 
@@ -255,13 +355,24 @@ impl RedbEventStore {
         Ok(self.last_sequence()?.map_or(1, |sequence| sequence + 1))
     }
 
-    /// Returns the highest stored event sequence.
+    /// Returns the highest event sequence ever assigned, including retained-away events.
     pub fn last_sequence(&self) -> Result<Option<u64>, StorageError> {
+        let read = self.db.begin_read().map_err(redb_error)?;
+        let metadata = read.open_table(METADATA).map_err(redb_error)?;
+
+        Ok(metadata
+            .get(EVENT_HIGH_WATERMARK_KEY)
+            .map_err(redb_error)?
+            .map(|sequence| sequence.value()))
+    }
+
+    /// Returns the oldest event sequence whose payload is still retained.
+    pub fn first_sequence(&self) -> Result<Option<u64>, StorageError> {
         let read = self.db.begin_read().map_err(redb_error)?;
         let events = read.open_table(EVENTS).map_err(redb_error)?;
 
         Ok(events
-            .last()
+            .first()
             .map_err(redb_error)?
             .map(|(sequence, _payload)| sequence.value()))
     }
@@ -274,7 +385,20 @@ impl RedbEventStore {
     ) -> Result<Vec<ChangeEvent>, StorageError> {
         let read = self.db.begin_read().map_err(redb_error)?;
         let events = read.open_table(EVENTS).map_err(redb_error)?;
+        let metadata = read.open_table(METADATA).map_err(redb_error)?;
         let mut output = Vec::with_capacity(limit);
+
+        if let Some(first_available) = metadata
+            .get(RETENTION_FLOOR_KEY)
+            .map_err(redb_error)?
+            .map(|sequence| sequence.value())
+            && sequence < first_available
+        {
+            return Err(StorageError::SequenceExpired {
+                requested: sequence,
+                first_available,
+            });
+        }
 
         for entry in events.range(sequence..).map_err(redb_error)?.take(limit) {
             let (_sequence, payload) = entry.map_err(redb_error)?;
@@ -282,6 +406,147 @@ impl RedbEventStore {
         }
 
         Ok(output)
+    }
+
+    /// Atomically removes one bounded prefix that exceeds count or age retention.
+    pub fn prune_events(
+        &self,
+        policy: RetentionPolicy,
+        now_ms: i64,
+    ) -> Result<RetentionOutcome, StorageError> {
+        if !policy.is_enabled() {
+            return Ok(RetentionOutcome {
+                deleted_events: 0,
+                deleted_event_ids: 0,
+                first_retained_sequence: self.first_sequence()?,
+                high_watermark: self.last_sequence()?,
+            });
+        }
+        if policy.delete_batch_size == 0 {
+            return Err(StorageError::InvalidRetentionPolicy(
+                "delete_batch_size must be greater than zero".to_owned(),
+            ));
+        }
+
+        let (candidates, replay_floor, first_retained_sequence, high_watermark) = {
+            let read = self.db.begin_read().map_err(redb_error)?;
+            let replay_floor = {
+                let replay_floors = read.open_table(SOURCE_REPLAY_FLOORS).map_err(redb_error)?;
+                let mut minimum = None;
+                for entry in replay_floors.iter().map_err(redb_error)? {
+                    let (_source, floor) = entry.map_err(redb_error)?;
+                    minimum =
+                        Some(minimum.map_or(floor.value(), |value: u64| value.min(floor.value())));
+                }
+                minimum
+            };
+            let events = read.open_table(EVENTS).map_err(redb_error)?;
+            let retained_count = events.len().map_err(redb_error)?;
+            let count_excess = policy
+                .max_events
+                .map_or(0, |max_events| retained_count.saturating_sub(max_events));
+            let age_cutoff_ms = policy.max_age.map(|max_age| {
+                let age_ms = max_age.as_millis().min(i64::MAX as u128) as i64;
+                now_ms.saturating_sub(age_ms)
+            });
+            let mut candidates = Vec::new();
+
+            for (index, entry) in events
+                .iter()
+                .map_err(redb_error)?
+                .take(policy.delete_batch_size)
+                .enumerate()
+            {
+                let (sequence, payload) = entry.map_err(redb_error)?;
+                let event: ChangeEvent = serde_json::from_slice(payload.value())?;
+                let exceeds_count = (index as u64) < count_excess;
+                let exceeds_age = age_cutoff_ms.is_some_and(|cutoff| {
+                    event
+                        .commit_timestamp_ms
+                        .is_some_and(|timestamp| timestamp <= cutoff)
+                });
+                if !exceeds_count && !exceeds_age {
+                    break;
+                }
+                candidates.push((sequence.value(), event.event_id));
+            }
+            let first_retained_sequence = events
+                .first()
+                .map_err(redb_error)?
+                .map(|(sequence, _payload)| sequence.value());
+            let metadata = read.open_table(METADATA).map_err(redb_error)?;
+            let high_watermark = metadata
+                .get(EVENT_HIGH_WATERMARK_KEY)
+                .map_err(redb_error)?
+                .map(|sequence| sequence.value());
+
+            (
+                candidates,
+                replay_floor,
+                first_retained_sequence,
+                high_watermark,
+            )
+        };
+
+        if candidates.is_empty() {
+            return Ok(RetentionOutcome {
+                deleted_events: 0,
+                deleted_event_ids: 0,
+                first_retained_sequence,
+                high_watermark,
+            });
+        }
+
+        let write = self.db.begin_write().map_err(redb_error)?;
+        let (deleted_event_ids, first_retained_sequence, high_watermark) = {
+            let mut events = write.open_table(EVENTS).map_err(redb_error)?;
+            let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
+            let mut deleted_event_ids = 0u64;
+            for (sequence, event_id) in &candidates {
+                drop(events.remove(*sequence).map_err(redb_error)?);
+                if replay_floor.is_some_and(|floor| *sequence < floor)
+                    && event_ids
+                        .remove(event_id.as_str())
+                        .map_err(redb_error)?
+                        .is_some()
+                {
+                    deleted_event_ids += 1;
+                }
+            }
+            let first_retained_sequence = events
+                .first()
+                .map_err(redb_error)?
+                .map(|(sequence, _payload)| sequence.value());
+            let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
+            let high_watermark = metadata
+                .get(EVENT_HIGH_WATERMARK_KEY)
+                .map_err(redb_error)?
+                .map(|sequence| sequence.value());
+            if !candidates.is_empty()
+                && let Some(first_available) = first_retained_sequence
+                    .or_else(|| high_watermark.map(|sequence| sequence.saturating_add(1)))
+            {
+                let retention_floor = metadata
+                    .get(RETENTION_FLOOR_KEY)
+                    .map_err(redb_error)?
+                    .map_or(first_available, |current| {
+                        current.value().max(first_available)
+                    });
+                metadata
+                    .insert(RETENTION_FLOOR_KEY, retention_floor)
+                    .map_err(redb_error)?;
+            }
+
+            (deleted_event_ids, first_retained_sequence, high_watermark)
+        };
+        write.commit().map_err(redb_error)?;
+
+        Ok(RetentionOutcome {
+            deleted_events: candidates.len() as u64,
+            deleted_event_ids,
+            first_retained_sequence,
+            high_watermark,
+        })
     }
 
     /// Returns row counts for the tables that make up the event store.
@@ -438,10 +703,27 @@ impl RedbEventStore {
         let write = self.db.begin_write().map_err(redb_error)?;
 
         {
-            write.open_table(EVENTS).map_err(redb_error)?;
+            let events = write.open_table(EVENTS).map_err(redb_error)?;
+            let existing_high_watermark = events
+                .last()
+                .map_err(redb_error)?
+                .map(|(sequence, _payload)| sequence.value());
+            drop(events);
             write.open_table(EVENT_IDS).map_err(redb_error)?;
             write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
             write.open_table(CONSUMER_OFFSETS).map_err(redb_error)?;
+            write.open_table(SOURCE_REPLAY_FLOORS).map_err(redb_error)?;
+            let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
+            if metadata
+                .get(EVENT_HIGH_WATERMARK_KEY)
+                .map_err(redb_error)?
+                .is_none()
+                && let Some(high_watermark) = existing_high_watermark
+            {
+                metadata
+                    .insert(EVENT_HIGH_WATERMARK_KEY, high_watermark)
+                    .map_err(redb_error)?;
+            }
         }
 
         write.commit().map_err(redb_error)?;
@@ -470,6 +752,12 @@ pub enum StorageError {
     #[error("duplicate event sequence: {0}")]
     DuplicateSequence(u64),
 
+    #[error("cannot persist an empty source transaction batch")]
+    EmptyTransactionBatch,
+
+    #[error("source transaction batch event count overflowed")]
+    TransactionBatchEventCountOverflow,
+
     #[error(
         "source transaction is only partially persisted: {duplicate_count} of {event_count} events already exist"
     )]
@@ -480,6 +768,17 @@ pub enum StorageError {
 
     #[error("invalid stored consumer offset key: {0:?}")]
     InvalidConsumerOffsetKey(String),
+
+    #[error(
+        "event sequence {requested} is no longer retained; first available sequence is {first_available}"
+    )]
+    SequenceExpired {
+        requested: u64,
+        first_available: u64,
+    },
+
+    #[error("invalid retention policy: {0}")]
+    InvalidRetentionPolicy(String),
 }
 
 impl StorageError {
@@ -499,10 +798,14 @@ fn consumer_offset_key(stream_name: &str, consumer_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use lightcdc_core::{ChangeEvent, Operation, SourceMetadata};
     use tempfile::TempDir;
 
-    use super::{LogOpenOptions, PersistTransactionOutcome, RedbEventStore, StorageError};
+    use super::{
+        LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionPolicy, StorageError,
+    };
     use crate::{TransactionBuffer, TransactionBufferOptions, TransactionEvents};
 
     #[test]
@@ -719,6 +1022,131 @@ mod tests {
     }
 
     #[test]
+    fn source_transaction_batch_uses_one_atomic_commit_and_final_lsn() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+
+        let mut first_buffer =
+            TransactionBuffer::new(TransactionBufferOptions::unbounded_in_memory())
+                .expect("first buffer");
+        first_buffer.begin(41).expect("begin first transaction");
+        first_buffer.push(event(1, "0/1")).expect("first event");
+        let first = first_buffer.finish().expect("finish first transaction");
+
+        let staged_options =
+            TransactionBufferOptions::bounded(temp.path(), "default", 1, 1_000_000, 10);
+        let mut second_buffer = TransactionBuffer::new(staged_options).expect("second buffer");
+        second_buffer.begin(42).expect("begin second transaction");
+        second_buffer.push(event(2, "0/2")).expect("second event");
+        second_buffer.push(event(3, "0/3")).expect("third event");
+        let second = second_buffer.finish().expect("finish second transaction");
+        assert!(second.is_staged());
+
+        let outcome = store
+            .persist_transaction_batch(&[&first, &second], "default", "0/4")
+            .expect("persist source transaction batch");
+
+        assert_eq!(outcome, PersistTransactionOutcome::Persisted);
+        assert_eq!(
+            store.replay_from(1, 10).expect("replay batch"),
+            [event(1, "0/1"), event(2, "0/2"), event(3, "0/3")]
+        );
+        assert_eq!(
+            store.source_offset("default").expect("source offset"),
+            Some("0/4".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_source_transaction_batch_is_rejected() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+
+        let error = store
+            .persist_transaction_batch(&[], "default", "0/1")
+            .expect_err("empty batch should fail");
+
+        assert!(matches!(error, StorageError::EmptyTransactionBatch));
+        assert_eq!(store.source_offset("default").expect("source offset"), None);
+    }
+
+    #[test]
+    fn eventless_source_transaction_advances_only_the_checkpoint() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        let mut buffer = TransactionBuffer::new(TransactionBufferOptions::unbounded_in_memory())
+            .expect("transaction buffer");
+        buffer.begin(42).expect("begin transaction");
+        let eventless = buffer.finish().expect("finish eventless transaction");
+
+        let outcome = store
+            .persist_transaction_events(&eventless, "default", "0/10")
+            .expect("persist checkpoint-only transaction");
+
+        assert_eq!(outcome, PersistTransactionOutcome::Persisted);
+        assert!(store.replay_from(1, 10).expect("replay").is_empty());
+        assert_eq!(store.last_sequence().expect("high watermark"), None);
+        assert_eq!(store.next_sequence().expect("next sequence"), 1);
+        assert_eq!(
+            store.source_offset("default").expect("source offset"),
+            Some("0/10".to_owned())
+        );
+    }
+
+    #[test]
+    fn source_transaction_batch_rolls_back_all_events_and_final_lsn() {
+        let temp = TempDir::new().expect("temp dir");
+        let options = LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        };
+        let store = RedbEventStore::open(&options).expect("open store");
+
+        let mut first_buffer =
+            TransactionBuffer::new(TransactionBufferOptions::unbounded_in_memory())
+                .expect("first buffer");
+        first_buffer.begin(41).expect("begin first transaction");
+        first_buffer.push(event(1, "0/1")).expect("first event");
+        let first = first_buffer.finish().expect("finish first transaction");
+
+        let mut second_buffer =
+            TransactionBuffer::new(TransactionBufferOptions::unbounded_in_memory())
+                .expect("second buffer");
+        second_buffer.begin(42).expect("begin second transaction");
+        second_buffer.push(event(2, "0/2")).expect("second event");
+        let second = second_buffer.finish().expect("finish second transaction");
+
+        let error = store
+            .persist_transaction_batch_before_commit(&[&first, &second], "default", "0/3", || {
+                Err(StorageError::Redb(
+                    "injected group failure before commit".to_owned(),
+                ))
+            })
+            .expect_err("injected persistence failure");
+        assert!(matches!(error, StorageError::Redb(_)));
+        drop(store);
+
+        let reopened = RedbEventStore::open(&options).expect("reopen store");
+        assert!(reopened.replay_from(1, 10).expect("replay").is_empty());
+        assert_eq!(
+            reopened.source_offset("default").expect("source offset"),
+            None
+        );
+    }
+
+    #[test]
     fn pre_commit_failure_rolls_back_events_ids_and_source_offset() {
         let temp = TempDir::new().expect("temp dir");
         let options = LogOpenOptions {
@@ -845,6 +1273,92 @@ mod tests {
             store.source_offset("default").expect("source offset"),
             Some("0/4".to_owned())
         );
+    }
+
+    #[test]
+    fn count_retention_prunes_payloads_without_resetting_sequence_numbers() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        store
+            .persist_transaction(&[event(1, "0/1"), event(2, "0/2")], "default", "0/3")
+            .expect("persist first batch");
+        store
+            .persist_transaction(&[event(3, "0/3")], "default", "0/4")
+            .expect("persist latest batch");
+
+        let outcome = store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: Some(1),
+                    max_age: None,
+                    delete_batch_size: 10,
+                },
+                i64::MAX,
+            )
+            .expect("prune events");
+
+        assert_eq!(outcome.deleted_events, 2);
+        assert_eq!(outcome.deleted_event_ids, 2);
+        assert_eq!(outcome.first_retained_sequence, Some(3));
+        assert_eq!(outcome.high_watermark, Some(3));
+        assert_eq!(store.next_sequence().expect("next sequence"), 4);
+        assert!(matches!(
+            store.replay_from(1, 10),
+            Err(StorageError::SequenceExpired {
+                requested: 1,
+                first_available: 3
+            })
+        ));
+        assert_eq!(
+            store.replay_from(3, 10).expect("retained events"),
+            [event(3, "0/3")]
+        );
+        assert_eq!(store.stats().expect("stats").event_id_count, 1);
+    }
+
+    #[test]
+    fn age_retention_keeps_latest_checkpoint_ids_for_source_replay() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        let original = [event(1, "0/1"), event(2, "0/2")];
+        store
+            .persist_transaction(&original, "default", "0/3")
+            .expect("persist checkpoint");
+
+        let outcome = store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: None,
+                    max_age: Some(Duration::from_secs(1)),
+                    delete_batch_size: 10,
+                },
+                1_784_862_082_000,
+            )
+            .expect("prune expired events");
+
+        assert_eq!(outcome.deleted_events, 2);
+        assert_eq!(outcome.deleted_event_ids, 0);
+        assert_eq!(store.next_sequence().expect("next sequence"), 3);
+        assert_eq!(store.stats().expect("stats").event_id_count, 2);
+
+        let mut replayed = original;
+        replayed[0].sequence = 3;
+        replayed[1].sequence = 4;
+        assert_eq!(
+            store
+                .persist_transaction(&replayed, "default", "0/3")
+                .expect("deduplicate replay"),
+            PersistTransactionOutcome::AlreadyPersisted
+        );
+        assert_eq!(store.next_sequence().expect("next sequence"), 3);
     }
 
     fn event(sequence: u64, lsn: &str) -> ChangeEvent {

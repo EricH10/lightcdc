@@ -39,6 +39,33 @@ For a bounded local smoke test:
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml --max-events 3
 ```
 
+Capture keeps the union of tables selected by configured durable streams, even
+when no consumer is currently connected:
+
+```toml
+[[streams]]
+name = "orders"
+source = "default"
+tables = ["public.orders"]
+```
+
+The PostgreSQL publication must contain every table matched by the stream
+configuration. Startup fails when a required table is missing and warns when
+the publication contains unnecessary tables. The publication remains
+operator-managed; LightCDC also filters unmatched published tables before they
+receive local event sequences or enter redb.
+
+Transactional logical heartbeats advance the replication slot safely while
+only unpublished or filtered tables are changing:
+
+```toml
+heartbeat_interval_ms = 10000
+```
+
+Heartbeat transactions persist only the source checkpoint and do not create
+consumer events. Changing a stream's tables affects future capture only;
+historical rows and changes require a snapshot or backfill.
+
 Transaction buffering is bounded by three `[runtime]` settings:
 
 ```toml
@@ -52,6 +79,39 @@ Transactions stay in memory through the threshold, then spill to
 committed transaction and source LSN atomically, PostgreSQL is acknowledged only
 after that commit, and source-scoped leftovers from an abrupt exit are removed
 after the replacement capture acquires the replication slot.
+
+Complete source transactions are grouped into one durable redb commit using:
+
+```toml
+capture_batch_max_transactions = 100
+capture_batch_max_events = 500
+capture_batch_max_bytes = 4194304
+capture_batch_max_delay_ms = 20
+```
+
+The first reached limit flushes the group. A source transaction is never split,
+and PostgreSQL is acknowledged only through the final LSN committed with the
+whole group. A dedicated `lightcdc-redb-writer` OS thread owns capture writes.
+While it commits one group, the Tokio replication task can decode the next
+group. Capture permits only one in-flight write and waits for its successful
+completion before submitting another group or acknowledging PostgreSQL.
+
+Event-log retention is optional and enforced by maximum retained events, event
+age, or whichever boundary is reached first:
+
+```toml
+retention_max_events = 10000000
+retention_max_age_seconds = 604800
+retention_check_interval_ms = 1000
+retention_delete_batch_size = 100000
+```
+
+Omit both maximum settings to disable retention. Sweeps run on the dedicated
+redb writer thread so they cannot overlap capture commits. Retention is a hard
+log boundary: a durable consumer that falls behind receives an explicit expired
+offset error and must seek to `earliest` or `latest`. `earliest` means the oldest
+payload still retained. redb reuses deleted pages for later writes, although
+the database file is not guaranteed to shrink immediately.
 
 Run capture and the gRPC API together:
 
@@ -145,8 +205,11 @@ Implemented basics:
 - Combined capture plus gRPC serving command
 - `pgoutput` relation, insert, update, delete, and truncate decoding
 - Source offset persistence and idempotent duplicate replay handling
+- Configured-stream capture planning, publication-table validation,
+  capture-side filtering, and logical heartbeat checkpoints
+- Count- and age-based event retention with explicit stale-consumer behavior
 - Bounded transaction accounting with disk-backed spill staging and crash cleanup
-- Opt-in transaction-level capture metrics and an end-to-end load-test harness
+- Opt-in capture group-commit metrics and an end-to-end load-test harness
 - Docker-backed integration tests for capture, abrupt process recovery,
   PostgreSQL reconnect, large transactions, delete identities, TOAST values,
   truncates, and relation refresh after schema changes

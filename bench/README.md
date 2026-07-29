@@ -20,7 +20,7 @@ committed-transaction boundary, with no per-event instrumentation.
 Passing `--metrics-file` opts into capture instrumentation:
 
 - One `Instant` measurement and one nonblocking fixed-size channel send occur
-  per durable source transaction, not per event.
+  per durable storage group commit, not per event.
 - A dedicated standard thread owns all counters, rate calculations, histogram
   updates, JSON serialization, and file I/O.
 - A bounded channel prevents instrumentation from applying backpressure.
@@ -52,6 +52,12 @@ DURATION_SECONDS=10 CLIENTS=4 THREADS=2 bench/run-local.sh
 The default workload inserts one 256-byte row per transaction at the maximum
 rate `pgbench` can produce.
 
+The benchmark config retains at most 1,000,000 event payloads. Retention work is
+part of the measured storage cost, and `process.csv` should show data-file
+growth approaching a plateau after the retained window fills. redb may keep
+freed pages in the file for reuse, so live retention bounds are more important
+than expecting the file to shrink during a run.
+
 Useful controls:
 
 | Variable | Default | Meaning |
@@ -69,6 +75,45 @@ Useful controls:
 The generated payload is intentionally compressible. Add an incompressible
 payload scenario before using these results to size TOAST-heavy production
 traffic.
+
+## Measure Commit And ACK Cost
+
+Run the normalized four-way matrix:
+
+```bash
+DURATION_SECONDS=10 \
+EVENT_RATES="300" \
+bench/run-cost-matrix.sh
+```
+
+For each requested event rate it crosses:
+
+| Rows/transaction | `ACK_EVERY` | Capture commits | Consumer offset commits |
+| ---: | ---: | --- | --- |
+| 1 | 1 | One per event | One per event |
+| 1 | 100 | One per event | One per 100 events |
+| 100 | 1 | One per 100 events | One per event |
+| 100 | 100 | One per 100 events | One per 100 events |
+
+The runner converts the requested event rate into a transaction rate for each
+row count. Integer rounding is reflected in `target_events_per_second` in the
+summary. It writes and prints
+`bench/results/<matrix-id>-summary.csv`, including generated, captured, and
+consumed totals; source transaction and storage commit counts; events per
+storage commit; actual event rate; persistence, end-to-end, and ACK p95
+latencies; retained WAL; and dropped metric samples.
+
+Useful cost-matrix controls:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EVENT_RATES` | `300` | Space-separated target CDC event rates |
+| `ROWS_PER_TRANSACTION_VALUES` | `1 100` | Source transaction sizes |
+| `ACK_EVERY_VALUES` | `1 100` | Consumer acknowledgement batch sizes |
+| `REPETITIONS` | `1` | Runs per combination |
+
+Use `EVENT_RATES="300 600 1200"` to compare how each write pattern approaches
+its sustainable limit.
 
 ## Find The Sustainable Limit
 
@@ -93,8 +138,17 @@ Use at least a 30-minute soak after locating the approximate limit.
 
 ## Results
 
-A dated baseline report is available at
+A dated baseline report from before commit notifications replaced polling is
+available at
 [Windows baseline benchmark — 2026-07-28](../docs/benchmarks/2026-07-28-windows-baseline.md).
+The first normalized write-cost comparison is recorded in
+[macOS commit cost benchmark — 2026-07-27](../docs/benchmarks/2026-07-27-macos-commit-cost.md).
+The capture group-commit follow-up is recorded in
+[macOS capture group commit benchmark — 2026-07-27](../docs/benchmarks/2026-07-27-capture-group-commits.md).
+The pipelined storage follow-up is recorded in
+[macOS dedicated redb writer benchmark — 2026-07-28](../docs/benchmarks/2026-07-28-dedicated-redb-writer.md).
+The first bounded-log run is recorded in
+[macOS retention smoke benchmark — 2026-07-28](../docs/benchmarks/2026-07-28-retention-smoke.md).
 
 Each run creates `bench/results/<run-id>/` containing:
 

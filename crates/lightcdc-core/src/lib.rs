@@ -5,6 +5,8 @@ pub mod error;
 /// Shared CDC event types.
 pub mod event;
 
-pub use config::{Config, LoggingConfig, RuntimeConfig, SourceConfig, StreamConfig};
+pub use config::{
+    CapturePlan, CapturePlanError, Config, LoggingConfig, RuntimeConfig, SourceConfig, StreamConfig,
+};
 pub use error::{Error, Result};
 pub use event::{ChangeEvent, Operation, SourceMetadata, TransactionMetadata};

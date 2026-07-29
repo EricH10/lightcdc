@@ -13,9 +13,17 @@ data_dir = "bench/.data"
 storage_file = "benchmark.redb"
 channel_capacity = 1024
 shutdown_timeout_ms = 10000
+heartbeat_interval_ms = 10000
 transaction_memory_threshold_bytes = 16777216
 max_transaction_bytes = 1073741824
 max_transaction_events = 1000000
+capture_batch_max_transactions = 100
+capture_batch_max_events = 500
+capture_batch_max_bytes = 4194304
+capture_batch_max_delay_ms = 20
+retention_max_events = 1000000
+retention_check_interval_ms = 100
+retention_delete_batch_size = 10000
 
 [logging]
 level = "info"

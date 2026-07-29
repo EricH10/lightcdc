@@ -17,4 +17,7 @@ pub enum Error {
         path: String,
         source: toml::de::Error,
     },
+
+    #[error("invalid config at {path}: {reason}")]
+    InvalidConfig { path: String, reason: String },
 }

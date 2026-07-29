@@ -1,25 +1,35 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
-use lightcdc_core::{ChangeEvent, Config, Operation, StreamConfig};
-use lightcdc_postgres::ReplicationReader;
+use lightcdc_api::EventNotifier;
+use lightcdc_core::{CapturePlan, ChangeEvent, Config, Operation, SourceConfig, StreamConfig};
+use lightcdc_postgres::{
+    CapturedTransaction, LogicalHeartbeatEmitter, PostgresError, ReplicationReader, TransactionRead,
+};
 use lightcdc_storage::{
-    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, TransactionBufferOptions,
+    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionPolicy,
+    TransactionBufferOptions,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::capture_metrics::CaptureMetrics;
+use crate::capture_writer::{
+    CaptureBatch, CaptureBatchLimits, CaptureStorageHandle, CaptureStorageWriter,
+    PendingCaptureWrite, StorageCompletion,
+};
 
 mod capture_metrics;
+mod capture_writer;
 
 const RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
+const HEARTBEAT_PREFIX: &str = "lightcdc.heartbeat";
 
 /// Parses the top-level lightcdc command line.
 #[derive(Debug, Parser)]
@@ -122,6 +132,78 @@ struct CaptureOptions {
     metrics_interval: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistCaptureBatchOutcome {
+    Persisted(usize),
+    Replayed,
+}
+
+enum CaptureProgress {
+    Transaction(Result<TransactionRead, PostgresError>),
+    Storage(anyhow::Result<StorageCompletion>),
+}
+
+struct CapturePipeline {
+    batch: CaptureBatch,
+    pending_write: Option<PendingCaptureWrite>,
+    replay_reconciled: bool,
+}
+
+impl CapturePipeline {
+    fn new(replay_reconciled: bool) -> Self {
+        Self {
+            batch: CaptureBatch::default(),
+            pending_write: None,
+            replay_reconciled,
+        }
+    }
+
+    fn buffered_event_count(&self, captured: usize) -> usize {
+        captured
+            .saturating_add(self.pending_event_count())
+            .saturating_add(self.batch.event_count)
+    }
+
+    fn pending_event_count(&self) -> usize {
+        self.pending_write
+            .as_ref()
+            .map_or(0, |pending_write| pending_write.event_count)
+    }
+
+    fn read_deadline(&self, limits: CaptureBatchLimits) -> Option<tokio::time::Instant> {
+        if self.batch.is_empty() || !self.replay_reconciled || self.pending_write.is_some() {
+            None
+        } else {
+            Some(self.batch.deadline(limits))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CaptureRetention {
+    policy: RetentionPolicy,
+    check_interval: Duration,
+}
+
+struct CaptureContext<'a> {
+    config: &'a Config,
+    store: &'a RedbEventStore,
+    storage_writer: &'a CaptureStorageWriter,
+    options: &'a CaptureOptions,
+    metrics: &'a Option<CaptureMetrics>,
+    event_notifier: &'a Option<EventNotifier>,
+    source_name: &'a str,
+    capture_plan: &'a CapturePlan,
+    heartbeat_interval: Duration,
+    batch_limits: CaptureBatchLimits,
+    transaction_buffer_options: TransactionBufferOptions,
+}
+
+enum CaptureSessionExit {
+    LimitReached,
+    Disconnected(String),
+}
+
 /// Parses CLI arguments and dispatches to the requested command.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -196,7 +278,7 @@ async fn capture(config_path: PathBuf, options: CaptureOptions) -> anyhow::Resul
     );
 
     let store = open_event_store(&config)?;
-    capture_with_store(config, store, options).await
+    capture_with_store(config, store, options, None).await
 }
 
 /// Runs capture and the gRPC server in one process sharing one event store.
@@ -220,9 +302,12 @@ async fn run(
     let store = open_event_store(&config)?;
     let server_config = config.clone();
     let server_store = store.clone();
-    let mut server =
-        tokio::spawn(async move { lightcdc_api::serve(addr, server_config, server_store).await });
-    let capture = capture_with_store(config, store, options);
+    let event_notifier = EventNotifier::new();
+    let server_notifier = event_notifier.clone();
+    let mut server = tokio::spawn(async move {
+        lightcdc_api::serve_with_notifier(addr, server_config, server_store, server_notifier).await
+    });
+    let capture = capture_with_store(config, store, options, Some(event_notifier));
     tokio::pin!(capture);
 
     tokio::select! {
@@ -251,9 +336,16 @@ async fn capture_with_store(
     config: Config,
     store: RedbEventStore,
     options: CaptureOptions,
+    event_notifier: Option<EventNotifier>,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
     let source_name = config.source.name.clone();
+    let capture_plan = config
+        .capture_plan()
+        .context("failed to compile configured stream table selection")?;
+    let heartbeat_interval = capture_heartbeat_interval(&config)?;
+    let batch_limits = capture_batch_limits(&config)?;
+    let retention = capture_retention(&config)?;
     let transaction_buffer_options = TransactionBufferOptions::bounded(
         storage.data_dir.join("staging"),
         &source_name,
@@ -274,6 +366,15 @@ async fn capture_with_store(
         transaction_memory_threshold_bytes = config.runtime.transaction_memory_threshold_bytes,
         max_transaction_bytes = config.runtime.max_transaction_bytes,
         max_transaction_events = config.runtime.max_transaction_events,
+        capture_batch_max_transactions = batch_limits.max_transactions,
+        capture_batch_max_events = batch_limits.max_events,
+        capture_batch_max_bytes = batch_limits.max_bytes,
+        capture_batch_max_delay_ms = batch_limits.max_delay.as_millis(),
+        retention_max_events = ?retention.and_then(|retention| retention.policy.max_events),
+        retention_max_age_seconds = ?retention
+            .and_then(|retention| retention.policy.max_age)
+            .map(|max_age| max_age.as_secs()),
+        heartbeat_interval_ms = heartbeat_interval.as_millis(),
         event_output = ?options.output,
         metrics_file = ?options.metrics_file,
         "opened local event store"
@@ -284,161 +385,737 @@ async fn capture_with_store(
         "capture is running; insert, update, or delete rows in the published tables"
     );
 
+    let storage_writer = CaptureStorageWriter::start(store.clone(), source_name.clone())?;
+    let retention_task = retention
+        .map(|retention| tokio::spawn(run_retention_sweeps(storage_writer.handle(), retention)));
+    let capture_result = supervise_capture(CaptureContext {
+        config: &config,
+        store: &store,
+        storage_writer: &storage_writer,
+        options: &options,
+        metrics: &metrics,
+        event_notifier: &event_notifier,
+        source_name: &source_name,
+        capture_plan: &capture_plan,
+        heartbeat_interval,
+        batch_limits,
+        transaction_buffer_options,
+    })
+    .await;
+    if let Some(retention_task) = retention_task {
+        retention_task.abort();
+        if let Err(error) = retention_task.await
+            && !error.is_cancelled()
+        {
+            warn!(%error, "retention task stopped unexpectedly");
+        }
+    }
+    capture_result
+}
+
+async fn run_retention_sweeps(storage: CaptureStorageHandle, retention: CaptureRetention) {
+    let mut interval = tokio::time::interval(retention.check_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        match storage
+            .prune(retention.policy, unix_timestamp_ms_i64())
+            .await
+        {
+            Ok(outcome) if outcome.deleted_events > 0 => {
+                info!(
+                    deleted_events = outcome.deleted_events,
+                    deleted_event_ids = outcome.deleted_event_ids,
+                    first_retained_sequence = ?outcome.first_retained_sequence,
+                    high_watermark = ?outcome.high_watermark,
+                    "pruned retained events"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "event retention sweep failed; retrying");
+            }
+        }
+    }
+}
+
+async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Result<()> {
     let mut captured = 0usize;
-    let mut source_validated = false;
     let mut retry_attempt = 0u32;
     let mut reconnect_count = 0u64;
 
+    validate_source_until_ready(&context, &mut retry_attempt, &mut reconnect_count).await?;
+    let heartbeat_task = tokio::spawn(run_logical_heartbeats(
+        context.config.source.clone(),
+        context.heartbeat_interval,
+    ));
+    let capture_result = supervise_capture_sessions(
+        &context,
+        &mut captured,
+        &mut retry_attempt,
+        &mut reconnect_count,
+    )
+    .await;
+    heartbeat_task.abort();
+    if let Err(error) = heartbeat_task.await
+        && !error.is_cancelled()
+    {
+        warn!(%error, "logical heartbeat task stopped unexpectedly");
+    }
+    capture_result
+}
+
+async fn supervise_capture_sessions(
+    context: &CaptureContext<'_>,
+    captured: &mut usize,
+    retry_attempt: &mut u32,
+    reconnect_count: &mut u64,
+) -> anyhow::Result<()> {
     loop {
-        if options.max_events.is_some_and(|max| captured >= max) {
+        if capture_limit_reached(context.options, *captured) {
             return Ok(());
         }
 
-        if !source_validated {
-            match lightcdc_postgres::validate_source_config(&config.source).await {
-                Ok(()) => source_validated = true,
-                Err(error) if error.is_retryable() => {
-                    if let Some(metrics) = &metrics {
-                        metrics.record_reconnect();
-                    }
-                    wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
-                    retry_attempt = retry_attempt.saturating_add(1);
-                    reconnect_count = reconnect_count.saturating_add(1);
-                    continue;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .context("PostgreSQL source configuration requires operator action");
-                }
+        let (mut reader, replay_reconciled) =
+            connect_capture_reader(context, retry_attempt, reconnect_count)
+                .await
+                .context("failed to connect PostgreSQL capture")?;
+
+        let session_result =
+            run_capture_session(context, &mut reader, captured, replay_reconciled).await;
+        shutdown_capture_reader(&mut reader).await;
+
+        match session_result? {
+            CaptureSessionExit::LimitReached => return Ok(()),
+            CaptureSessionExit::Disconnected(reason) => {
+                wait_before_session_reconnect(context, retry_attempt, reconnect_count, &reason)
+                    .await;
             }
         }
+    }
+}
 
-        let next_sequence = store
-            .next_sequence()
-            .context("failed to read next event sequence from redb")?;
-        let source_offset = store
-            .source_offset(&source_name)
-            .context("failed to read source offset from redb")?;
-
-        let mut reader = match ReplicationReader::connect_from_with_buffer(
-            config.source.clone(),
-            source_offset.as_deref(),
-            transaction_buffer_options.clone(),
+async fn validate_source_until_ready(
+    context: &CaptureContext<'_>,
+    retry_attempt: &mut u32,
+    reconnect_count: &mut u64,
+) -> anyhow::Result<()> {
+    loop {
+        match lightcdc_postgres::validate_source_config_with_plan(
+            &context.config.source,
+            context.capture_plan,
         )
         .await
         {
-            Ok(reader) => reader,
+            Ok(alignment) => {
+                if !alignment.unnecessary_published_tables.is_empty() {
+                    warn!(
+                        tables = ?alignment.unnecessary_published_tables,
+                        "publication contains tables that no configured stream consumes"
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if error.is_retryable() => {
+                record_capture_reconnect(context.metrics);
+                wait_before_reconnect(*retry_attempt, *reconnect_count, &error).await;
+                advance_reconnect_state(retry_attempt, reconnect_count);
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("PostgreSQL source configuration requires operator action");
+            }
+        }
+    }
+}
+
+async fn connect_capture_reader(
+    context: &CaptureContext<'_>,
+    retry_attempt: &mut u32,
+    reconnect_count: &mut u64,
+) -> anyhow::Result<(ReplicationReader, bool)> {
+    loop {
+        let next_sequence = context
+            .store
+            .next_sequence()
+            .context("failed to read next event sequence from redb")?;
+        let source_offset = context
+            .store
+            .source_offset(context.source_name)
+            .context("failed to read source offset from redb")?;
+
+        match ReplicationReader::connect_from_with_buffer_and_plan(
+            context.config.source.clone(),
+            source_offset.as_deref(),
+            context.transaction_buffer_options.clone(),
+            context.capture_plan.clone(),
+        )
+        .await
+        {
+            Ok(mut reader) => {
+                reader.set_next_sequence(next_sequence);
+                *retry_attempt = 0;
+                info!(
+                    reconnect_count = *reconnect_count,
+                    next_sequence,
+                    source_offset = ?source_offset,
+                    "PostgreSQL capture connection is ready"
+                );
+                return Ok((reader, source_offset.is_none()));
+            }
             Err(error) if error.is_fatal_capture_error() => {
                 return Err(error).context("failed to initialize transaction buffering");
             }
             Err(error) => {
-                if let Some(metrics) = &metrics {
-                    metrics.record_reconnect();
-                }
-                wait_before_reconnect(retry_attempt, reconnect_count, &error).await;
-                retry_attempt = retry_attempt.saturating_add(1);
-                reconnect_count = reconnect_count.saturating_add(1);
-                continue;
+                record_capture_reconnect(context.metrics);
+                wait_before_reconnect(*retry_attempt, *reconnect_count, &error).await;
+                advance_reconnect_state(retry_attempt, reconnect_count);
             }
-        };
+        }
+    }
+}
 
-        reader.set_next_sequence(next_sequence);
-        retry_attempt = 0;
-        info!(
-            reconnect_count,
-            next_sequence,
-            source_offset = ?source_offset,
-            "PostgreSQL capture connection is ready"
-        );
+async fn run_capture_session(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    captured: &mut usize,
+    replay_reconciled: bool,
+) -> anyhow::Result<CaptureSessionExit> {
+    let mut pipeline = CapturePipeline::new(replay_reconciled);
 
-        let disconnect_reason = loop {
-            if options.max_events.is_some_and(|max| captured >= max) {
-                reader.shutdown().await?;
-                return Ok(());
-            }
+    loop {
+        if capture_limit_reached(context.options, *captured) {
+            return Ok(CaptureSessionExit::LimitReached);
+        }
 
-            let transaction = match reader.next_transaction().await {
-                Ok(Some(transaction)) => transaction,
-                Ok(None) => break "replication stream ended".to_owned(),
-                Err(error) if error.is_fatal_capture_error() => {
-                    if let Err(shutdown_error) = reader.shutdown().await {
-                        warn!(%shutdown_error, "failed to close PostgreSQL capture after transaction buffer failure");
-                    }
-                    return Err(error)
-                        .context("capture stopped without acknowledging the source transaction");
+        if capture_limit_includes_pending_write(context.options, *captured, &pipeline) {
+            complete_pending_capture_write(context, reader, &mut pipeline, captured)
+                .await?
+                .expect("the pending event count requires a pending write");
+            continue;
+        }
+
+        match wait_for_capture_progress(context, reader, &mut pipeline).await {
+            CaptureProgress::Storage(completion) => {
+                let replayed = complete_pipelined_capture_write(
+                    context,
+                    reader,
+                    &mut pipeline,
+                    captured,
+                    completion?,
+                )?;
+                if replayed {
+                    return Ok(reconnect_after_replayed_batch("pipelined"));
                 }
-                Err(error) => break error.to_string(),
-            };
-            let ack_lsn = transaction.ack_lsn;
-            let transaction_stats = transaction.events.stats();
-            let transaction_was_staged = transaction.events.is_staged();
-            let persist_started = metrics.as_ref().map(|_| Instant::now());
+            }
+            CaptureProgress::Transaction(Ok(TransactionRead::Transaction(transaction))) => {
+                if let Some(exit) = buffer_captured_transaction(
+                    context,
+                    reader,
+                    &mut pipeline,
+                    captured,
+                    transaction,
+                )
+                .await?
+                {
+                    return Ok(exit);
+                }
+            }
+            CaptureProgress::Transaction(Ok(TransactionRead::TimedOut)) => {
+                if let Some(exit) =
+                    flush_expired_capture_batch(context, reader, &mut pipeline, captured).await?
+                {
+                    return Ok(exit);
+                }
+            }
+            CaptureProgress::Transaction(Ok(TransactionRead::StreamEnded)) => {
+                return finish_capture_stream(context, reader, &mut pipeline, captured).await;
+            }
+            CaptureProgress::Transaction(Err(error)) => {
+                return finish_capture_read_error(context, reader, &mut pipeline, captured, error)
+                    .await;
+            }
+        }
+    }
+}
 
-            let persist_outcome = store
-                .persist_transaction_events(&transaction.events, &source_name, &ack_lsn.to_string())
-                .context("failed to persist captured transaction to redb")?;
-            let persist_latency = persist_started.map(|started| started.elapsed());
+async fn wait_for_capture_progress(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+) -> CaptureProgress {
+    let deadline = pipeline.read_deadline(context.batch_limits);
+    if let Some(pending_write) = pipeline.pending_write.as_mut() {
+        tokio::select! {
+            biased;
+            completion = &mut pending_write.response => {
+                CaptureProgress::Storage(
+                    completion.context("dedicated redb writer stopped before returning a batch")
+                )
+            }
+            transaction = next_capture_transaction(reader, deadline) => {
+                CaptureProgress::Transaction(transaction)
+            }
+        }
+    } else {
+        CaptureProgress::Transaction(next_capture_transaction(reader, deadline).await)
+    }
+}
 
-            match persist_outcome {
-                PersistTransactionOutcome::Persisted => {
-                    if let (Some(metrics), Some(persist_latency)) = (&metrics, persist_latency) {
-                        metrics.record_persisted(
-                            transaction_stats.event_count,
-                            transaction_stats.decoded_bytes,
-                            transaction_stats.staged_bytes,
-                            persist_latency,
-                            transaction_was_staged,
-                        );
-                    }
-                    if matches!(options.output, CaptureOutput::Json) {
-                        for event in transaction
-                            .events
-                            .iter()
-                            .context("failed to open captured transaction events")?
-                        {
-                            let event =
-                                event.context("failed to read captured transaction event")?;
-                            println!("{}", event_to_json(&event, false)?);
+async fn buffer_captured_transaction(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+    transaction: CapturedTransaction,
+) -> anyhow::Result<Option<CaptureSessionExit>> {
+    if !pipeline.replay_reconciled {
+        pipeline.batch.push(transaction);
+        submit_capture_batch(context, pipeline).await?;
+        complete_pending_capture_write(context, reader, pipeline, captured)
+            .await?
+            .expect("the submitted recovery batch has a pending write");
+        return Ok(None);
+    }
+
+    if pipeline
+        .batch
+        .would_exceed(&transaction, context.batch_limits)
+    {
+        if complete_pending_capture_write(context, reader, pipeline, captured).await?
+            == Some(PersistCaptureBatchOutcome::Replayed)
+        {
+            return Ok(Some(reconnect_after_replayed_batch("queued")));
+        }
+        submit_capture_batch(context, pipeline).await?;
+    }
+
+    pipeline.batch.push(transaction);
+    let max_events_reached = context
+        .options
+        .max_events
+        .is_some_and(|max| pipeline.buffered_event_count(*captured) >= max);
+    if pipeline.batch.reached_limit(context.batch_limits) || max_events_reached {
+        if complete_pending_capture_write(context, reader, pipeline, captured).await?
+            == Some(PersistCaptureBatchOutcome::Replayed)
+        {
+            return Ok(Some(reconnect_after_replayed_batch("queued")));
+        }
+        if !capture_limit_reached(context.options, *captured) {
+            submit_capture_batch(context, pipeline).await?;
+        }
+    }
+
+    Ok(None)
+}
+
+async fn flush_expired_capture_batch(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+) -> anyhow::Result<Option<CaptureSessionExit>> {
+    if complete_pending_capture_write(context, reader, pipeline, captured).await?
+        == Some(PersistCaptureBatchOutcome::Replayed)
+    {
+        return Ok(Some(reconnect_after_replayed_batch("queued")));
+    }
+
+    submit_capture_batch(context, pipeline).await?;
+    Ok(None)
+}
+
+async fn finish_capture_stream(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+) -> anyhow::Result<CaptureSessionExit> {
+    let replayed = complete_pending_capture_write(context, reader, pipeline, captured).await?
+        == Some(PersistCaptureBatchOutcome::Replayed);
+
+    if !pipeline.batch.is_empty() {
+        if replayed {
+            return Ok(reconnect_after_replayed_batch("queued"));
+        }
+        submit_and_complete_capture_batch(context, reader, pipeline, captured).await?;
+    }
+
+    Ok(CaptureSessionExit::Disconnected(
+        "replication stream ended".to_owned(),
+    ))
+}
+
+async fn finish_capture_read_error(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+    error: PostgresError,
+) -> anyhow::Result<CaptureSessionExit> {
+    let replayed = complete_pending_capture_write(context, reader, pipeline, captured).await?
+        == Some(PersistCaptureBatchOutcome::Replayed);
+
+    if !replayed && !pipeline.batch.is_empty() {
+        submit_and_complete_capture_batch(context, reader, pipeline, captured).await?;
+    }
+
+    if error.is_fatal_capture_error() {
+        return Err(error).context("capture stopped without acknowledging the source transaction");
+    }
+
+    Ok(CaptureSessionExit::Disconnected(error.to_string()))
+}
+
+async fn submit_capture_batch(
+    context: &CaptureContext<'_>,
+    pipeline: &mut CapturePipeline,
+) -> anyhow::Result<()> {
+    debug_assert!(pipeline.pending_write.is_none());
+    debug_assert!(!pipeline.batch.is_empty());
+    pipeline.pending_write = Some(
+        context
+            .storage_writer
+            .submit(
+                std::mem::take(&mut pipeline.batch),
+                context.metrics.is_some(),
+            )
+            .await?,
+    );
+    Ok(())
+}
+
+async fn submit_and_complete_capture_batch(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+) -> anyhow::Result<PersistCaptureBatchOutcome> {
+    submit_capture_batch(context, pipeline).await?;
+    complete_pending_capture_write(context, reader, pipeline, captured)
+        .await?
+        .context("the submitted capture batch has no pending write")
+}
+
+async fn complete_pending_capture_write(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+) -> anyhow::Result<Option<PersistCaptureBatchOutcome>> {
+    let Some(pending_write) = pipeline.pending_write.take() else {
+        return Ok(None);
+    };
+    let completion = pending_write
+        .response
+        .await
+        .context("dedicated redb writer stopped before returning a batch")?;
+    complete_and_apply_capture_write(context, reader, pipeline, captured, completion).map(Some)
+}
+
+fn complete_pipelined_capture_write(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+    completion: StorageCompletion,
+) -> anyhow::Result<bool> {
+    pipeline.pending_write.take();
+    Ok(
+        complete_and_apply_capture_write(context, reader, pipeline, captured, completion)?
+            == PersistCaptureBatchOutcome::Replayed,
+    )
+}
+
+fn complete_and_apply_capture_write(
+    context: &CaptureContext<'_>,
+    reader: &mut ReplicationReader,
+    pipeline: &mut CapturePipeline,
+    captured: &mut usize,
+    completion: StorageCompletion,
+) -> anyhow::Result<PersistCaptureBatchOutcome> {
+    let outcome = complete_capture_write(
+        completion,
+        reader,
+        context.store,
+        context.options,
+        context.metrics.as_ref(),
+        context.event_notifier.as_ref(),
+    )?;
+    apply_capture_batch_outcome(outcome, captured, &mut pipeline.replay_reconciled);
+    Ok(outcome)
+}
+
+fn capture_limit_includes_pending_write(
+    options: &CaptureOptions,
+    captured: usize,
+    pipeline: &CapturePipeline,
+) -> bool {
+    options
+        .max_events
+        .is_some_and(|max| captured.saturating_add(pipeline.pending_event_count()) >= max)
+}
+
+fn reconnect_after_replayed_batch(batch_state: &str) -> CaptureSessionExit {
+    CaptureSessionExit::Disconnected(format!(
+        "replayed {batch_state} batch required sequence reconciliation"
+    ))
+}
+
+async fn shutdown_capture_reader(reader: &mut ReplicationReader) {
+    if let Err(error) = reader.shutdown().await {
+        warn!(%error, "failed to close PostgreSQL capture session");
+    }
+}
+
+async fn wait_before_session_reconnect(
+    context: &CaptureContext<'_>,
+    retry_attempt: &mut u32,
+    reconnect_count: &mut u64,
+    reason: &str,
+) {
+    record_capture_reconnect(context.metrics);
+    let delay = reconnect_delay(*retry_attempt);
+    warn!(
+        %reason,
+        reconnect_count = *reconnect_count,
+        retry_in_ms = delay.as_millis(),
+        "PostgreSQL capture disconnected; retrying from the durable source LSN"
+    );
+    tokio::time::sleep(delay).await;
+    advance_reconnect_state(retry_attempt, reconnect_count);
+}
+
+fn record_capture_reconnect(metrics: &Option<CaptureMetrics>) {
+    if let Some(metrics) = metrics {
+        metrics.record_reconnect();
+    }
+}
+
+fn advance_reconnect_state(retry_attempt: &mut u32, reconnect_count: &mut u64) {
+    *retry_attempt = retry_attempt.saturating_add(1);
+    *reconnect_count = reconnect_count.saturating_add(1);
+}
+
+fn capture_limit_reached(options: &CaptureOptions, captured: usize) -> bool {
+    options.max_events.is_some_and(|max| captured >= max)
+}
+
+fn capture_batch_limits(config: &Config) -> anyhow::Result<CaptureBatchLimits> {
+    let runtime = &config.runtime;
+    if runtime.capture_batch_max_transactions == 0 {
+        return Err(anyhow!(
+            "runtime.capture_batch_max_transactions must be greater than zero"
+        ));
+    }
+    if runtime.capture_batch_max_events == 0 {
+        return Err(anyhow!(
+            "runtime.capture_batch_max_events must be greater than zero"
+        ));
+    }
+    if runtime.capture_batch_max_bytes == 0 {
+        return Err(anyhow!(
+            "runtime.capture_batch_max_bytes must be greater than zero"
+        ));
+    }
+    if runtime.capture_batch_max_delay_ms == 0 {
+        return Err(anyhow!(
+            "runtime.capture_batch_max_delay_ms must be greater than zero"
+        ));
+    }
+
+    Ok(CaptureBatchLimits {
+        max_transactions: runtime.capture_batch_max_transactions,
+        max_events: runtime.capture_batch_max_events,
+        max_bytes: runtime.capture_batch_max_bytes,
+        max_delay: Duration::from_millis(runtime.capture_batch_max_delay_ms),
+    })
+}
+
+fn capture_heartbeat_interval(config: &Config) -> anyhow::Result<Duration> {
+    if config.runtime.heartbeat_interval_ms == 0 {
+        return Err(anyhow!(
+            "runtime.heartbeat_interval_ms must be greater than zero"
+        ));
+    }
+    Ok(Duration::from_millis(config.runtime.heartbeat_interval_ms))
+}
+
+async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
+    let content = format!("source={};slot={}", source.name, source.slot);
+    loop {
+        match LogicalHeartbeatEmitter::connect(&source).await {
+            Ok(emitter) => {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    match emitter.emit(HEARTBEAT_PREFIX, &content).await {
+                        Ok(lsn) => {
+                            tracing::debug!(%lsn, "emitted PostgreSQL logical heartbeat");
+                        }
+                        Err(error) => {
+                            warn!(%error, "logical heartbeat connection failed; reconnecting");
+                            break;
                         }
                     }
-                    captured += transaction_stats.event_count;
                 }
-                PersistTransactionOutcome::AlreadyPersisted => {
-                    warn!(
-                        event_count = transaction_stats.event_count,
-                        decoded_bytes = transaction_stats.decoded_bytes,
-                        staged_bytes = transaction_stats.staged_bytes,
-                        %ack_lsn,
-                        "skipping replayed transaction already present in redb"
-                    );
-                    reader.set_next_sequence(
-                        store
-                            .next_sequence()
-                            .context("failed to reset sequence after transaction replay")?,
-                    );
+            }
+            Err(error) => {
+                warn!(%error, "failed to connect PostgreSQL logical heartbeat; retrying");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(RECONNECT_INITIAL_DELAY_MS)).await;
+    }
+}
+
+fn capture_retention(config: &Config) -> anyhow::Result<Option<CaptureRetention>> {
+    let runtime = &config.runtime;
+    if runtime.retention_max_events.is_none() && runtime.retention_max_age_seconds.is_none() {
+        return Ok(None);
+    }
+    if runtime.retention_max_events == Some(0) {
+        return Err(anyhow!(
+            "runtime.retention_max_events must be greater than zero"
+        ));
+    }
+    if runtime.retention_max_age_seconds == Some(0) {
+        return Err(anyhow!(
+            "runtime.retention_max_age_seconds must be greater than zero"
+        ));
+    }
+    if runtime.retention_check_interval_ms == 0 {
+        return Err(anyhow!(
+            "runtime.retention_check_interval_ms must be greater than zero"
+        ));
+    }
+    if runtime.retention_delete_batch_size == 0 {
+        return Err(anyhow!(
+            "runtime.retention_delete_batch_size must be greater than zero"
+        ));
+    }
+
+    Ok(Some(CaptureRetention {
+        policy: RetentionPolicy {
+            max_events: runtime.retention_max_events,
+            max_age: runtime.retention_max_age_seconds.map(Duration::from_secs),
+            delete_batch_size: runtime.retention_delete_batch_size,
+        },
+        check_interval: Duration::from_millis(runtime.retention_check_interval_ms),
+    }))
+}
+
+fn unix_timestamp_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+async fn next_capture_transaction(
+    reader: &mut ReplicationReader,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<TransactionRead, PostgresError> {
+    match deadline {
+        Some(deadline) => reader.next_transaction_until(deadline).await,
+        None => reader
+            .next_transaction()
+            .await
+            .map(|transaction| match transaction {
+                Some(transaction) => TransactionRead::Transaction(transaction),
+                None => TransactionRead::StreamEnded,
+            }),
+    }
+}
+
+fn complete_capture_write(
+    completion: StorageCompletion,
+    reader: &mut ReplicationReader,
+    store: &RedbEventStore,
+    options: &CaptureOptions,
+    metrics: Option<&CaptureMetrics>,
+    event_notifier: Option<&EventNotifier>,
+) -> anyhow::Result<PersistCaptureBatchOutcome> {
+    let batch = completion.batch;
+    let transaction_count = batch.transactions.len();
+    let ack_lsn = batch
+        .transactions
+        .last()
+        .expect("capture never persists an empty batch")
+        .ack_lsn;
+    let persist_outcome = completion
+        .result
+        .context("failed to persist captured transaction batch to redb")?;
+
+    let outcome = match persist_outcome {
+        PersistTransactionOutcome::Persisted => {
+            if batch.event_count > 0
+                && let Some(event_notifier) = event_notifier
+            {
+                event_notifier.notify();
+            }
+            if let (Some(metrics), Some(persist_latency)) = (metrics, completion.persist_latency) {
+                metrics.record_persisted(
+                    transaction_count,
+                    batch.event_count,
+                    batch.decoded_bytes,
+                    batch.staged_bytes,
+                    persist_latency,
+                    batch.staged_transaction_count,
+                );
+            }
+            if matches!(options.output, CaptureOutput::Json) {
+                for transaction in &batch.transactions {
+                    for event in transaction
+                        .events
+                        .iter()
+                        .context("failed to open captured transaction events")?
+                    {
+                        let event = event.context("failed to read captured transaction event")?;
+                        println!("{}", event_to_json(&event, false)?);
+                    }
                 }
             }
 
-            reader.ack(ack_lsn);
-        };
-
-        if let Err(error) = reader.shutdown().await {
-            warn!(%error, "failed to close disconnected PostgreSQL capture session");
+            PersistCaptureBatchOutcome::Persisted(batch.event_count)
         }
-
-        if let Some(metrics) = &metrics {
-            metrics.record_reconnect();
+        PersistTransactionOutcome::AlreadyPersisted => {
+            warn!(
+                transaction_count,
+                event_count = batch.event_count,
+                decoded_bytes = batch.decoded_bytes,
+                staged_bytes = batch.staged_bytes,
+                %ack_lsn,
+                "skipping replayed transaction batch already present in redb"
+            );
+            reader.set_next_sequence(
+                store
+                    .next_sequence()
+                    .context("failed to reset sequence after transaction replay")?,
+            );
+            PersistCaptureBatchOutcome::Replayed
         }
-        let delay = reconnect_delay(retry_attempt);
-        warn!(
-            reason = %disconnect_reason,
-            reconnect_count,
-            retry_in_ms = delay.as_millis(),
-            "PostgreSQL capture disconnected; retrying from the durable source LSN"
-        );
-        tokio::time::sleep(delay).await;
-        retry_attempt = retry_attempt.saturating_add(1);
-        reconnect_count = reconnect_count.saturating_add(1);
+    };
+
+    reader.ack(ack_lsn);
+    Ok(outcome)
+}
+
+fn apply_capture_batch_outcome(
+    outcome: PersistCaptureBatchOutcome,
+    captured: &mut usize,
+    replay_reconciled: &mut bool,
+) {
+    match outcome {
+        PersistCaptureBatchOutcome::Persisted(event_count) => {
+            *captured = captured.saturating_add(event_count);
+            *replay_reconciled = true;
+        }
+        PersistCaptureBatchOutcome::Replayed => *replay_reconciled = false,
     }
 }
 
@@ -583,10 +1260,8 @@ fn inspect(
         .last_sequence()
         .context("failed to read last event sequence")?;
     let first_sequence = store
-        .replay_from(0, 1)
-        .context("failed to read first event sequence")?
-        .first()
-        .map(|event| event.sequence);
+        .first_sequence()
+        .context("failed to read first event sequence")?;
     let file_size = std::fs::metadata(&database_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -847,6 +1522,8 @@ fn operation_name(operation: Operation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use lightcdc_core::{Operation, SourceMetadata};
+    use lightcdc_postgres::CapturedTransaction;
+    use lightcdc_storage::{TransactionEvents, TransactionStats};
     use tempfile::TempDir;
 
     use super::*;
@@ -927,6 +1604,106 @@ mod tests {
         assert!(second >= Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 2));
         assert!(second < Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 4));
         assert_eq!(capped, Duration::from_millis(RECONNECT_MAX_DELAY_MS));
+    }
+
+    #[test]
+    fn capture_batch_flushes_before_adding_a_transaction_that_exceeds_limits() {
+        let limits = CaptureBatchLimits {
+            max_transactions: 10,
+            max_events: 3,
+            max_bytes: 1_000,
+            max_delay: Duration::from_millis(5),
+        };
+        let mut batch = CaptureBatch::default();
+        batch.push(captured_transaction(1, 2, 200));
+        let next = captured_transaction(3, 2, 200);
+
+        assert!(!batch.reached_limit(limits));
+        assert!(batch.would_exceed(&next, limits));
+    }
+
+    #[test]
+    fn capture_batch_accepts_one_source_transaction_larger_than_group_limits() {
+        let limits = CaptureBatchLimits {
+            max_transactions: 10,
+            max_events: 3,
+            max_bytes: 100,
+            max_delay: Duration::from_millis(5),
+        };
+        let transaction = captured_transaction(1, 5, 500);
+        let mut batch = CaptureBatch::default();
+
+        assert!(!batch.would_exceed(&transaction, limits));
+        batch.push(transaction);
+        assert!(batch.reached_limit(limits));
+    }
+
+    #[test]
+    fn capture_keeps_reading_past_the_batch_deadline_while_a_write_is_in_flight() {
+        let limits = CaptureBatchLimits {
+            max_transactions: 10,
+            max_events: 10,
+            max_bytes: 1_000,
+            max_delay: Duration::from_millis(5),
+        };
+        let mut pipeline = CapturePipeline::new(true);
+        pipeline.batch.push(captured_transaction(1, 1, 100));
+
+        assert!(pipeline.read_deadline(limits).is_some());
+
+        let (_sender, response) = tokio::sync::oneshot::channel::<StorageCompletion>();
+        pipeline.pending_write = Some(PendingCaptureWrite {
+            response,
+            event_count: 2,
+        });
+
+        assert!(pipeline.read_deadline(limits).is_none());
+        assert_eq!(pipeline.buffered_event_count(3), 6);
+    }
+
+    #[test]
+    fn capture_pipeline_tracks_replay_reconciliation() {
+        let mut pipeline = CapturePipeline::new(true);
+        let mut captured = 3;
+
+        apply_capture_batch_outcome(
+            PersistCaptureBatchOutcome::Replayed,
+            &mut captured,
+            &mut pipeline.replay_reconciled,
+        );
+
+        assert_eq!(captured, 3);
+        assert!(!pipeline.replay_reconciled);
+
+        apply_capture_batch_outcome(
+            PersistCaptureBatchOutcome::Persisted(2),
+            &mut captured,
+            &mut pipeline.replay_reconciled,
+        );
+
+        assert_eq!(captured, 5);
+        assert!(pipeline.replay_reconciled);
+    }
+
+    fn captured_transaction(
+        first_sequence: u64,
+        event_count: usize,
+        decoded_bytes: u64,
+    ) -> CapturedTransaction {
+        let events = (0..event_count)
+            .map(|index| event(first_sequence + index as u64, "public", "orders"))
+            .collect();
+        CapturedTransaction {
+            events: TransactionEvents::InMemory {
+                events,
+                stats: TransactionStats {
+                    event_count,
+                    decoded_bytes,
+                    staged_bytes: decoded_bytes,
+                },
+            },
+            ack_lsn: format!("0/{first_sequence:X}").parse().expect("test LSN"),
+        }
     }
 
     fn event(sequence: u64, schema: &str, table: &str) -> ChangeEvent {

@@ -16,7 +16,7 @@ use serde_json::json;
 
 const SAMPLE_CHANNEL_CAPACITY: usize = 8_192;
 
-/// Sends transaction-level capture samples to a dedicated aggregation thread.
+/// Sends storage-group capture samples to a dedicated aggregation thread.
 pub struct CaptureMetrics {
     sender: Option<SyncSender<CaptureSample>>,
     dropped_samples: Arc<AtomicU64>,
@@ -26,17 +26,19 @@ pub struct CaptureMetrics {
 #[derive(Debug)]
 enum CaptureSample {
     Persisted {
+        transaction_count: u64,
         event_count: u64,
         decoded_bytes: u64,
         staged_bytes: u64,
         persist_latency_ns: u64,
-        staged: bool,
+        staged_transaction_count: u64,
     },
     Reconnect,
 }
 
 #[derive(Default)]
 struct Totals {
+    storage_commits: u64,
     transactions: u64,
     events: u64,
     decoded_bytes: u64,
@@ -47,6 +49,7 @@ struct Totals {
 
 #[derive(Default)]
 struct IntervalTotals {
+    storage_commits: u64,
     transactions: u64,
     events: u64,
     decoded_bytes: u64,
@@ -85,21 +88,23 @@ impl CaptureMetrics {
         })
     }
 
-    /// Records one durable source transaction without blocking capture.
+    /// Records one durable source transaction group without blocking capture.
     pub fn record_persisted(
         &self,
+        transaction_count: usize,
         event_count: usize,
         decoded_bytes: u64,
         staged_bytes: u64,
         persist_latency: Duration,
-        staged: bool,
+        staged_transaction_count: usize,
     ) {
         self.try_send(CaptureSample::Persisted {
+            transaction_count: transaction_count as u64,
             event_count: event_count as u64,
             decoded_bytes,
             staged_bytes,
             persist_latency_ns: duration_ns(persist_latency),
-            staged,
+            staged_transaction_count: staged_transaction_count as u64,
         });
     }
 
@@ -155,7 +160,7 @@ fn aggregate_metrics(
             Ok(sample) => record_sample(sample, &mut totals, &mut interval, &mut persist_latency),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                if interval.transactions > 0 || totals.reconnects > 0 {
+                if interval.storage_commits > 0 || totals.reconnects > 0 {
                     write_report(
                         &mut writer,
                         started,
@@ -197,18 +202,21 @@ fn record_sample(
 ) {
     match sample {
         CaptureSample::Persisted {
+            transaction_count,
             event_count,
             decoded_bytes,
             staged_bytes,
             persist_latency_ns,
-            staged,
+            staged_transaction_count,
         } => {
-            totals.transactions += 1;
+            totals.storage_commits += 1;
+            totals.transactions += transaction_count;
             totals.events += event_count;
             totals.decoded_bytes += decoded_bytes;
             totals.staged_bytes += staged_bytes;
-            totals.staged_transactions += u64::from(staged);
-            interval.transactions += 1;
+            totals.staged_transactions += staged_transaction_count;
+            interval.storage_commits += 1;
+            interval.transactions += transaction_count;
             interval.events += event_count;
             interval.decoded_bytes += decoded_bytes;
             interval.staged_bytes += staged_bytes;
@@ -231,16 +239,27 @@ fn write_report(
     let now = Instant::now();
     let interval_seconds = now.duration_since(last_report).as_secs_f64().max(0.000_001);
     let latency_ms = |quantile| persist_latency.value_at_quantile(quantile) as f64 / 1_000_000.0;
+    let per_commit = |value| {
+        if interval.storage_commits == 0 {
+            0.0
+        } else {
+            value as f64 / interval.storage_commits as f64
+        }
+    };
     let report = json!({
         "timestamp_ms": unix_timestamp_ms(),
         "elapsed_seconds": now.duration_since(started).as_secs_f64(),
         "interval_seconds": interval_seconds,
         "events_per_second": interval.events as f64 / interval_seconds,
         "transactions_per_second": interval.transactions as f64 / interval_seconds,
+        "storage_commits_per_second": interval.storage_commits as f64 / interval_seconds,
+        "events_per_storage_commit": per_commit(interval.events),
+        "transactions_per_storage_commit": per_commit(interval.transactions),
         "decoded_bytes_per_second": interval.decoded_bytes as f64 / interval_seconds,
         "staged_bytes_per_second": interval.staged_bytes as f64 / interval_seconds,
         "events_total": totals.events,
         "transactions_total": totals.transactions,
+        "storage_commits_total": totals.storage_commits,
         "decoded_bytes_total": totals.decoded_bytes,
         "staged_bytes_total": totals.staged_bytes,
         "staged_transactions_total": totals.staged_transactions,
@@ -285,7 +304,7 @@ mod tests {
         let path = temp.path().join("capture.jsonl");
         {
             let metrics = CaptureMetrics::start(&path, Duration::from_millis(10)).expect("metrics");
-            metrics.record_persisted(25, 1_000, 1_500, Duration::from_millis(2), true);
+            metrics.record_persisted(4, 25, 1_000, 1_500, Duration::from_millis(2), 2);
             metrics.record_reconnect();
             thread::sleep(Duration::from_millis(20));
         }
@@ -295,8 +314,11 @@ mod tests {
             serde_json::from_str(reports.lines().next().expect("report line"))
                 .expect("JSON report");
         assert_eq!(report["events_total"], 25);
-        assert_eq!(report["transactions_total"], 1);
-        assert_eq!(report["staged_transactions_total"], 1);
+        assert_eq!(report["transactions_total"], 4);
+        assert_eq!(report["storage_commits_total"], 1);
+        assert_eq!(report["events_per_storage_commit"], 25.0);
+        assert_eq!(report["transactions_per_storage_commit"], 4.0);
+        assert_eq!(report["staged_transactions_total"], 2);
         assert_eq!(report["reconnects_total"], 1);
         assert_eq!(report["dropped_samples_total"], 0);
     }

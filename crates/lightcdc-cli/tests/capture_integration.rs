@@ -1,5 +1,6 @@
 use std::{
     env,
+    fs::File,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -7,7 +8,7 @@ use std::{
 };
 
 use lightcdc_core::{ChangeEvent, Config, Operation, SourceConfig};
-use lightcdc_postgres::ReplicationReader;
+use lightcdc_postgres::{ReplicationReader, validate_source_config_with_plan};
 use lightcdc_storage::{
     LogOpenOptions, PersistTransactionOutcome, RedbEventStore, TransactionBufferError,
     TransactionBufferOptions, TransactionEvents,
@@ -702,6 +703,116 @@ async fn capture_reconnects_after_postgres_terminates_replication_backend() -> a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_groups_small_source_transactions_into_one_redb_commit() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    let metrics_path = temp.path().join("capture.jsonl");
+    write_test_config_with_batch(&config_path, temp.path(), &fixture, 10, 100, 5_000)?;
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--max-events",
+                "10",
+                "--output",
+                "none",
+                "--metrics-file",
+                metrics_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("metrics path is not UTF-8"))?,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+
+    fixture.wait_for_replication_pid(None).await?;
+    for index in 0..10 {
+        fixture
+            .insert(&format!("batch-{index}@example.com"), index)
+            .await?;
+    }
+
+    let status = capture.wait_for_exit().await?;
+    assert!(status.success(), "capture process failed with {status}");
+
+    let reports = std::fs::read_to_string(&metrics_path)?;
+    let report: serde_json::Value = serde_json::from_str(
+        reports
+            .lines()
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("capture metrics file is empty"))?,
+    )?;
+    assert_eq!(report["transactions_total"], 10);
+    assert_eq!(report["events_total"], 10);
+    assert_eq!(report["storage_commits_total"], 1);
+    assert_eq!(report["transactions_per_storage_commit"], 10.0);
+    assert_eq!(report["events_per_storage_commit"], 10.0);
+
+    let store = open_store(temp.path().to_path_buf())?;
+    assert_eq!(store.replay_from(1, 20)?.len(), 10);
+    assert!(store.source_offset(&fixture.source_name)?.is_some());
+
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_runtime_prunes_events_to_the_configured_count() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    let log_path = temp.path().join("lightcdc.log");
+    write_test_config_with_retention(&config_path, temp.path(), &fixture, 3)?;
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--output",
+                "none",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&log_path)?))
+            .spawn()?,
+    );
+
+    fixture.wait_for_replication_pid(None).await?;
+    for index in 0..10 {
+        fixture
+            .insert(&format!("retention-{index}@example.com"), index)
+            .await?;
+    }
+    let target_lsn = fixture.current_wal_lsn().await?;
+    fixture.wait_for_confirmed_flush_lsn(&target_lsn).await?;
+    sleep(Duration::from_millis(250)).await;
+    capture.kill_and_wait()?;
+
+    let store = open_store(temp.path().to_path_buf())?;
+    assert_eq!(store.stats()?.event_count, 3);
+    assert_eq!(store.first_sequence()?, Some(8));
+    assert_eq!(store.last_sequence()?, Some(10));
+    assert_eq!(store.next_sequence()?, 11);
+
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
 async fn capture_exits_for_a_missing_publication_instead_of_retrying() -> anyhow::Result<()> {
     let fixture = PgFixture::create().await?;
     let temp = TempDir::new()?;
@@ -732,6 +843,171 @@ async fn capture_exits_for_a_missing_publication_instead_of_retrying() -> anyhow
         "capture should stop for a missing publication"
     );
 
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_exits_when_a_configured_table_is_missing_from_the_publication()
+-> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {} DROP TABLE public.{}",
+            fixture.publication, fixture.table
+        ))
+        .await?;
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let status = capture.wait_for_exit().await?;
+    assert!(
+        !status.success(),
+        "capture should stop when a configured table is not published"
+    );
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_filters_unconfigured_tables_from_a_broad_publication() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let unrelated_table = fixture.create_unrelated_table().await?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {} ADD TABLE public.{}",
+            fixture.publication, unrelated_table
+        ))
+        .await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let config = Config::from_path(&config_path)?;
+    let capture_plan = config.capture_plan()?;
+    let alignment = validate_source_config_with_plan(&config.source, &capture_plan).await?;
+    assert_eq!(
+        alignment.unnecessary_published_tables,
+        [format!("public.{unrelated_table}")]
+    );
+    let store = open_store(temp.path().to_path_buf())?;
+    let mut reader = ReplicationReader::connect_from_with_buffer_and_plan(
+        config.source.clone(),
+        None,
+        config_buffer_options(&config),
+        capture_plan,
+    )
+    .await?;
+    reader.set_next_sequence(store.next_sequence()?);
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            r#"
+            BEGIN;
+            INSERT INTO public.{unrelated_table} (payload) VALUES ('ignore me');
+            INSERT INTO public.{table} (customer_email, total_cents)
+            VALUES ('selected@example.com', 4200);
+            COMMIT;
+            "#,
+            table = fixture.table
+        ))
+        .await?;
+
+    let transaction = timeout(Duration::from_secs(15), reader.next_transaction())
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("replication stream ended before transaction commit"))?;
+    let events = transaction.events.load()?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].table, fixture.table);
+    store.persist_transaction_events(
+        &transaction.events,
+        &config.source.name,
+        &transaction.ack_lsn.to_string(),
+    )?;
+    reader.ack(transaction.ack_lsn);
+    reader.shutdown().await?;
+    assert_eq!(store.stats()?.event_count, 1);
+
+    fixture
+        .client
+        .batch_execute(&format!("DROP TABLE public.{unrelated_table}"))
+        .await?;
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn logical_heartbeats_advance_the_slot_during_only_unrelated_writes() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let unrelated_table = fixture.create_unrelated_table().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config_with_heartbeat(&config_path, temp.path(), &fixture, 50)?;
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--output",
+                "none",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    fixture.wait_for_replication_pid(None).await?;
+    let initial = fixture.confirmed_flush_lsn().await?;
+    fixture
+        .wait_for_confirmed_flush_lsn_change(initial.as_deref())
+        .await?;
+
+    fixture
+        .client
+        .execute(
+            &format!("INSERT INTO public.{unrelated_table} (payload) VALUES ($1)"),
+            &[&"not captured"],
+        )
+        .await?;
+    let unrelated_write_lsn = fixture.current_wal_lsn().await?;
+    fixture
+        .wait_for_confirmed_flush_lsn(&unrelated_write_lsn)
+        .await?;
+
+    capture.kill_and_wait()?;
+    let store = open_store(temp.path().to_path_buf())?;
+    assert_eq!(store.stats()?.event_count, 0);
+    assert!(store.source_offset(&fixture.source_name)?.is_some());
+    drop(store);
+
+    fixture
+        .client
+        .batch_execute(&format!("DROP TABLE public.{unrelated_table}"))
+        .await?;
     fixture.cleanup().await?;
     Ok(())
 }
@@ -878,6 +1154,17 @@ fn write_test_config(
     data_dir: &std::path::Path,
     fixture: &PgFixture,
 ) -> anyhow::Result<()> {
+    write_test_config_with_batch(config_path, data_dir, fixture, 100, 500, 5)
+}
+
+fn write_test_config_with_batch(
+    config_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    fixture: &PgFixture,
+    capture_batch_max_transactions: usize,
+    capture_batch_max_events: usize,
+    capture_batch_max_delay_ms: u64,
+) -> anyhow::Result<()> {
     let source_name = serde_json::to_string(&fixture.source_name)?;
     let host = serde_json::to_string(&fixture.source.host)?;
     let database = serde_json::to_string(&fixture.source.database)?;
@@ -909,6 +1196,10 @@ shutdown_timeout_ms = 10000
 transaction_memory_threshold_bytes = 1
 max_transaction_bytes = 67108864
 max_transaction_events = 10000
+capture_batch_max_transactions = {capture_batch_max_transactions}
+capture_batch_max_events = {capture_batch_max_events}
+capture_batch_max_bytes = 4194304
+capture_batch_max_delay_ms = {capture_batch_max_delay_ms}
 
 [logging]
 level = "info"
@@ -921,6 +1212,43 @@ tables = [{table}]
             port = fixture.source.port,
         ),
     )?;
+    Ok(())
+}
+
+fn write_test_config_with_retention(
+    config_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    fixture: &PgFixture,
+    retention_max_events: u64,
+) -> anyhow::Result<()> {
+    write_test_config(config_path, data_dir, fixture)?;
+    let config = std::fs::read_to_string(config_path)?;
+    let config = config.replace(
+        "capture_batch_max_delay_ms = 5",
+        &format!(
+            "capture_batch_max_delay_ms = 5\n\
+             retention_max_events = {retention_max_events}\n\
+             retention_check_interval_ms = 10\n\
+             retention_delete_batch_size = 100"
+        ),
+    );
+    std::fs::write(config_path, config)?;
+    Ok(())
+}
+
+fn write_test_config_with_heartbeat(
+    config_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    fixture: &PgFixture,
+    heartbeat_interval_ms: u64,
+) -> anyhow::Result<()> {
+    write_test_config(config_path, data_dir, fixture)?;
+    let config = std::fs::read_to_string(config_path)?;
+    let config = config.replace(
+        "shutdown_timeout_ms = 10000",
+        &format!("shutdown_timeout_ms = 10000\nheartbeat_interval_ms = {heartbeat_interval_ms}"),
+    );
+    std::fs::write(config_path, config)?;
     Ok(())
 }
 
@@ -1154,6 +1482,19 @@ impl PgFixture {
         Ok(())
     }
 
+    async fn create_unrelated_table(&self) -> anyhow::Result<String> {
+        let table = format!("unrelated_{}", unique_suffix());
+        self.client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table} (
+                    id BIGSERIAL PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )"
+            ))
+            .await?;
+        Ok(table)
+    }
+
     async fn confirmed_flush_lsn(&self) -> anyhow::Result<Option<String>> {
         let row = self
             .client
@@ -1163,6 +1504,35 @@ impl PgFixture {
             )
             .await?;
         Ok(row.get(0))
+    }
+
+    async fn current_wal_lsn(&self) -> anyhow::Result<String> {
+        let row = self
+            .client
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn wait_for_confirmed_flush_lsn(&self, target: &str) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let row = self
+                    .client
+                    .query_one(
+                        "SELECT COALESCE(confirmed_flush_lsn >= ($2::text)::pg_lsn, false)
+                         FROM pg_replication_slots
+                         WHERE slot_name = $1",
+                        &[&self.slot, &target],
+                    )
+                    .await?;
+                if row.get::<_, bool>(0) {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?
     }
 
     async fn wait_for_confirmed_flush_lsn_change(

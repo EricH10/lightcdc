@@ -50,6 +50,37 @@ The gRPC API exposes:
 - `Ack`: persist a stream-scoped consumer offset.
 - `Seek`: move a consumer offset to earliest, latest, or an explicit sequence.
 
+## Capture Selection and Idle Progress
+
+`Config::capture_plan` compiles the union of table patterns required by every
+configured durable stream. Consumer connection state is deliberately absent
+from this plan: an offline consumer still expects its configured history to be
+captured for later replay.
+
+Startup expands `*` and `schema.*` patterns against current user tables and
+compares the required set with `pg_publication_tables`. Missing required tables
+are a fatal configuration error. Extra published tables produce a warning, and
+the replication reader filters their row and truncate messages before assigning
+local sequences or staging events. The operator owns publication DDL; LightCDC
+does not silently add or remove tables.
+
+A source transaction may therefore commit with zero selected events. It still
+travels through `CapturedTransaction` and the dedicated writer so redb advances
+the source LSN atomically without changing the event high-water mark. Multiple
+configured streams selecting one table still share one stored event.
+
+PostgreSQL does not emit transaction boundaries for ordinary changes excluded
+by a narrow publication. A long-lived normal SQL connection therefore calls
+`pg_logical_emit_message` at `heartbeat_interval_ms`. The replication
+connection requests logical messages, receives each transactional heartbeat
+with a safe commit boundary, and persists its eventless checkpoint before
+acknowledging PostgreSQL. Keepalive `wal_end` values are never treated as
+durable checkpoints because they may be ahead of uncommitted relevant work.
+
+Changing configured table selection changes future capture only. Adding a table
+to a stream requires adding it to the publication before startup and using a
+snapshot or backfill when earlier state is required.
+
 ## PostgreSQL Client Choice
 
 Initial dependencies: `tokio-postgres` and `pgwire-replication`.
@@ -98,8 +129,9 @@ staging bytes.
   source-scoped `data_dir/staging/` directory.
 - `max_transaction_bytes` and `max_transaction_events` are hard bounds. Crossing
   either stops capture without persisting or acknowledging the transaction.
-- redb reads a staged file one event at a time while writing the events,
-  deduplication IDs, and source commit LSN in one atomic write transaction.
+- redb reads staged files one event at a time while writing events,
+  deduplication IDs, and the final source commit LSN in one atomic write
+  transaction.
 - Completed files are deleted after processing. Files left by an abrupt exit are
   treated as disposable scratch data and removed on the next successful
   replication connection for that source.
@@ -107,6 +139,64 @@ staging bytes.
 The staged file is deliberately not a recovery log. PostgreSQL WAL is replayed
 from the source LSN already committed in redb, which keeps one authoritative
 durability boundary and avoids trying to resume a partially decoded transaction.
+
+## Capture Group Commits
+
+After PostgreSQL commits a source transaction, capture may hold that complete
+transaction briefly while collecting more committed transactions. The group
+flushes when it reaches the configured transaction, event, decoded-byte, or
+time limit. Defaults are 100 transactions, 500 events, 4 MiB, and 20 ms.
+
+One redb write transaction streams every group member, updates the event-ID
+index, and advances the source offset to the final transaction's LSN. Only
+after that commit succeeds does capture acknowledge the final LSN to
+PostgreSQL. A crash before the redb commit replays the whole group; a crash
+afterward resumes from its final durable LSN. Grouping therefore changes
+visibility latency but not the no-loss boundary or individual transaction
+metadata.
+
+After reconnecting from an existing source offset, capture reconciles replayed
+transactions individually before group commits resume. This lets it reset
+temporary local sequence numbers if PostgreSQL repeats the last durable
+transaction.
+
+## Dedicated Capture Writer
+
+Capture starts one long-lived `lightcdc-redb-writer` standard thread. A bounded
+Tokio channel transfers ownership of a completed `CaptureBatch` to that thread,
+where `blocking_recv` waits without occupying a Tokio worker. The writer returns
+the owned batch and persistence result through a one-shot channel.
+
+Capture keeps at most one redb write in flight. While that group commits, the
+replication task may decode and assemble the next group. Before submitting the
+next write, capture waits for the previous result, acknowledges its final
+PostgreSQL LSN, and handles any replay reconciliation. This overlaps WAL
+decoding with redb durability without allowing source offsets, local sequences,
+or storage writes to reorder.
+
+An idle replication stream also waits on the in-flight write completion. A
+completed commit is therefore acknowledged promptly even when PostgreSQL sends
+no subsequent transaction.
+
+## Event Retention
+
+Optional hard retention removes the oldest event payloads when either the
+configured maximum event count or maximum commit age is exceeded. Each sweep
+deletes a bounded prefix atomically on the same writer thread as capture, so
+retention and source commits cannot race or reorder.
+
+The store keeps an event-sequence high-water mark outside the retained payload
+table, preventing sequence reuse after every payload has expired. Event IDs for
+the latest durable PostgreSQL checkpoint remain protected until a newer source
+batch commits, preserving duplicate detection if PostgreSQL replays that
+checkpoint after a long idle period.
+
+Consumer offsets do not pin retention indefinitely. A subscription whose next
+sequence is older than the retention floor fails explicitly and must seek to
+the oldest retained event or to the current high-water mark. This bounds the
+log despite abandoned consumers and avoids silently skipping missing history.
+Deleted redb pages are available for reuse, but immediate filesystem shrinking
+is not part of the retention contract.
 
 ## Failure Classification
 
@@ -119,21 +209,37 @@ change and stops on failures that would repeat indefinitely:
   transaction-buffer failures, and local persistence failures stop capture.
 
 Before opening logical replication, startup validates `wal_level`, replication
-privilege, publication existence, and the slot's type, output plugin, and
-database. Every retry reconnects from the source LSN atomically committed in
-redb, so retrying never depends on an in-memory position.
+privilege, publication existence, configured table membership, and the slot's
+type, output plugin, and database. Every retry reconnects from the source LSN
+atomically committed in redb, so retrying never depends on an in-memory
+position.
+
+## Live Delivery Notifications
+
+The combined `lightcdc run` process shares an `EventNotifier` between capture
+and the gRPC service. Capture signals it only after a source transaction is
+durable in redb. A caught-up subscription sleeps on that signal instead of
+polling redb on a timer, then resumes ordered replay from its next sequence.
+
+The notification intentionally contains no event data. Tokio watch
+notifications may coalesce, but redb remains the source of truth and one wakeup
+causes the subscriber to drain every available event. This removes idle polling
+and its former latency floor without making correctness depend on an in-memory
+message.
 
 ## Benchmark Instrumentation
 
 Production instrumentation remains disabled unless `--metrics-file` is passed.
 The disabled path contains no clocks, counters, histograms, channels, worker
 threads, or per-event work. Enabled capture records one fixed-size sample per
-durable source transaction into a bounded nonblocking channel.
+durable redb group commit into a bounded nonblocking channel.
 
 A dedicated standard thread owns aggregation, persistence-latency histograms,
 JSON encoding, and metrics file I/O. A full channel drops instrumentation
 samples instead of slowing capture, and every report exposes the cumulative
-drop count so invalid benchmark runs are visible.
+drop count so invalid benchmark runs are visible. Reports distinguish source
+transactions from storage commits and expose events and transactions per
+storage commit.
 
 Consumer delivery and end-to-end latency are measured by the separate benchmark
 consumer rather than adding measurement work to the gRPC service.

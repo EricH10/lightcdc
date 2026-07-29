@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
 
-use lightcdc_core::{ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata};
+use lightcdc_core::{
+    CapturePlan, ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata,
+};
 use lightcdc_storage::{
     TransactionBuffer, TransactionBufferError, TransactionBufferOptions, TransactionEvents,
 };
@@ -12,7 +15,9 @@ use pgwire_replication::{
     lsn::Lsn,
 };
 use thiserror::Error;
-use tokio_postgres::NoTls;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout_at};
+use tokio_postgres::{Client, NoTls};
 use tracing::{debug, info};
 
 use crate::decoder::{DecodeError, PgOutputDecoder, PgOutputMessage, Relation, RowChange};
@@ -50,6 +55,19 @@ pub struct ReplicationReader {
     transaction: Option<TransactionMetadata>,
     commit_timestamp_ms: Option<i64>,
     pending_events: TransactionBuffer,
+    capture_plan: CapturePlan,
+}
+
+/// Emits transactional logical messages that provide safe idle WAL checkpoints.
+pub struct LogicalHeartbeatEmitter {
+    client: Client,
+    connection_task: JoinHandle<()>,
+}
+
+/// Describes how a configured capture plan aligns with its publication.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicationAlignment {
+    pub unnecessary_published_tables: Vec<String>,
 }
 
 /// Bundles the events from one committed transaction with its checkpoint.
@@ -58,6 +76,13 @@ pub struct CapturedTransaction {
     pub events: TransactionEvents,
     /// The commit WAL position to acknowledge after durable persistence.
     pub ack_lsn: Lsn,
+}
+
+/// Reports whether a bounded transaction read completed, timed out, or ended.
+pub enum TransactionRead {
+    Transaction(CapturedTransaction),
+    TimedOut,
+    StreamEnded,
 }
 
 impl ReplicationReader {
@@ -85,6 +110,25 @@ impl ReplicationReader {
         start_lsn: Option<&str>,
         buffer_options: TransactionBufferOptions,
     ) -> Result<Self, PostgresError> {
+        let capture_plan = CapturePlan::all(source.name.clone());
+        Self::connect_from_with_buffer_and_plan(source, start_lsn, buffer_options, capture_plan)
+            .await
+    }
+
+    /// Connects with bounded buffering and a compiled configured-table filter.
+    pub async fn connect_from_with_buffer_and_plan(
+        source: SourceConfig,
+        start_lsn: Option<&str>,
+        buffer_options: TransactionBufferOptions,
+        capture_plan: CapturePlan,
+    ) -> Result<Self, PostgresError> {
+        if capture_plan.source_name() != source.name {
+            return Err(PostgresError::Configuration(format!(
+                "capture plan belongs to source {:?}; expected {:?}",
+                capture_plan.source_name(),
+                source.name
+            )));
+        }
         let start_lsn = match start_lsn {
             Some(lsn) => Lsn::from_str(lsn).map_err(|error| {
                 PostgresError::StreamState(format!("invalid durable source LSN {lsn:?}: {error}"))
@@ -126,6 +170,7 @@ impl ReplicationReader {
             transaction: None,
             commit_timestamp_ms: None,
             pending_events,
+            capture_plan,
         })
     }
 
@@ -136,10 +181,36 @@ impl ReplicationReader {
 
     /// Waits for the next committed PostgreSQL transaction.
     pub async fn next_transaction(&mut self) -> Result<Option<CapturedTransaction>, PostgresError> {
+        match self.read_transaction(None).await? {
+            TransactionRead::Transaction(transaction) => Ok(Some(transaction)),
+            TransactionRead::StreamEnded => Ok(None),
+            TransactionRead::TimedOut => unreachable!("unbounded transaction read timed out"),
+        }
+    }
+
+    /// Waits for a committed transaction until an absolute batching deadline.
+    pub async fn next_transaction_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<TransactionRead, PostgresError> {
+        self.read_transaction(Some(deadline)).await
+    }
+
+    async fn read_transaction(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<TransactionRead, PostgresError> {
         loop {
-            let event = match self.client.recv().await? {
+            let received = match deadline {
+                Some(deadline) => match timeout_at(deadline, self.client.recv()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok(TransactionRead::TimedOut),
+                },
+                None => self.client.recv().await?,
+            };
+            let event = match received {
                 Some(event) => event,
-                None => return Ok(None),
+                None => return Ok(TransactionRead::StreamEnded),
             };
             let removed_orphans = self.pending_events.cleanup_orphaned_files()?;
             if removed_orphans > 0 {
@@ -202,7 +273,7 @@ impl ReplicationReader {
                     );
                     self.transaction = None;
                     self.commit_timestamp_ms = None;
-                    return Ok(Some(CapturedTransaction {
+                    return Ok(TransactionRead::Transaction(CapturedTransaction {
                         events,
                         ack_lsn: end_lsn,
                     }));
@@ -219,21 +290,41 @@ impl ReplicationReader {
                         );
                     }
                     PgOutputMessage::Insert(row) => {
-                        let event = self.row_change(Operation::Insert, row, wal_start);
-                        self.pending_events.push(event)?;
+                        if self
+                            .capture_plan
+                            .matches_table(&row.relation.namespace, &row.relation.name)
+                        {
+                            let event = self.row_change(Operation::Insert, row, wal_start);
+                            self.pending_events.push(event)?;
+                        }
                     }
                     PgOutputMessage::Update(row) => {
-                        let event = self.row_change(Operation::Update, row, wal_start);
-                        self.pending_events.push(event)?;
+                        if self
+                            .capture_plan
+                            .matches_table(&row.relation.namespace, &row.relation.name)
+                        {
+                            let event = self.row_change(Operation::Update, row, wal_start);
+                            self.pending_events.push(event)?;
+                        }
                     }
                     PgOutputMessage::Delete(row) => {
-                        let event = self.row_change(Operation::Delete, row, wal_start);
-                        self.pending_events.push(event)?;
+                        if self
+                            .capture_plan
+                            .matches_table(&row.relation.namespace, &row.relation.name)
+                        {
+                            let event = self.row_change(Operation::Delete, row, wal_start);
+                            self.pending_events.push(event)?;
+                        }
                     }
                     PgOutputMessage::Truncate(relations) => {
                         for relation in relations {
-                            let event = self.truncate_change(relation, wal_start);
-                            self.pending_events.push(event)?;
+                            if self
+                                .capture_plan
+                                .matches_table(&relation.namespace, &relation.name)
+                            {
+                                let event = self.truncate_change(relation, wal_start);
+                                self.pending_events.push(event)?;
+                            }
                         }
                     }
                     PgOutputMessage::Ignored => {}
@@ -243,7 +334,7 @@ impl ReplicationReader {
                 }
                 ReplicationEvent::StoppedAt { reached } => {
                     debug!(%reached, "replication stopped at configured LSN");
-                    return Ok(None);
+                    return Ok(TransactionRead::StreamEnded);
                 }
             }
         }
@@ -338,6 +429,41 @@ impl PostgresError {
     }
 }
 
+impl LogicalHeartbeatEmitter {
+    /// Opens one ordinary PostgreSQL connection used only to emit heartbeats.
+    pub async fn connect(source: &SourceConfig) -> Result<Self, PostgresError> {
+        let (client, connection) =
+            tokio_postgres::connect(&source.connection_string(), NoTls).await?;
+        let connection_task = tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::warn!(%error, "PostgreSQL heartbeat connection stopped");
+            }
+        });
+        Ok(Self {
+            client,
+            connection_task,
+        })
+    }
+
+    /// Writes one transactional logical message and returns its WAL position.
+    pub async fn emit(&self, prefix: &str, content: &str) -> Result<String, PostgresError> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT pg_logical_emit_message(true, $1::text, $2::text)::text",
+                &[&prefix, &content],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+}
+
+impl Drop for LogicalHeartbeatEmitter {
+    fn drop(&mut self) {
+        self.connection_task.abort();
+    }
+}
+
 /// Checks that PostgreSQL accepts a normal connection for the configured source.
 pub async fn validate_source_config(config: &SourceConfig) -> Result<(), PostgresError> {
     let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
@@ -348,6 +474,37 @@ pub async fn validate_source_config(config: &SourceConfig) -> Result<(), Postgre
         }
     });
 
+    validate_source_client(&client, config).await
+}
+
+/// Validates the source and ensures its publication contains every configured table.
+pub async fn validate_source_config_with_plan(
+    config: &SourceConfig,
+    capture_plan: &CapturePlan,
+) -> Result<PublicationAlignment, PostgresError> {
+    if capture_plan.source_name() != config.name {
+        return Err(PostgresError::Configuration(format!(
+            "capture plan belongs to source {:?}; expected {:?}",
+            capture_plan.source_name(),
+            config.name
+        )));
+    }
+
+    let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::error!(%error, "PostgreSQL validation connection task failed");
+        }
+    });
+
+    validate_source_client(&client, config).await?;
+    validate_publication_alignment(&client, config, capture_plan).await
+}
+
+async fn validate_source_client(
+    client: &Client,
+    config: &SourceConfig,
+) -> Result<(), PostgresError> {
     let row = client
         .query_one(
             r#"
@@ -446,6 +603,81 @@ pub async fn validate_source_config(config: &SourceConfig) -> Result<(), Postgre
     );
 
     Ok(())
+}
+
+async fn validate_publication_alignment(
+    client: &Client,
+    config: &SourceConfig,
+    capture_plan: &CapturePlan,
+) -> Result<PublicationAlignment, PostgresError> {
+    let published_rows = client
+        .query(
+            r#"
+            SELECT schemaname, tablename
+            FROM pg_publication_tables
+            WHERE pubname = $1
+            ORDER BY schemaname, tablename
+            "#,
+            &[&config.publication],
+        )
+        .await?;
+    let published_tables = published_rows
+        .iter()
+        .map(|row| {
+            let schema: String = row.get(0);
+            let table: String = row.get(1);
+            format!("{schema}.{table}")
+        })
+        .collect::<BTreeSet<_>>();
+
+    let database_rows = client
+        .query(
+            r#"
+            SELECT namespace.nspname, relation.relname
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE relation.relkind IN ('r', 'p')
+              AND relation.relpersistence <> 't'
+              AND namespace.nspname <> 'information_schema'
+              AND namespace.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+            ORDER BY namespace.nspname, relation.relname
+            "#,
+            &[],
+        )
+        .await?;
+    let database_tables = database_rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let required_tables = capture_plan.required_tables(
+        database_tables
+            .iter()
+            .map(|(schema, table)| (schema.as_str(), table.as_str())),
+    );
+    let missing_tables = required_tables
+        .difference(&published_tables)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_tables.is_empty() {
+        return Err(PostgresError::Configuration(format!(
+            "publication {:?} is missing configured capture tables: {}",
+            config.publication,
+            missing_tables.join(", ")
+        )));
+    }
+
+    let unnecessary_published_tables = published_tables
+        .into_iter()
+        .filter(|qualified| {
+            qualified
+                .split_once('.')
+                .is_some_and(|(schema, table)| !capture_plan.matches_table(schema, table))
+        })
+        .collect();
+
+    Ok(PublicationAlignment {
+        unnecessary_published_tables,
+    })
 }
 
 fn pg_time_to_unix_ms(pg_micros: i64) -> i64 {

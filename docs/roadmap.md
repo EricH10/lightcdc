@@ -11,6 +11,146 @@ The MVP proves the product path, but it is not production-ready yet. Work is
 ordered so correctness and recovery come before throughput and product
 features.
 
+## Production Readiness Gate
+
+The first production claim should stay intentionally narrow: one LightCDC
+process, one PostgreSQL source and replication slot, one local durable redb
+store, config-defined streams, and ordered gRPC consumers. High availability,
+shared worker groups, transforms, webhooks, and additional source databases are
+valuable later features, not requirements for an honest single-node release.
+
+The following are release gates, even when the broader milestone containing
+them has optional work remaining.
+
+### Data Correctness and Compatibility
+
+- Preserve source transactions, local events, and the source checkpoint
+  atomically. DONE for currently supported `pgoutput` row events.
+- Persist and validate PostgreSQL source identity, not only database, slot, and
+  publication names, so a replaced or restored source cannot silently continue
+  against old local state.
+- Reconcile the local durable source LSN with the slot's
+  `confirmed_flush_lsn` before capture. Refuse startup with a clear data-gap
+  error when PostgreSQL can no longer replay the local missing range.
+- Publish and enforce a supported PostgreSQL and `pgoutput` feature matrix,
+  including partitioned tables, replica identity modes, schema changes,
+  publication changes, messages, streaming transactions, and prepared
+  transactions. Unsupported modes must fail before acknowledging affected WAL.
+- Derive the union of tables required by configured durable streams and push
+  that selection into the PostgreSQL publication. Capture must not depend on
+  which consumers happen to be connected, and startup must reject missing
+  required tables while reporting unnecessary published tables. DONE for the
+  compiled plan and operator-managed publication validation.
+- Add a capture-side table filter as defense in depth so an intentionally broad
+  publication does not fill redb with events no configured stream can consume.
+  Persist checkpoint-only source transactions when every event is filtered.
+  DONE.
+- Advance safely across long periods containing only unrelated source changes.
+  Use a transaction-boundary checkpoint or logical heartbeat rather than
+  acknowledging a keepalive WAL end that may include uncommitted relevant work.
+  DONE with configurable transactional logical heartbeats.
+- Provide a consistent bootstrap procedure: either a built-in initial snapshot
+  or a documented external snapshot plus resume-LSN workflow. A change-only
+  release must say so prominently.
+- Version the durable event, metadata, consumer-offset, and staging formats.
+  Test forward migrations and reject unsupported downgrade or newer formats
+  without mutating the store.
+- Test the no-loss boundary across process kill, host restart, PostgreSQL
+  restart, network interruption, storage failure, retention, and supported
+  schema changes. PARTIAL: process, reconnect, transaction, retention, and
+  selected schema-change boundaries are covered.
+
+### Recovery and Resource Safety
+
+- Shut down on SIGINT and SIGTERM at a known durability boundary: stop accepting
+  new work, finish or replay the current source transaction, resolve the
+  in-flight redb write, acknowledge only durable LSNs, drain or close gRPC
+  streams, and honor a tested timeout. The existing `shutdown_timeout_ms`
+  setting is not yet wired into this lifecycle.
+- Define and test backup and restore for the redb store together with PostgreSQL
+  slot state. Document the no-loss boundary, recovery point objective, recovery
+  time objective, and what happens when local storage is permanently lost.
+- Detect redb corruption and incompatible files at startup, fail without
+  destructive repair, and provide a tested integrity-check and recovery
+  procedure.
+- Enforce byte-size retention, staging-space limits, minimum free-space
+  thresholds, and a reserved emergency margin. Stop or shed work before disk
+  exhaustion and surface the resulting PostgreSQL WAL-retention risk.
+- Classify storage and retention failures as healthy, degraded, retryable, or
+  terminal instead of logging every retention failure and retrying forever.
+- Move consumer replay, ACK, and seek storage operations off Tokio worker
+  threads. The dedicated storage thread currently covers capture and retention
+  writes only.
+- Bound active subscriptions, per-connection buffers, request and consumer-name
+  sizes, outbound event sizes, and total memory. Validate every configured
+  numeric limit and reject zero, contradictory, or ineffective settings.
+- Remove or implement inert configuration fields such as `channel_capacity`;
+  production configuration must not appear to control behavior that ignores it.
+
+### Security and API Safety
+
+- Add PostgreSQL TLS with certificate verification and gRPC TLS, with secure
+  production defaults and an explicit local-development opt-out.
+- Add gRPC authentication and per-stream authorization before binding beyond
+  localhost. Protect administrative operations such as seek separately from
+  ordinary subscribe and ACK access.
+- Load passwords, keys, and tokens from environment variables or secret files;
+  avoid requiring plaintext secrets in the main TOML file.
+- Sanitize external gRPC errors so storage paths, database details, and internal
+  failures are logged server-side without being returned to untrusted clients.
+- Default production capture output to no event payloads so row data is not
+  accidentally written to logs and capture throughput is not silently reduced.
+- Document a least-privilege PostgreSQL role and test it in integration tests.
+
+### Operations, Releases, and Support
+
+- Expose the standard gRPC health service and separate liveness from readiness.
+  Readiness must reflect capture state, storage writability, source continuity,
+  and whether serving retained events is still safe.
+- Export low-overhead production metrics for source LSN and WAL lag, capture
+  rate, redb latency, retention lag, consumer lag, reconnects, subscription
+  pressure, disk and staging usage, and terminal state. Define actionable alert
+  thresholds and do not rely on benchmark-only JSONL metrics.
+- Add structured runtime states and stable exit behavior so supervisors can
+  distinguish starting, capturing, retrying, degraded, draining, and terminal
+  configuration or data-loss failures.
+- Provide a production container or release binaries that run as a non-root
+  user, use a persistent volume, handle signals, expose health checks, and pin
+  supported Rust, OS, architecture, PostgreSQL, and redb versions.
+- Add required CI for formatting, clippy, unit tests, Docker-backed PostgreSQL
+  tests, release builds, durable-format migration fixtures, and the minimum
+  supported Rust version.
+- Add dependency vulnerability and license checks, automated dependency updates,
+  release versioning, changelog and upgrade notes, and checksums or provenance
+  for distributed artifacts.
+- Write an operator runbook for installation, upgrades, rollback, backup,
+  restore, slot loss, source failover, WAL growth, disk pressure, stale
+  consumers, corruption, and collecting diagnostics without exposing row data.
+- Declare the single-node availability boundary. A first release may require
+  restart or restore after host loss; active-passive failover and shared storage
+  do not block release if that limitation and recovery procedure are explicit.
+
+### Capacity Sign-Off
+
+- Establish a supported capacity envelope by payload size, source transaction
+  size, retention window, consumer count, acknowledgement frequency, and disk.
+- Run multi-hour soak tests with retention active and verify bounded memory,
+  bounded allocated disk, stable latency, no sequence gaps, and no growing
+  PostgreSQL WAL lag.
+- Exercise slow and disconnected consumers, PostgreSQL outages, process restarts,
+  disk pressure, and reconnect storms during load.
+- Drive sustained unrelated-table writes and verify they do not consume redb
+  retention capacity, materially reduce useful capture throughput, or cause
+  unbounded replication-slot WAL retention while relevant tables are idle.
+- Restore append-like sustained throughput while retention is active, or publish
+  a lower measured limit. A production release needs predictable capacity, not
+  maximum possible benchmark throughput.
+
+Production-ready means every item above is complete or has an explicit,
+documented limitation that does not permit silent data loss, unauthorized
+access, or unbounded resource growth. It does not require completing every
+feature milestone below.
+
 ## Milestone 2: Correctness and Crash Recovery - COMPLETE
 
 - Persist a transaction's events and source LSN in one atomic redb transaction. DONE
@@ -66,6 +206,10 @@ production-stability claim:
 - Version the durable event and staging formats and define their migration policy
   before promising compatibility across releases.
 - Test the configured byte and event limits at their exact boundary values.
+- Persist PostgreSQL source identity and reject source replacement, stale local
+  restore, or a slot checkpoint ahead of the durable local source LSN.
+- Add restart and restore fixtures that exercise compatible migrations,
+  incompatible formats, corruption, and local/source checkpoint divergence.
 
 ## Planned Migrations and Backfills
 
@@ -105,6 +249,8 @@ intervention.
 - Add gRPC health and readiness reporting.
 - Report PostgreSQL connection state and reconnect count.
 - Report received, persisted, and acknowledged positions.
+- Report slot `confirmed_flush_lsn`, retained WAL bytes, `wal_status`,
+  `safe_wal_size`, and source/local checkpoint divergence.
 - Report capture throughput, consumer lag, redb latency, and disk usage.
   PARTIAL: the opt-in benchmark harness records capture and consumer throughput,
   redb persistence latency, WAL lag, CPU, memory, and disk usage as JSONL/CSV;
@@ -119,14 +265,21 @@ disk-constrained runtime without reading debug logs.
 ## Milestone 5: Efficient Consumer Fanout
 
 Each subscription already runs in its own Tokio task, and duplicate active
-subscriptions for one `(stream, consumer)` are rejected. Improve this fanout by
-removing constant per-consumer polling:
+subscriptions for one `(stream, consumer)` are rejected. Constant
+per-consumer polling has been removed:
 
-- Notify subscribers when the durable high-water mark advances.
-- Keep redb as the source of truth when notifications are missed.
-- Give each subscription a bounded delivery channel.
-- Batch redb reads, writes, and acknowledgements where safe.
-- Move synchronous storage work onto a dedicated blocking boundary.
+- Notify subscribers when the durable high-water mark advances. DONE: `run`
+  shares a Tokio watch notifier between capture and gRPC.
+- Keep redb as the source of truth when notifications are missed. DONE:
+  notifications carry no payload and only trigger another ordered redb replay.
+- Give each subscription a bounded delivery channel. DONE.
+- Batch redb reads, writes, and acknowledgements where safe. PARTIAL: capture
+  now group-commits complete source transactions using count, event, byte, and
+  time limits; consumer acknowledgement batching remains client-controlled.
+- Move synchronous storage work onto a dedicated blocking boundary. PARTIAL:
+  capture pipelines one in-flight group through a long-lived redb writer thread
+  while the Tokio replication task assembles the next group; gRPC replay,
+  acknowledgement, and seek still call redb from Tokio tasks.
 - Limit active subscriptions to protect memory and file descriptors.
 - Define duplicate consumer-name and consumer-group behavior. DONE for the
   ordered-cursor mode; shared groups are deferred to leased-message delivery.
@@ -135,17 +288,30 @@ removing constant per-consumer polling:
   following Sequin's delivery approach.
 - Benchmark 1, 10, 100, and 1,000 consumers. IN PROGRESS: the repeatable
   single-consumer rate, payload, transaction-size, and acknowledgement harness
-  exists; concurrent-consumer matrix coverage remains.
+  includes a normalized capture-commit/acknowledgement cost matrix and a short
+  48.7k events/second dedicated-writer probe; concurrent-consumer matrix and
+  sustained incompressible-payload coverage remain.
 
 Complete when additional consumers have measured, bounded resource costs and a
 slow consumer cannot stall capture or unrelated consumers.
 
 ## Milestone 6: Retention and Slow Consumers
 
-- Add maximum event age and storage size policies.
-- Track the lowest sequence still required by active consumers.
-- Define expiration behavior for abandoned consumers.
-- Compact events that are no longer needed.
+- Add maximum event age and storage size policies. PARTIAL: maximum age and
+  retained event count are implemented; byte-size retention remains.
+- Track the lowest sequence still required by active consumers. SUPERSEDED for
+  the initial hard-retention model: abandoned consumers do not pin disk.
+- Define expiration behavior for abandoned consumers. DONE: an expired offset
+  fails explicitly and requires a seek to the retained prefix or latest.
+- Compact events that are no longer needed. PARTIAL: bounded prefix deletion and
+  redb page reuse are implemented; explicit offline file compaction remains.
+- Restore append-like sustained throughput while retention is active. Profile
+  the current prefix-pruning path, benchmark combining append and prune work in
+  one redb transaction, evaluate transaction-level rather than per-event replay
+  deduplication, and compare redb's range-removal APIs. If row-by-row deletion
+  remains the limit, move to size- or time-bounded redb segments so retention
+  can remove whole sealed files; consider multiple writable shards only when
+  measured demand justifies the ordering and replay complexity.
 - Warn and shed work safely before disk exhaustion.
 
 Complete when storage growth is bounded and stale consumers have explicit,
@@ -157,9 +323,12 @@ observable behavior.
 - Add consumer authentication and per-stream authorization.
 - Load secrets from environment variables or secret files.
 - Enforce event, request, subscription, and connection limits.
+- Sanitize public API errors and default to not logging captured row payloads.
 - Validate publications, slots, and configured tables at startup. PARTIAL:
   `wal_level`, replication privilege, publication, slot type, `pgoutput` plugin,
-  and slot database are validated; configured table validation remains.
+  slot database, configured stream/publication table alignment, and
+  unnecessary-table reporting are validated; broader supported-feature
+  validation remains.
 
 ## Milestone 8: Product Features
 
@@ -171,6 +340,8 @@ observable behavior.
 
 ## Current Next Step
 
-Test that the combined runtime keeps serving stored events while PostgreSQL
-capture is unavailable, then add explicit runtime states and graceful shutdown
-at a known durability boundary.
+Persist and validate PostgreSQL source identity, then reject a slot
+`confirmed_flush_lsn` that is ahead of the durable local checkpoint before
+capture starts. Next, finish the combined-runtime outage test, explicit runtime
+states, graceful shutdown, and standard health/readiness service before
+returning to retention throughput work.

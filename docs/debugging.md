@@ -65,10 +65,11 @@ information without stopping the process, which is useful inside event loops.
 
 ## Useful LightCDC Breakpoints
 
-- `capture_with_store` shows the capture and durability loop.
+- `capture_with_store` shows capture setup and dependency wiring.
+- `run_capture_session` shows the capture and durability state transitions.
 - `ReplicationReader::next_transaction` shows transaction buffering and commit boundaries.
 - `PgOutputDecoder::decode` shows raw pgoutput message handling.
-- `RedbEventStore::persist_transaction` shows the atomic event and source-LSN write.
+- `RedbEventStore::persist_transaction_batch` shows the atomic event and source-LSN write.
 - `LightCdcService::subscribe` shows creation of a consumer stream.
 - The spawned loop inside `subscribe` shows replay, filtering, and delivery.
 

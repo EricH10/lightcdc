@@ -2,12 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use lightcdc_core::{ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
-use lightcdc_storage::RedbEventStore;
-use tokio::{sync::mpsc, time::sleep};
+use lightcdc_storage::{RedbEventStore, StorageError};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{info, warn};
@@ -28,12 +27,41 @@ use proto::{
 pub struct LightCdcService {
     config: Arc<Config>,
     store: Arc<RedbEventStore>,
-    poll_interval: Duration,
+    event_notifier: EventNotifier,
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
     delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
 }
 
 type SubscriptionKey = (String, String);
+
+/// Wakes live subscribers after capture durably commits new events.
+#[derive(Clone, Debug)]
+pub struct EventNotifier {
+    sender: watch::Sender<()>,
+}
+
+impl EventNotifier {
+    /// Creates an independent event notification channel.
+    pub fn new() -> Self {
+        let (sender, _receiver) = watch::channel(());
+        Self { sender }
+    }
+
+    /// Signals that subscribers should check the durable event log again.
+    pub fn notify(&self) {
+        self.sender.send_replace(());
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.sender.subscribe()
+    }
+}
+
+impl Default for EventNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Removes a subscription identity from the active set when its task exits.
 struct ActiveSubscription {
@@ -50,10 +78,19 @@ impl Drop for ActiveSubscription {
 impl LightCdcService {
     /// Creates a gRPC service from configuration and a shared event store.
     pub fn new(config: Config, store: RedbEventStore) -> Self {
+        Self::new_with_notifier(config, store, EventNotifier::new())
+    }
+
+    /// Creates a gRPC service that shares capture commit notifications.
+    pub fn new_with_notifier(
+        config: Config,
+        store: RedbEventStore,
+        event_notifier: EventNotifier,
+    ) -> Self {
         Self {
             config: Arc::new(config),
             store: Arc::new(store),
-            poll_interval: Duration::from_millis(250),
+            event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -67,7 +104,24 @@ pub async fn serve(
     store: RedbEventStore,
 ) -> Result<(), tonic::transport::Error> {
     let service = LightCdcService::new(config, store);
+    serve_service(addr, service).await
+}
 
+/// Runs the gRPC server with notifications from an in-process capture loop.
+pub async fn serve_with_notifier(
+    addr: SocketAddr,
+    config: Config,
+    store: RedbEventStore,
+    event_notifier: EventNotifier,
+) -> Result<(), tonic::transport::Error> {
+    let service = LightCdcService::new_with_notifier(config, store, event_notifier);
+    serve_service(addr, service).await
+}
+
+async fn serve_service(
+    addr: SocketAddr,
+    service: LightCdcService,
+) -> Result<(), tonic::transport::Error> {
     info!(%addr, "starting lightcdc gRPC server");
     Server::builder()
         .add_service(LightCdcServer::new(service))
@@ -88,15 +142,18 @@ impl LightCdc for LightCdcService {
         let consumer = validate_consumer(&request.consumer)?;
         let stream = self.stream(&request.stream)?;
         let subscription = self.claim_subscription(&stream.name, consumer)?;
-        let start_offset = self
+        let stored_offset = self
             .store
             .consumer_offset(&stream.name, consumer)
-            .map_err(internal)?
-            .unwrap_or(0);
+            .map_err(internal)?;
+        let start_offset = match stored_offset {
+            Some(offset) => offset,
+            None => earliest_retained_offset(&self.store).map_err(internal)?,
+        };
         let limit = request.limit as usize;
         let (tx, rx) = mpsc::channel(32);
         let store = Arc::clone(&self.store);
-        let poll_interval = self.poll_interval;
+        let mut event_notifications = self.event_notifier.subscribe();
         let delivery_key = (stream.name.clone(), consumer.to_owned());
         let delivery_high_watermarks = Arc::clone(&self.delivery_high_watermarks);
 
@@ -109,11 +166,7 @@ impl LightCdc for LightCdcService {
                 let batch = match store.replay_from(next_sequence, 256) {
                     Ok(batch) => batch,
                     Err(error) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "failed to read events from redb: {error}"
-                            ))))
-                            .await;
+                        let _ = tx.send(Err(replay_status(error))).await;
                         return;
                     }
                 };
@@ -121,7 +174,11 @@ impl LightCdc for LightCdcService {
                 if batch.is_empty() {
                     tokio::select! {
                         _ = tx.closed() => return,
-                        _ = sleep(poll_interval) => {}
+                        result = event_notifications.changed() => {
+                            if result.is_err() {
+                                return;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -191,7 +248,7 @@ impl LightCdc for LightCdcService {
             SeekPosition::try_from(request.position).unwrap_or(SeekPosition::Unspecified);
 
         let offset = match position {
-            SeekPosition::Earliest => 0,
+            SeekPosition::Earliest => earliest_retained_offset(&self.store).map_err(internal)?,
             SeekPosition::Latest => self.store.last_sequence().map_err(internal)?.unwrap_or(0),
             SeekPosition::Absolute => request.sequence,
             SeekPosition::Unspecified => {
@@ -325,6 +382,28 @@ fn record_delivery(
         .or_insert(sequence);
 }
 
+/// Returns the offset immediately before the oldest retained event.
+fn earliest_retained_offset(store: &RedbEventStore) -> Result<u64, StorageError> {
+    match store.first_sequence()? {
+        Some(first_sequence) => Ok(first_sequence.saturating_sub(1)),
+        None => Ok(store.last_sequence()?.unwrap_or(0)),
+    }
+}
+
+/// Converts an expired replay position into an actionable consumer error.
+fn replay_status(error: StorageError) -> Status {
+    match error {
+        StorageError::SequenceExpired {
+            requested,
+            first_available,
+        } => Status::failed_precondition(format!(
+            "consumer offset expired at sequence {requested}; first retained sequence is \
+             {first_available}; seek to earliest or latest before subscribing again"
+        )),
+        error => internal(format!("failed to read events from redb: {error}")),
+    }
+}
+
 /// Converts internal errors into gRPC internal status errors.
 fn internal(error: impl ToString) -> Status {
     let message = error.to_string();
@@ -338,7 +417,7 @@ mod tests {
         ChangeEvent as CoreChangeEvent, LoggingConfig, Operation as CoreOperation, RuntimeConfig,
         SourceConfig, SourceMetadata, StreamConfig,
     };
-    use lightcdc_storage::LogOpenOptions;
+    use lightcdc_storage::{LogOpenOptions, RetentionPolicy};
     use tempfile::TempDir;
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
@@ -371,6 +450,36 @@ mod tests {
         assert_eq!(event.sequence, 2);
         assert_eq!(event.table, "orders");
         assert_eq!(event.operation, proto::Operation::Insert as i32);
+    }
+
+    #[tokio::test]
+    async fn commit_notification_wakes_a_waiting_subscriber() {
+        let service = service_with_events(&[]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+
+        assert!(
+            timeout(Duration::from_millis(20), subscription.next())
+                .await
+                .is_err(),
+            "empty subscription should wait for a durable event"
+        );
+
+        service
+            .store
+            .append_event(&event(1, "public", "orders"))
+            .expect("append event");
+        service.event_notifier.notify();
+
+        let delivered = timeout(Duration::from_secs(1), subscription.next())
+            .await
+            .expect("subscriber should wake immediately")
+            .expect("stream item")
+            .expect("change event");
+        assert_eq!(delivered.sequence, 1);
     }
 
     #[tokio::test]
@@ -623,6 +732,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_consumer_offset_requires_an_explicit_seek() {
+        let service = service_with_events(&[
+            event(1, "public", "orders"),
+            event(2, "public", "orders"),
+            event(3, "public", "orders"),
+        ]);
+        service
+            .store
+            .set_consumer_offset("orders", "search-indexer", 1)
+            .expect("set stale offset");
+        service
+            .store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: Some(1),
+                    max_age: None,
+                    delete_batch_size: 10,
+                },
+                i64::MAX,
+            )
+            .expect("prune events");
+
+        let mut expired = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        let error = expired
+            .next()
+            .await
+            .expect("stream status")
+            .expect_err("expired offset should fail");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("first retained sequence is 3"));
+    }
+
+    #[tokio::test]
+    async fn seek_earliest_resumes_at_the_retained_prefix() {
+        let service = service_with_events(&[
+            event(1, "public", "orders"),
+            event(2, "public", "orders"),
+            event(3, "public", "orders"),
+        ]);
+        service
+            .store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: Some(1),
+                    max_age: None,
+                    delete_batch_size: 10,
+                },
+                i64::MAX,
+            )
+            .expect("prune events");
+        let seek = service
+            .seek(Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                position: SeekPosition::Earliest as i32,
+                sequence: 0,
+            }))
+            .await
+            .expect("seek response")
+            .into_inner();
+
+        assert_eq!(seek.offset, 2);
+
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        let event = subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("retained event");
+        assert_eq!(event.sequence, 3);
+    }
+
+    #[tokio::test]
     async fn seek_latest_sets_consumer_offset_to_last_sequence() {
         let service = service_with_events(&[
             event(1, "public", "orders"),
@@ -742,9 +933,18 @@ mod tests {
                 storage_file: "lightcdc.redb".to_owned(),
                 channel_capacity: 1024,
                 shutdown_timeout_ms: 10000,
+                heartbeat_interval_ms: 10_000,
                 transaction_memory_threshold_bytes: 16 * 1024 * 1024,
                 max_transaction_bytes: 1024 * 1024 * 1024,
                 max_transaction_events: 1_000_000,
+                capture_batch_max_transactions: 100,
+                capture_batch_max_events: 500,
+                capture_batch_max_bytes: 4 * 1024 * 1024,
+                capture_batch_max_delay_ms: 20,
+                retention_max_events: None,
+                retention_max_age_seconds: None,
+                retention_check_interval_ms: 1_000,
+                retention_delete_batch_size: 100_000,
             },
             logging: LoggingConfig {
                 level: "info".to_owned(),

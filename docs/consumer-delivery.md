@@ -23,6 +23,11 @@ operator and should remain stable across restarts.
   downstream processing should be idempotent.
 - A consumer that intentionally does not need missed events can seek to
   `latest` before subscribing.
+- Retention is a hard boundary and is not pinned by consumer offsets. A
+  consumer that falls behind receives an expired-offset error and must
+  explicitly seek to `earliest` or `latest`.
+- `earliest` means the oldest event payload that is still retained, not
+  necessarily sequence 1.
 - Delivery history is retained across ordinary reconnects, so a delayed
   acknowledgement from an earlier connection remains valid. An explicit seek
   clears that history and requires a new delivery before another

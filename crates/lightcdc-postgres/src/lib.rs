@@ -5,5 +5,6 @@ pub mod replication;
 
 pub use decoder::{PgOutputDecoder, PgOutputMessage};
 pub use replication::{
-    CapturedTransaction, PostgresError, ReplicationReader, validate_source_config,
+    CapturedTransaction, LogicalHeartbeatEmitter, PostgresError, PublicationAlignment,
+    ReplicationReader, TransactionRead, validate_source_config, validate_source_config_with_plan,
 };
