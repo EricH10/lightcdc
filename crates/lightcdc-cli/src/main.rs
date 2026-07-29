@@ -47,8 +47,9 @@ enum Command {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,
 
-        #[arg(long)]
-        max_events: Option<usize>,
+        /// Stop after at least this many durable events in a bounded run.
+        #[arg(long, alias = "max-events")]
+        stop_after_events: Option<usize>,
 
         #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
         output: CaptureOutput,
@@ -67,8 +68,9 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: SocketAddr,
 
-        #[arg(long)]
-        max_events: Option<usize>,
+        /// Stop after at least this many durable events in a bounded run.
+        #[arg(long, alias = "max-events")]
+        stop_after_events: Option<usize>,
 
         #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
         output: CaptureOutput,
@@ -126,7 +128,9 @@ enum CaptureOutput {
 
 /// Holds optional capture behavior used by bounded runs and benchmarks.
 struct CaptureOptions {
-    max_events: Option<usize>,
+    /// Stops after at least this many events are durable; the final source
+    /// transaction remains whole, so the count can exceed the requested target.
+    stop_after_events: Option<usize>,
     output: CaptureOutput,
     metrics_file: Option<PathBuf>,
     metrics_interval: Duration,
@@ -200,7 +204,7 @@ struct CaptureContext<'a> {
 }
 
 enum CaptureSessionExit {
-    LimitReached,
+    RequestedEventCountReached,
     Disconnected(String),
 }
 
@@ -212,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Capture {
             config,
-            max_events,
+            stop_after_events,
             output,
             metrics_file,
             metrics_interval_seconds,
@@ -220,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
             capture(
                 config,
                 CaptureOptions {
-                    max_events,
+                    stop_after_events,
                     output,
                     metrics_file,
                     metrics_interval: Duration::from_secs(metrics_interval_seconds),
@@ -231,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             config,
             addr,
-            max_events,
+            stop_after_events,
             output,
             metrics_file,
             metrics_interval_seconds,
@@ -240,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 addr,
                 CaptureOptions {
-                    max_events,
+                    stop_after_events,
                     output,
                     metrics_file,
                     metrics_interval: Duration::from_secs(metrics_interval_seconds),
@@ -381,7 +385,7 @@ async fn capture_with_store(
     );
 
     warn!(
-        max_events = ?options.max_events,
+        stop_after_events = ?options.stop_after_events,
         "capture is running; insert, update, or delete rows in the published tables"
     );
 
@@ -474,7 +478,7 @@ async fn supervise_capture_sessions(
     reconnect_count: &mut u64,
 ) -> anyhow::Result<()> {
     loop {
-        if capture_limit_reached(context.options, *captured) {
+        if requested_event_count_reached(context.options, *captured) {
             return Ok(());
         }
 
@@ -488,7 +492,7 @@ async fn supervise_capture_sessions(
         shutdown_capture_reader(&mut reader).await;
 
         match session_result? {
-            CaptureSessionExit::LimitReached => return Ok(()),
+            CaptureSessionExit::RequestedEventCountReached => return Ok(()),
             CaptureSessionExit::Disconnected(reason) => {
                 wait_before_session_reconnect(context, retry_attempt, reconnect_count, &reason)
                     .await;
@@ -586,11 +590,11 @@ async fn run_capture_session(
     let mut pipeline = CapturePipeline::new(replay_reconciled);
 
     loop {
-        if capture_limit_reached(context.options, *captured) {
-            return Ok(CaptureSessionExit::LimitReached);
+        if requested_event_count_reached(context.options, *captured) {
+            return Ok(CaptureSessionExit::RequestedEventCountReached);
         }
 
-        if capture_limit_includes_pending_write(context.options, *captured, &pipeline) {
+        if pending_write_reaches_requested_event_count(context.options, *captured, &pipeline) {
             complete_pending_capture_write(context, reader, &mut pipeline, captured)
                 .await?
                 .expect("the pending event count requires a pending write");
@@ -648,6 +652,8 @@ async fn wait_for_capture_progress(
 ) -> CaptureProgress {
     let deadline = pipeline.read_deadline(context.batch_limits);
     if let Some(pending_write) = pipeline.pending_write.as_mut() {
+        // Apply durable storage results before reading more WAL so replay and
+        // sequence state cannot lag behind a completed write.
         tokio::select! {
             biased;
             completion = &mut pending_write.response => {
@@ -672,6 +678,9 @@ async fn buffer_captured_transaction(
     transaction: CapturedTransaction,
 ) -> anyhow::Result<Option<CaptureSessionExit>> {
     if !pipeline.replay_reconciled {
+        // PostgreSQL may redeliver the last durable transaction after reconnect.
+        // Persist one batch synchronously so duplicate detection can reset the
+        // local sequence before capture pipelines more WAL.
         pipeline.batch.push(transaction);
         submit_capture_batch(context, pipeline).await?;
         complete_pending_capture_write(context, reader, pipeline, captured)
@@ -693,17 +702,19 @@ async fn buffer_captured_transaction(
     }
 
     pipeline.batch.push(transaction);
-    let max_events_reached = context
+    let requested_event_count_buffered = context
         .options
-        .max_events
+        .stop_after_events
         .is_some_and(|max| pipeline.buffered_event_count(*captured) >= max);
-    if pipeline.batch.reached_limit(context.batch_limits) || max_events_reached {
+    if pipeline.batch.reached_limit(context.batch_limits) || requested_event_count_buffered {
         if complete_pending_capture_write(context, reader, pipeline, captured).await?
             == Some(PersistCaptureBatchOutcome::Replayed)
         {
             return Ok(Some(reconnect_after_replayed_batch("queued")));
         }
-        if !capture_limit_reached(context.options, *captured) {
+        // An earlier in-flight batch can satisfy a bounded run while this batch
+        // is queued. Leave the queued transaction unacknowledged for the next run.
+        if !requested_event_count_reached(context.options, *captured) {
             submit_capture_batch(context, pipeline).await?;
         }
     }
@@ -848,13 +859,13 @@ fn complete_and_apply_capture_write(
     Ok(outcome)
 }
 
-fn capture_limit_includes_pending_write(
+fn pending_write_reaches_requested_event_count(
     options: &CaptureOptions,
     captured: usize,
     pipeline: &CapturePipeline,
 ) -> bool {
     options
-        .max_events
+        .stop_after_events
         .is_some_and(|max| captured.saturating_add(pipeline.pending_event_count()) >= max)
 }
 
@@ -899,8 +910,10 @@ fn advance_reconnect_state(retry_attempt: &mut u32, reconnect_count: &mut u64) {
     *reconnect_count = reconnect_count.saturating_add(1);
 }
 
-fn capture_limit_reached(options: &CaptureOptions, captured: usize) -> bool {
-    options.max_events.is_some_and(|max| captured >= max)
+fn requested_event_count_reached(options: &CaptureOptions, captured: usize) -> bool {
+    options
+        .stop_after_events
+        .is_some_and(|target| captured >= target)
 }
 
 fn capture_batch_limits(config: &Config) -> anyhow::Result<CaptureBatchLimits> {
@@ -950,6 +963,8 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
             Ok(emitter) => {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Tokio's first interval tick is immediate; consume it so the
+                // configured idle period elapses before emitting a heartbeat.
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;

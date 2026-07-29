@@ -36,7 +36,7 @@ cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
 For a bounded local smoke test:
 
 ```bash
-cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml --max-events 3
+cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml --stop-after-events 3
 ```
 
 Capture keeps the union of tables selected by configured durable streams, even

@@ -4,8 +4,8 @@
 
 1. `lightcdc run` loads `lightcdc.example.toml`, opens redb once, starts gRPC, and starts capture.
 2. `capture_with_store` compiles the configured streams into one `CapturePlan`
-   and prepares capture limits, metrics, transaction staging, heartbeats, and
-   the dedicated storage writer.
+   and prepares the optional bounded-run target, metrics, transaction staging,
+   heartbeats, and the dedicated storage writer.
 3. `supervise_capture` validates the source and publication table membership,
    starts logical heartbeats, reconnects when needed, and asks
    `connect_capture_reader` to reload the durable source LSN and next local

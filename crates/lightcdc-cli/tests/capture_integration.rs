@@ -661,7 +661,7 @@ async fn capture_reconnects_after_postgres_terminates_replication_backend() -> a
                 config_path
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
-                "--max-events",
+                "--stop-after-events",
                 "2",
             ])
             .stdout(Stdio::null())
@@ -718,7 +718,7 @@ async fn capture_groups_small_source_transactions_into_one_redb_commit() -> anyh
                 config_path
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
-                "--max-events",
+                "--stop-after-events",
                 "10",
                 "--output",
                 "none",

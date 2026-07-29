@@ -119,6 +119,8 @@ impl CaptureStorageWriter {
         let thread = thread::Builder::new()
             .name("lightcdc-redb-writer".to_owned())
             .spawn(move || {
+                // redb commits are synchronous, so one OS thread owns and
+                // serializes capture and retention writes off Tokio's workers.
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
                         StorageCommand::Persist(command) => {
