@@ -1,5 +1,18 @@
 # Code Flow
 
+## CLI Module Map
+
+- `main.rs` parses arguments and dispatches one command.
+- `cli.rs` defines command-line arguments and bounded capture options.
+- `capture/mod.rs` wires configuration, storage, metrics, retention, and serving.
+- `capture/supervisor.rs` owns validation, reconnects, heartbeats, and session lifetime.
+- `capture/pipeline.rs` overlaps PostgreSQL reads with one in-flight redb write.
+- `capture/writer.rs` owns the dedicated synchronous redb thread.
+- `capture/metrics.rs` owns optional non-blocking benchmark metrics.
+- `commands.rs` implements replay, inspect, and serve-only commands.
+- `display.rs` formats events and inspector tables.
+- `store.rs` translates runtime configuration into redb open options.
+
 ## Runtime Flow
 
 1. `lightcdc run` loads `lightcdc.example.toml`, opens redb once, starts gRPC, and starts capture.

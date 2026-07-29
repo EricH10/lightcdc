@@ -19,7 +19,7 @@ use serde_json::json;
 const SAMPLE_CHANNEL_CAPACITY: usize = 8_192;
 
 /// Sends storage-group capture samples to a dedicated aggregation thread.
-pub struct CaptureMetrics {
+pub(super) struct CaptureMetrics {
     sender: Option<SyncSender<CaptureSample>>,
     dropped_samples: Arc<AtomicU64>,
     worker: Option<JoinHandle<io::Result<()>>>,
@@ -63,7 +63,7 @@ struct IntervalTotals {
 
 impl CaptureMetrics {
     /// Starts an opt-in metrics writer. No metrics object exists in normal runs.
-    pub fn start(path: &Path, report_interval: Duration) -> io::Result<Self> {
+    pub(super) fn start(path: &Path, report_interval: Duration) -> io::Result<Self> {
         if report_interval.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -94,7 +94,7 @@ impl CaptureMetrics {
     }
 
     /// Records one durable source transaction group without blocking capture.
-    pub fn record_persisted(
+    pub(super) fn record_persisted(
         &self,
         transaction_count: usize,
         event_count: usize,
@@ -114,7 +114,7 @@ impl CaptureMetrics {
     }
 
     /// Records one retryable capture disconnection.
-    pub fn record_reconnect(&self) {
+    pub(super) fn record_reconnect(&self) {
         self.try_send(CaptureSample::Reconnect);
     }
 

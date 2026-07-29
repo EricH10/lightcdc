@@ -17,37 +17,37 @@ const STORAGE_COMMAND_CAPACITY: usize = 1;
 
 /// Bounds how many complete source transactions share one redb commit.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct CaptureBatchLimits {
+pub(super) struct CaptureBatchLimits {
     /// Maximum grouped source transactions.
-    pub(crate) max_transactions: usize,
+    pub(super) max_transactions: usize,
     /// Soft grouped event boundary.
-    pub(crate) max_events: usize,
+    pub(super) max_events: usize,
     /// Soft grouped decoded-byte boundary.
-    pub(crate) max_bytes: u64,
+    pub(super) max_bytes: u64,
     /// Maximum wait measured from the first grouped transaction.
-    pub(crate) max_delay: Duration,
+    pub(super) max_delay: Duration,
 }
 
 /// Accumulates complete source transactions and their resource totals.
 #[derive(Default)]
-pub(crate) struct CaptureBatch {
+pub(super) struct CaptureBatch {
     /// Whole source transactions preserved in commit order.
-    pub(crate) transactions: Vec<CapturedTransaction>,
+    pub(super) transactions: Vec<CapturedTransaction>,
     /// Total consumer events across the grouped transactions.
-    pub(crate) event_count: usize,
+    pub(super) event_count: usize,
     /// Total estimated decoded bytes across the group.
-    pub(crate) decoded_bytes: u64,
+    pub(super) decoded_bytes: u64,
     /// Total staged representation bytes across the group.
-    pub(crate) staged_bytes: u64,
+    pub(super) staged_bytes: u64,
     /// Transactions whose events currently live in staging files.
-    pub(crate) staged_transaction_count: usize,
+    pub(super) staged_transaction_count: usize,
     /// Time the first transaction entered this group.
     started_at: Option<TokioInstant>,
 }
 
 impl CaptureBatch {
     /// Adds a whole source transaction and updates aggregate accounting.
-    pub(crate) fn push(&mut self, transaction: CapturedTransaction) {
+    pub(super) fn push(&mut self, transaction: CapturedTransaction) {
         let stats = transaction.events.stats();
         if self.transactions.is_empty() {
             self.started_at = Some(TokioInstant::now());
@@ -60,7 +60,7 @@ impl CaptureBatch {
     }
 
     /// Returns true when the batch contains no source transactions.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
@@ -68,7 +68,7 @@ impl CaptureBatch {
     ///
     /// An empty batch always accepts one transaction so a source transaction is
     /// never split merely to satisfy redb group-commit limits.
-    pub(crate) fn would_exceed(
+    pub(super) fn would_exceed(
         &self,
         transaction: &CapturedTransaction,
         limits: CaptureBatchLimits,
@@ -83,14 +83,14 @@ impl CaptureBatch {
     }
 
     /// Returns true when the current batch has met any flush boundary.
-    pub(crate) fn reached_limit(&self, limits: CaptureBatchLimits) -> bool {
+    pub(super) fn reached_limit(&self, limits: CaptureBatchLimits) -> bool {
         self.transactions.len() >= limits.max_transactions
             || self.event_count >= limits.max_events
             || self.decoded_bytes >= limits.max_bytes
     }
 
     /// Returns when the oldest transaction in this batch must be flushed.
-    pub(crate) fn deadline(&self, limits: CaptureBatchLimits) -> TokioInstant {
+    pub(super) fn deadline(&self, limits: CaptureBatchLimits) -> TokioInstant {
         self.started_at
             .expect("non-empty capture batch has a start time")
             + limits.max_delay
@@ -98,28 +98,28 @@ impl CaptureBatch {
 }
 
 /// Owns the lifetime of the dedicated redb writer thread.
-pub(crate) struct CaptureStorageWriter {
+pub(super) struct CaptureStorageWriter {
     handle: Option<CaptureStorageHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// Sends serialized storage commands to the dedicated writer.
 #[derive(Clone)]
-pub(crate) struct CaptureStorageHandle {
+pub(super) struct CaptureStorageHandle {
     sender: mpsc::Sender<StorageCommand>,
 }
 
 /// Tracks one submitted batch until its redb result is available.
-pub(crate) struct PendingCaptureWrite {
-    pub(crate) response: oneshot::Receiver<StorageCompletion>,
-    pub(crate) event_count: usize,
+pub(super) struct PendingCaptureWrite {
+    pub(super) response: oneshot::Receiver<StorageCompletion>,
+    pub(super) event_count: usize,
 }
 
 /// Returns both the original batch and its storage result to the async pipeline.
-pub(crate) struct StorageCompletion {
-    pub(crate) batch: CaptureBatch,
-    pub(crate) result: Result<PersistTransactionOutcome, StorageError>,
-    pub(crate) persist_latency: Option<Duration>,
+pub(super) struct StorageCompletion {
+    pub(super) batch: CaptureBatch,
+    pub(super) result: Result<PersistTransactionOutcome, StorageError>,
+    pub(super) persist_latency: Option<Duration>,
 }
 
 /// Carries all state required to persist and report one capture batch.
@@ -143,7 +143,7 @@ enum StorageCommand {
 
 impl CaptureStorageWriter {
     /// Starts the long-lived OS thread that owns synchronous storage work.
-    pub(crate) fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
+    pub(super) fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<StorageCommand>(STORAGE_COMMAND_CAPACITY);
         let thread = thread::Builder::new()
             .name("lightcdc-redb-writer".to_owned())
@@ -177,7 +177,7 @@ impl CaptureStorageWriter {
     }
 
     /// Clones a lightweight command handle for retention or other producers.
-    pub(crate) fn handle(&self) -> CaptureStorageHandle {
+    pub(super) fn handle(&self) -> CaptureStorageHandle {
         self.handle
             .as_ref()
             .expect("redb writer thread is running")
@@ -185,7 +185,7 @@ impl CaptureStorageWriter {
     }
 
     /// Queues one capture batch and returns a receiver for its eventual result.
-    pub(crate) async fn submit(
+    pub(super) async fn submit(
         &self,
         batch: CaptureBatch,
         measure_latency: bool,
@@ -250,7 +250,7 @@ impl CaptureStorageWriter {
 
 impl CaptureStorageHandle {
     /// Queues one retention sweep behind any capture write already in progress.
-    pub(crate) async fn prune(
+    pub(super) async fn prune(
         &self,
         policy: RetentionPolicy,
         now_ms: i64,
