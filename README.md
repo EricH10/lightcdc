@@ -84,7 +84,7 @@ Complete source transactions are grouped into one durable redb commit using:
 
 ```toml
 capture_batch_max_transactions = 100
-capture_batch_max_events = 500
+capture_batch_max_events = 1000
 capture_batch_max_bytes = 4194304
 capture_batch_max_delay_ms = 20
 ```
@@ -95,6 +95,9 @@ whole group. A dedicated `lightcdc-redb-writer` OS thread owns capture writes.
 While it commits one group, the Tokio replication task can decode the next
 group. Capture permits only one in-flight write and waits for its successful
 completion before submitting another group or acknowledging PostgreSQL.
+For sustained high-throughput workloads, `capture_batch_max_events = 2000`
+with `capture_batch_max_delay_ms = 40` further reduces durable commit
+frequency at the cost of additional batching latency.
 
 The event log uses one writable segment plus immutable sealed segments. Rotation
 is checked between capture groups, so a PostgreSQL transaction is never split

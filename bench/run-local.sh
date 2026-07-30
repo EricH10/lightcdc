@@ -11,7 +11,9 @@ THREADS="${THREADS:-4}"
 RATE="${RATE:-0}"
 ROWS_PER_TRANSACTION="${ROWS_PER_TRANSACTION:-1}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-256}"
-ACK_EVERY="${ACK_EVERY:-1}"
+ACK_EVERY="${ACK_EVERY:-5000}"
+CAPTURE_BATCH_MAX_EVENTS="${CAPTURE_BATCH_MAX_EVENTS:-1000}"
+CAPTURE_BATCH_MAX_DELAY_MS="${CAPTURE_BATCH_MAX_DELAY_MS:-20}"
 WORKLOAD="${WORKLOAD:-insert}"
 PRELOAD_ROWS="${PRELOAD_ROWS:-100000}"
 PGHOST="${PGHOST:-localhost}"
@@ -25,6 +27,7 @@ RESULTS_ROOT="${RESULTS_ROOT:-bench/results}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RESULT_DIR="$RESULTS_ROOT/$RUN_ID"
 DATA_DIR="$ROOT/bench/.data"
+RUN_CONFIG="$RESULT_DIR/lightcdc.toml"
 
 export PGPASSWORD
 
@@ -74,6 +77,21 @@ esac
 
 mkdir -p "$RESULT_DIR"
 rm -rf "$DATA_DIR"
+awk \
+    -v max_events="$CAPTURE_BATCH_MAX_EVENTS" \
+    -v max_delay_ms="$CAPTURE_BATCH_MAX_DELAY_MS" \
+    '
+        /^capture_batch_max_events =/ {
+            print "capture_batch_max_events = " max_events
+            next
+        }
+        /^capture_batch_max_delay_ms =/ {
+            print "capture_batch_max_delay_ms = " max_delay_ms
+            next
+        }
+        { print }
+    ' \
+    bench/lightcdc.benchmark.toml >"$RUN_CONFIG"
 
 LIGHTCDC_PID=""
 CONSUMER_PID=""
@@ -106,6 +124,8 @@ rate=$RATE
 rows_per_transaction=$ROWS_PER_TRANSACTION
 payload_bytes=$PAYLOAD_BYTES
 ack_every=$ACK_EVERY
+capture_batch_max_events=$CAPTURE_BATCH_MAX_EVENTS
+capture_batch_max_delay_ms=$CAPTURE_BATCH_MAX_DELAY_MS
 workload=$WORKLOAD
 preload_rows=$PRELOAD_ROWS
 EOF
@@ -182,7 +202,7 @@ cargo build --release -p lightcdc-api --example benchmark_consumer \
     >>"$RESULT_DIR/build.log" 2>&1
 
 target/release/lightcdc run \
-    --config bench/lightcdc.benchmark.toml \
+    --config "$RUN_CONFIG" \
     --addr 127.0.0.1:50051 \
     --output none \
     --metrics-file "$RESULT_DIR/capture.jsonl" \

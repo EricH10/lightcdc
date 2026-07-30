@@ -405,7 +405,7 @@ fn default_capture_batch_max_transactions() -> usize {
 }
 
 fn default_capture_batch_max_events() -> usize {
-    500
+    1_000
 }
 
 fn default_capture_batch_max_bytes() -> u64 {
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(config.runtime.max_transaction_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.runtime.max_transaction_events, 1_000_000);
         assert_eq!(config.runtime.capture_batch_max_transactions, 100);
-        assert_eq!(config.runtime.capture_batch_max_events, 500);
+        assert_eq!(config.runtime.capture_batch_max_events, 1_000);
         assert_eq!(config.runtime.capture_batch_max_bytes, 4 * 1024 * 1024);
         assert_eq!(config.runtime.capture_batch_max_delay_ms, 20);
         assert_eq!(config.runtime.segment_max_events, 1_000_000);

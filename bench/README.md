@@ -68,13 +68,31 @@ Useful controls:
 | `RATE` | `0` | Target transactions/second; `0` means unthrottled |
 | `ROWS_PER_TRANSACTION` | `1` | Inserted CDC events per source transaction |
 | `PAYLOAD_BYTES` | `256` | Text payload size |
-| `ACK_EVERY` | `1` | Events processed per cumulative acknowledgement |
+| `ACK_EVERY` | `5000` | Events processed per cumulative acknowledgement |
+| `CAPTURE_BATCH_MAX_EVENTS` | `1000` | Soft event limit for one capture storage commit |
+| `CAPTURE_BATCH_MAX_DELAY_MS` | `20` | Maximum capture group-commit delay |
 | `WORKLOAD` | `insert` | `insert` or `update` |
 | `PRELOAD_ROWS` | `100000` | Rows prepared for the update workload |
+
+`ACK_EVERY=5000` is at-least-once safe because each acknowledgement is
+cumulative and durable. A consumer crash can redeliver up to roughly 5,000
+events, so handlers must remain idempotent. Use a smaller value when the
+redelivery window matters more than acknowledgement throughput.
 
 The generated payload is intentionally compressible. Add an incompressible
 payload scenario before using these results to size TOAST-heavy production
 traffic.
+
+For the high-throughput capture profile, use:
+
+```bash
+CAPTURE_BATCH_MAX_EVENTS=2000 \
+CAPTURE_BATCH_MAX_DELAY_MS=40 \
+ACK_EVERY=5000 \
+bench/run-local.sh
+```
+
+The extra delay is a throughput/latency tradeoff and is not the default.
 
 ## Measure Commit And ACK Cost
 

@@ -39,7 +39,7 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     report_interval_seconds: u64,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 5_000)]
     ack_every: u64,
 
     #[arg(long)]
