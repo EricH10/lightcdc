@@ -128,7 +128,7 @@ pub(crate) fn inspect(
         &["NAME", "ROWS"],
         &[
             vec!["events".to_owned(), stats.event_count.to_string()],
-            vec!["event_ids".to_owned(), stats.event_id_count.to_string()],
+            vec!["replay_ids".to_owned(), stats.replay_id_count.to_string()],
             vec![
                 "source_offsets".to_owned(),
                 stats.source_offset_count.to_string(),

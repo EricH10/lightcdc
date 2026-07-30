@@ -309,10 +309,11 @@ slow consumer cannot stall capture or unrelated consumers.
   and whole-file deletion; retained events are not rewritten.
 - Restore append-like sustained throughput while retention is active. PARTIAL:
   count-, byte-, and age-bounded redb segments now make retention a whole-file
-  operation. Rerun sustained retention benchmarks, then evaluate
-  transaction-level rather than per-event replay deduplication. Consider
-  multiple writable shards only when measured demand justifies the ordering and
-  replay complexity.
+  operation. Transaction-level replay markers now replace the per-event capture
+  index and moved the short local benchmark boundary from about 80k to around
+  100k events/second. Longer sustained retention benchmarks remain. Consider
+  encoded event blocks or multiple writable shards only when measured demand
+  justifies their added ordering and replay complexity.
 - Warn and shed work safely before disk exhaustion.
 
 Complete when storage growth is bounded and stale consumers have explicit,

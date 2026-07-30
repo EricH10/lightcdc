@@ -26,7 +26,7 @@ pub struct StoreStats {
     /// Retained event payload rows.
     pub event_count: u64,
     /// Deduplication identifiers retained with event segments.
-    pub event_id_count: u64,
+    pub replay_id_count: u64,
     /// Durable PostgreSQL source checkpoints.
     pub source_offset_count: u64,
     /// Durable stream consumer checkpoints.
@@ -61,6 +61,15 @@ pub struct SourceOffset {
     pub source_name: String,
     /// Last durably persisted PostgreSQL commit LSN.
     pub lsn: String,
+}
+
+/// Couples one complete source transaction with its durable commit position.
+#[derive(Clone, Copy)]
+pub struct SourceTransaction<'a> {
+    /// Events committed atomically by the source transaction.
+    pub events: &'a TransactionEvents,
+    /// Source commit position used as the transaction replay identity.
+    pub source_lsn: &'a str,
 }
 
 /// Describes one persisted stream consumer checkpoint.
@@ -98,7 +107,7 @@ pub struct RetentionOutcome {
     /// Event payload rows removed by the sweep.
     pub deleted_events: u64,
     /// Deduplication identifiers old enough to remove safely.
-    pub deleted_event_ids: u64,
+    pub deleted_replay_ids: u64,
     /// Oldest sequence whose payload remains after the sweep.
     pub first_retained_sequence: Option<u64>,
     /// Highest sequence ever assigned, which retention never rewinds.
@@ -110,7 +119,7 @@ pub struct RetentionOutcome {
 pub enum PersistTransactionOutcome {
     /// The source transaction and checkpoint were newly committed.
     Persisted,
-    /// Every event id was already durable, while the checkpoint was refreshed.
+    /// Every source transaction was already durable, while the checkpoint was refreshed.
     AlreadyPersisted,
 }
 
@@ -238,57 +247,45 @@ impl RedbEventStore {
         source_name: &str,
         source_lsn: &str,
     ) -> Result<PersistTransactionOutcome, StorageError> {
-        self.persist_transaction_batch(&[transaction_events], source_name, source_lsn)
+        self.persist_transaction_batch(
+            &[SourceTransaction {
+                events: transaction_events,
+                source_lsn,
+            }],
+            source_name,
+        )
     }
 
     /// Atomically persists complete transactions in one active segment commit.
     pub fn persist_transaction_batch(
         &self,
-        transaction_events: &[&TransactionEvents],
+        transactions: &[SourceTransaction<'_>],
         source_name: &str,
-        source_lsn: &str,
     ) -> Result<PersistTransactionOutcome, StorageError> {
-        self.persist_transaction_batch_before_commit(
-            transaction_events,
-            source_name,
-            source_lsn,
-            || Ok(()),
-        )
+        self.persist_transaction_batch_before_commit(transactions, source_name, || Ok(()))
     }
 
     /// Persists a batch after the caller has reconciled source replay for this session.
     pub fn persist_reconciled_transaction_batch(
         &self,
-        transaction_events: &[&TransactionEvents],
+        transactions: &[SourceTransaction<'_>],
         source_name: &str,
-        source_lsn: &str,
     ) -> Result<PersistTransactionOutcome, StorageError> {
-        self.inner.persist_transaction_batch(
-            transaction_events,
-            source_name,
-            source_lsn,
-            false,
-            || Ok(()),
-        )
+        self.inner
+            .persist_transaction_batch(transactions, source_name, false, || Ok(()))
     }
 
     fn persist_transaction_batch_before_commit<F>(
         &self,
-        transaction_events: &[&TransactionEvents],
+        transactions: &[SourceTransaction<'_>],
         source_name: &str,
-        source_lsn: &str,
         before_commit: F,
     ) -> Result<PersistTransactionOutcome, StorageError>
     where
         F: FnOnce() -> Result<(), StorageError>,
     {
-        self.inner.persist_transaction_batch(
-            transaction_events,
-            source_name,
-            source_lsn,
-            true,
-            before_commit,
-        )
+        self.inner
+            .persist_transaction_batch(transactions, source_name, true, before_commit)
     }
 
     fn persist_transaction_before_commit<F>(
@@ -316,9 +313,11 @@ impl RedbEventStore {
             },
         };
         self.inner.persist_transaction_batch(
-            &[&events],
+            &[SourceTransaction {
+                events: &events,
+                source_lsn,
+            }],
             source_name,
-            source_lsn,
             true,
             before_commit,
         )
@@ -432,6 +431,9 @@ pub enum StorageError {
     #[error("duplicate event id: {0}")]
     DuplicateEventId(String),
 
+    #[error("duplicate source transaction replay marker: {0}")]
+    DuplicateTransactionMarker(String),
+
     #[error("duplicate event sequence: {0}")]
     DuplicateSequence(u64),
 
@@ -508,7 +510,7 @@ mod tests {
 
     use super::{
         LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionPolicy, SegmentOptions,
-        StorageError,
+        SourceTransaction, StorageError,
     };
     use crate::{TransactionBuffer, TransactionBufferOptions, TransactionEvents};
 
@@ -561,7 +563,7 @@ mod tests {
 
         let stats = store.stats().expect("store stats");
         assert_eq!(stats.event_count, 1);
-        assert_eq!(stats.event_id_count, 1);
+        assert_eq!(stats.replay_id_count, 1);
         assert_eq!(stats.source_offset_count, 1);
         assert_eq!(stats.consumer_offset_count, 1);
 
@@ -751,7 +753,19 @@ mod tests {
         assert!(second.is_staged());
 
         let outcome = store
-            .persist_transaction_batch(&[&first, &second], "default", "0/4")
+            .persist_transaction_batch(
+                &[
+                    SourceTransaction {
+                        events: &first,
+                        source_lsn: "0/2",
+                    },
+                    SourceTransaction {
+                        events: &second,
+                        source_lsn: "0/4",
+                    },
+                ],
+                "default",
+            )
             .expect("persist source transaction batch");
 
         assert_eq!(outcome, PersistTransactionOutcome::Persisted);
@@ -763,6 +777,7 @@ mod tests {
             store.source_offset("default").expect("source offset"),
             Some("0/4".to_owned())
         );
+        assert_eq!(store.stats().expect("store stats").replay_id_count, 2);
     }
 
     #[test]
@@ -775,7 +790,7 @@ mod tests {
         .expect("open store");
 
         let error = store
-            .persist_transaction_batch(&[], "default", "0/1")
+            .persist_transaction_batch(&[], "default")
             .expect_err("empty batch should fail");
 
         assert!(matches!(error, StorageError::EmptyTransactionBatch));
@@ -833,11 +848,24 @@ mod tests {
         let second = second_buffer.finish().expect("finish second transaction");
 
         let error = store
-            .persist_transaction_batch_before_commit(&[&first, &second], "default", "0/3", || {
-                Err(StorageError::Redb(
-                    "injected group failure before commit".to_owned(),
-                ))
-            })
+            .persist_transaction_batch_before_commit(
+                &[
+                    SourceTransaction {
+                        events: &first,
+                        source_lsn: "0/2",
+                    },
+                    SourceTransaction {
+                        events: &second,
+                        source_lsn: "0/3",
+                    },
+                ],
+                "default",
+                || {
+                    Err(StorageError::Redb(
+                        "injected group failure before commit".to_owned(),
+                    ))
+                },
+            )
             .expect_err("injected persistence failure");
         assert!(matches!(error, StorageError::Redb(_)));
         drop(store);
@@ -851,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_commit_failure_rolls_back_events_ids_and_source_offset() {
+    fn pre_commit_failure_rolls_back_events_replay_marker_and_source_offset() {
         let temp = TempDir::new().expect("temp dir");
         let options = LogOpenOptions {
             data_dir: temp.path().to_path_buf(),
@@ -883,7 +911,7 @@ mod tests {
         );
         let stats = reopened.stats().expect("store stats");
         assert_eq!(stats.event_count, 0);
-        assert_eq!(stats.event_id_count, 0);
+        assert_eq!(stats.replay_id_count, 0);
     }
 
     #[test]
@@ -908,7 +936,7 @@ mod tests {
         );
         let stats = reopened.stats().expect("store stats");
         assert_eq!(stats.event_count, 2);
-        assert_eq!(stats.event_id_count, 2);
+        assert_eq!(stats.replay_id_count, 1);
     }
 
     #[test]
@@ -960,12 +988,15 @@ mod tests {
         store
             .persist_transaction(&original, "default", "0/3")
             .expect("persist original transaction");
+        store
+            .set_source_offset("default", "0/2")
+            .expect("simulate a stale source checkpoint");
         let mut replayed = original.clone();
         replayed[0].sequence = 3;
         replayed[1].sequence = 4;
 
         let outcome = store
-            .persist_transaction(&replayed, "default", "0/4")
+            .persist_transaction(&replayed, "default", "0/3")
             .expect("persist replayed transaction");
 
         assert_eq!(outcome, PersistTransactionOutcome::AlreadyPersisted);
@@ -975,7 +1006,7 @@ mod tests {
         );
         assert_eq!(
             store.source_offset("default").expect("source offset"),
-            Some("0/4".to_owned())
+            Some("0/3".to_owned())
         );
     }
 
@@ -1001,12 +1032,46 @@ mod tests {
         store
             .persist_transaction(std::slice::from_ref(&second), "default", "0/4")
             .expect("persist second segment");
+        store
+            .set_source_offset("default", "0/2")
+            .expect("simulate a stale source checkpoint");
 
-        let mut replayed = [first.clone(), second.clone()];
-        replayed[0].sequence = 3;
-        replayed[1].sequence = 4;
+        let replayed_first = TransactionEvents::InMemory {
+            events: vec![ChangeEvent {
+                sequence: 3,
+                ..first.clone()
+            }],
+            stats: crate::TransactionStats {
+                event_count: 1,
+                decoded_bytes: 100,
+                staged_bytes: 100,
+            },
+        };
+        let replayed_second = TransactionEvents::InMemory {
+            events: vec![ChangeEvent {
+                sequence: 4,
+                ..second.clone()
+            }],
+            stats: crate::TransactionStats {
+                event_count: 1,
+                decoded_bytes: 100,
+                staged_bytes: 100,
+            },
+        };
         let outcome = store
-            .persist_transaction(&replayed, "default", "0/5")
+            .persist_transaction_batch(
+                &[
+                    SourceTransaction {
+                        events: &replayed_first,
+                        source_lsn: "0/3",
+                    },
+                    SourceTransaction {
+                        events: &replayed_second,
+                        source_lsn: "0/4",
+                    },
+                ],
+                "default",
+            )
             .expect("reconcile replay across segments");
 
         assert_eq!(outcome, PersistTransactionOutcome::AlreadyPersisted);
@@ -1016,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             store.source_offset("default").expect("source offset"),
-            Some("0/5".to_owned())
+            Some("0/4".to_owned())
         );
     }
 
@@ -1053,7 +1118,7 @@ mod tests {
             .expect("prune events");
 
         assert_eq!(outcome.deleted_events, 2);
-        assert_eq!(outcome.deleted_event_ids, 2);
+        assert_eq!(outcome.deleted_replay_ids, 1);
         assert_eq!(outcome.first_retained_sequence, Some(3));
         assert_eq!(outcome.high_watermark, Some(3));
         assert_eq!(store.next_sequence().expect("next sequence"), 4);
@@ -1068,7 +1133,7 @@ mod tests {
             store.replay_from(3, 10).expect("retained events"),
             [event(3, "0/3")]
         );
-        assert_eq!(store.stats().expect("stats").event_id_count, 1);
+        assert_eq!(store.stats().expect("stats").replay_id_count, 1);
         assert!(matches!(
             store.append_event(&event(1, "0/99")),
             Err(StorageError::DuplicateSequence(1))
@@ -1076,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn age_retention_keeps_latest_checkpoint_ids_for_source_replay() {
+    fn age_retention_keeps_latest_checkpoint_safe_for_source_replay() {
         let temp = TempDir::new().expect("temp dir");
         let store = RedbEventStore::open_with_segment_options(
             &LogOpenOptions {
@@ -1106,9 +1171,9 @@ mod tests {
             .expect("prune expired events");
 
         assert_eq!(outcome.deleted_events, 2);
-        assert_eq!(outcome.deleted_event_ids, 2);
+        assert_eq!(outcome.deleted_replay_ids, 1);
         assert_eq!(store.next_sequence().expect("next sequence"), 3);
-        assert_eq!(store.stats().expect("stats").event_id_count, 0);
+        assert_eq!(store.stats().expect("stats").replay_id_count, 0);
 
         let mut replayed = original;
         replayed[0].sequence = 3;

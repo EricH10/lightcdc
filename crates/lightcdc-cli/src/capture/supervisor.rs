@@ -45,7 +45,7 @@ pub(super) async fn run_retention_sweeps(
             Ok(outcome) if outcome.deleted_events > 0 => {
                 info!(
                     deleted_events = outcome.deleted_events,
-                    deleted_event_ids = outcome.deleted_event_ids,
+                    deleted_replay_ids = outcome.deleted_replay_ids,
                     first_retained_sequence = ?outcome.first_retained_sequence,
                     high_watermark = ?outcome.high_watermark,
                     "pruned retained events"

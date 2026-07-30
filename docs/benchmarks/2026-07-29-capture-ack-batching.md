@@ -60,7 +60,9 @@ approximately that many events.
 
 ## Next Work
 
-The next structural optimization should reduce per-event redb work rather than
-increasing groups indefinitely. Candidates are transaction-level replay markers
-instead of one event-ID index entry per event, and block records containing many
-encoded events with a sparse sequence index.
+Transaction-level replay markers were implemented and benchmarked next, replacing
+one capture-time event-ID index entry per event with one marker per committed
+source transaction. See
+`docs/benchmarks/2026-07-29-transaction-replay-markers.md`. Block records
+containing many encoded events with a sparse sequence index remain a possible
+future optimization.

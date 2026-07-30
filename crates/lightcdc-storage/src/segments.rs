@@ -19,16 +19,13 @@ use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
 
-use crate::{
-    TransactionEvents,
-    log::{
-        ConsumerOffset, PersistTransactionOutcome, RetentionOutcome, RetentionPolicy,
-        SegmentOptions, SourceOffset, StorageError, StoreStats,
-    },
+use crate::log::{
+    ConsumerOffset, PersistTransactionOutcome, RetentionOutcome, RetentionPolicy, SegmentOptions,
+    SourceOffset, SourceTransaction, StorageError, StoreStats,
 };
 
 const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
-const EVENT_IDS: TableDefinition<&str, u64> = TableDefinition::new("event_ids");
+const REPLAY_IDS: TableDefinition<&str, u64> = TableDefinition::new("event_ids");
 const SOURCE_OFFSETS: TableDefinition<&str, &str> = TableDefinition::new("source_offsets");
 const SOURCE_REPLAY_FLOORS: TableDefinition<&str, u64> =
     TableDefinition::new("source_replay_floors");
@@ -43,7 +40,7 @@ const SEGMENT_ID_KEY: &str = "segment_id";
 const SEGMENT_SEALED_KEY: &str = "segment_sealed";
 const SEGMENT_CREATED_AT_MS_KEY: &str = "segment_created_at_ms";
 const SEGMENT_EVENT_COUNT_KEY: &str = "segment_event_count";
-const SEGMENT_EVENT_ID_COUNT_KEY: &str = "segment_event_id_count";
+const SEGMENT_REPLAY_ID_COUNT_KEY: &str = "segment_event_id_count";
 const SEGMENT_STORED_BYTES_KEY: &str = "segment_stored_bytes";
 const SEGMENT_FIRST_TIMESTAMP_KEY: &str = "segment_first_timestamp_ms";
 const SEGMENT_LAST_TIMESTAMP_KEY: &str = "segment_last_timestamp_ms";
@@ -56,6 +53,7 @@ const SEGMENT_TEMP_SUFFIX: &str = ".redb.tmp";
 const SEGMENT_DELETING_SUFFIX: &str = ".redb.deleting";
 const CONTROL_FORMAT_MARKER_SUFFIX: &str = ".format";
 const CONTROL_FORMAT_MARKER_PREFIX: &str = "lightcdc-control-format=";
+const TRANSACTION_REPLAY_PREFIX: &str = "lightcdc-tx-v1";
 const CONTROL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Owns the control database and the ordered set of event segment files.
@@ -83,7 +81,7 @@ struct SegmentDescriptor {
     sealed: bool,
     created_at_ms: i64,
     event_count: u64,
-    event_id_count: u64,
+    replay_id_count: u64,
     stored_bytes: u64,
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
@@ -123,6 +121,12 @@ struct RetiredDatabase {
 struct PendingCloses {
     paths: Mutex<HashSet<PathBuf>>,
     changed: Condvar,
+}
+
+#[derive(Default)]
+struct ReplayDuplicateCounts {
+    transactions: usize,
+    events: usize,
 }
 
 impl SegmentStore {
@@ -230,7 +234,7 @@ impl SegmentStore {
         let write = active.begin_write().map_err(redb_error)?;
         {
             let mut events = write.open_table(EVENTS).map_err(redb_error)?;
-            let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
+            let mut event_ids = write.open_table(REPLAY_IDS).map_err(redb_error)?;
             let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
             events
                 .insert(event.sequence, payload.as_slice())
@@ -239,6 +243,7 @@ impl SegmentStore {
                 .insert(event.event_id.as_str(), event.sequence)
                 .map_err(redb_error)?;
             descriptor.record_event(event, payload.len() as u64);
+            descriptor.replay_id_count = descriptor.replay_id_count.saturating_add(1);
             write_segment_statistics(&mut metadata, &descriptor)?;
         }
         write.commit().map_err(redb_error)?;
@@ -249,32 +254,28 @@ impl SegmentStore {
 
     pub(crate) fn persist_transaction_batch<F>(
         &self,
-        transaction_events: &[&TransactionEvents],
+        transactions: &[SourceTransaction<'_>],
         source_name: &str,
-        source_lsn: &str,
         check_replay: bool,
         before_commit: F,
     ) -> Result<PersistTransactionOutcome, StorageError>
     where
         F: FnOnce() -> Result<(), StorageError>,
     {
-        if transaction_events.is_empty() {
-            return Err(StorageError::EmptyTransactionBatch);
-        }
-        let event_count = transaction_events
-            .iter()
-            .try_fold(0usize, |total, transaction| {
-                total
-                    .checked_add(transaction.len())
-                    .ok_or(StorageError::TransactionBatchEventCountOverflow)
-            })?;
-        let estimated_bytes = transaction_events
-            .iter()
-            .try_fold(0u64, |total, transaction| {
-                total
-                    .checked_add(transaction.stats().staged_bytes)
-                    .ok_or(StorageError::TransactionBatchByteCountOverflow)
-            })?;
+        let source_lsn = transactions
+            .last()
+            .ok_or(StorageError::EmptyTransactionBatch)?
+            .source_lsn;
+        let event_count = transactions.iter().try_fold(0usize, |total, transaction| {
+            total
+                .checked_add(transaction.events.len())
+                .ok_or(StorageError::TransactionBatchEventCountOverflow)
+        })?;
+        let estimated_bytes = transactions.iter().try_fold(0u64, |total, transaction| {
+            total
+                .checked_add(transaction.events.stats().staged_bytes)
+                .ok_or(StorageError::TransactionBatchByteCountOverflow)
+        })?;
 
         let _write = mutex(&self.write_gate);
         self.ensure_active_segment()?;
@@ -286,17 +287,15 @@ impl SegmentStore {
             return Ok(PersistTransactionOutcome::AlreadyPersisted);
         }
 
-        let needs_replay_check = check_replay
-            && self.batch_may_overlap_checkpoint(transaction_events, durable_lsn.as_deref())?;
-        if needs_replay_check {
-            let duplicate_count = self.count_duplicate_events(transaction_events)?;
-            if duplicate_count == event_count && event_count > 0 {
+        if check_replay && durable_lsn.is_some() {
+            let duplicates = self.count_duplicate_transactions(transactions, source_name)?;
+            if duplicates.transactions == transactions.len() {
                 self.persist_checkpoint_only(source_name, source_lsn)?;
                 return Ok(PersistTransactionOutcome::AlreadyPersisted);
             }
-            if duplicate_count > 0 {
+            if duplicates.transactions > 0 || duplicates.events > 0 {
                 return Err(StorageError::PartiallyPersistedTransaction {
-                    duplicate_count,
+                    duplicate_count: duplicates.events,
                     event_count,
                 });
             }
@@ -307,20 +306,21 @@ impl SegmentStore {
         let write = active.begin_write().map_err(redb_error)?;
         let outcome = {
             let mut events = write.open_table(EVENTS).map_err(redb_error)?;
-            let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
+            let mut replay_ids = write.open_table(REPLAY_IDS).map_err(redb_error)?;
             let mut source_offsets = write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
             let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
 
-            for transaction in transaction_events {
-                for event in transaction.iter()? {
+            for transaction in transactions {
+                let replay_id = transaction_replay_id(source_name, transaction.source_lsn);
+                if replay_ids
+                    .get(replay_id.as_str())
+                    .map_err(redb_error)?
+                    .is_some()
+                {
+                    return Err(StorageError::DuplicateTransactionMarker(replay_id));
+                }
+                for event in transaction.events.iter()? {
                     let event = event?;
-                    if event_ids
-                        .get(event.event_id.as_str())
-                        .map_err(redb_error)?
-                        .is_some()
-                    {
-                        return Err(StorageError::DuplicateEventId(event.event_id));
-                    }
                     if events.get(event.sequence).map_err(redb_error)?.is_some()
                         || descriptor
                             .high_watermark
@@ -333,11 +333,15 @@ impl SegmentStore {
                     events
                         .insert(event.sequence, payload.as_slice())
                         .map_err(redb_error)?;
-                    event_ids
-                        .insert(event.event_id.as_str(), event.sequence)
-                        .map_err(redb_error)?;
                     descriptor.record_event(&event, payload.len() as u64);
                 }
+                replay_ids
+                    .insert(
+                        replay_id.as_str(),
+                        descriptor.high_watermark.unwrap_or_default(),
+                    )
+                    .map_err(redb_error)?;
+                descriptor.replay_id_count = descriptor.replay_id_count.saturating_add(1);
             }
             source_offsets
                 .insert(source_name, source_lsn)
@@ -438,7 +442,7 @@ impl SegmentStore {
         if !policy.is_enabled() {
             return Ok(RetentionOutcome {
                 deleted_events: 0,
-                deleted_event_ids: 0,
+                deleted_replay_ids: 0,
                 first_retained_sequence: self.first_sequence()?,
                 high_watermark: self.last_sequence()?,
             });
@@ -485,16 +489,16 @@ impl SegmentStore {
         }
 
         let mut deleted_events = 0u64;
-        let mut deleted_event_ids = 0u64;
+        let mut deleted_replay_ids = 0u64;
         for candidate in candidates {
             self.delete_segment(&candidate)?;
             deleted_events = deleted_events.saturating_add(candidate.event_count);
-            deleted_event_ids = deleted_event_ids.saturating_add(candidate.event_id_count);
+            deleted_replay_ids = deleted_replay_ids.saturating_add(candidate.replay_id_count);
         }
 
         Ok(RetentionOutcome {
             deleted_events,
-            deleted_event_ids,
+            deleted_replay_ids,
             first_retained_sequence: self.first_sequence()?,
             high_watermark: self.last_sequence()?,
         })
@@ -507,10 +511,10 @@ impl SegmentStore {
             .iter()
             .map(|segment| segment.event_count)
             .sum();
-        let event_id_count = state
+        let replay_id_count = state
             .descriptors
             .iter()
-            .map(|segment| segment.event_id_count)
+            .map(|segment| segment.replay_id_count)
             .sum();
         let segment_count = state.descriptors.len() as u64;
         let sealed_segment_count = state
@@ -533,7 +537,7 @@ impl SegmentStore {
         let consumer_offset_count = offsets.len().map_err(redb_error)?;
         Ok(StoreStats {
             event_count,
-            event_id_count,
+            replay_id_count,
             source_offset_count,
             consumer_offset_count,
             segment_count,
@@ -817,36 +821,27 @@ impl SegmentStore {
         Ok(())
     }
 
-    fn batch_may_overlap_checkpoint(
+    fn count_duplicate_transactions(
         &self,
-        transactions: &[&TransactionEvents],
-        durable_lsn: Option<&str>,
-    ) -> Result<bool, StorageError> {
-        let Some(durable_lsn) = durable_lsn else {
-            return Ok(false);
-        };
+        transactions: &[SourceTransaction<'_>],
+        source_name: &str,
+    ) -> Result<ReplayDuplicateCounts, StorageError> {
+        let replay_ids = transactions
+            .iter()
+            .map(|transaction| transaction_replay_id(source_name, transaction.source_lsn))
+            .collect::<Vec<_>>();
+        let mut legacy_event_ids = Vec::with_capacity(transactions.len());
         for transaction in transactions {
-            if let Some(event) = transaction.iter()?.next() {
-                let event = event?;
-                return Ok(lsn_is_at_or_before(&event.source.lsn, durable_lsn));
-            }
-        }
-        Ok(false)
-    }
-
-    fn count_duplicate_events(
-        &self,
-        transactions: &[&TransactionEvents],
-    ) -> Result<usize, StorageError> {
-        let mut candidates = HashMap::<String, usize>::new();
-        for transaction in transactions {
-            for event in transaction.iter()? {
+            let mut candidates = HashMap::<String, usize>::new();
+            for event in transaction.events.iter()? {
                 let event_id = event?.event_id;
                 *candidates.entry(event_id).or_default() += 1;
             }
+            legacy_event_ids.push(candidates);
         }
 
-        let mut duplicates = 0usize;
+        let mut replayed = vec![false; transactions.len()];
+        let mut matched_legacy_ids = vec![HashSet::<String>::new(); transactions.len()];
         let state = read_state(&self.state);
         for descriptor in state.descriptors.iter().rev() {
             let database = if !descriptor.sealed {
@@ -859,25 +854,52 @@ impl SegmentStore {
                 self.sealed_database(descriptor)?
             };
             let read = database.begin_read().map_err(redb_error)?;
-            let event_ids = read.open_table(EVENT_IDS).map_err(redb_error)?;
-            let mut found = Vec::new();
-            for (event_id, count) in &candidates {
-                if event_ids
-                    .get(event_id.as_str())
-                    .map_err(redb_error)?
-                    .is_some()
+            let replay_table = read.open_table(REPLAY_IDS).map_err(redb_error)?;
+            for (index, replay_id) in replay_ids.iter().enumerate() {
+                if !replayed[index]
+                    && replay_table
+                        .get(replay_id.as_str())
+                        .map_err(redb_error)?
+                        .is_some()
                 {
-                    duplicates = duplicates.saturating_add(*count);
-                    found.push(event_id.clone());
+                    replayed[index] = true;
+                }
+                if replayed[index] {
+                    continue;
+                }
+                for event_id in legacy_event_ids[index].keys() {
+                    if !matched_legacy_ids[index].contains(event_id)
+                        && replay_table
+                            .get(event_id.as_str())
+                            .map_err(redb_error)?
+                            .is_some()
+                    {
+                        matched_legacy_ids[index].insert(event_id.clone());
+                    }
                 }
             }
-            drop(event_ids);
+            drop(replay_table);
             drop(read);
-            for event_id in found {
-                candidates.remove(&event_id);
-            }
-            if candidates.is_empty() {
+            if replayed.iter().all(|duplicate| *duplicate) {
                 break;
+            }
+        }
+        drop(state);
+
+        let mut duplicates = ReplayDuplicateCounts::default();
+        for (index, transaction) in transactions.iter().enumerate() {
+            if replayed[index] {
+                duplicates.transactions = duplicates.transactions.saturating_add(1);
+                duplicates.events = duplicates.events.saturating_add(transaction.events.len());
+                continue;
+            }
+            let matched_events = matched_legacy_ids[index]
+                .iter()
+                .map(|event_id| legacy_event_ids[index].get(event_id).copied().unwrap_or(0))
+                .sum::<usize>();
+            duplicates.events = duplicates.events.saturating_add(matched_events);
+            if !transaction.events.is_empty() && matched_events == transaction.events.len() {
+                duplicates.transactions = duplicates.transactions.saturating_add(1);
             }
         }
         Ok(duplicates)
@@ -896,7 +918,7 @@ impl SegmentStore {
                 self.sealed_database(descriptor)?
             };
             let read = database.begin_read().map_err(redb_error)?;
-            let event_ids = read.open_table(EVENT_IDS).map_err(redb_error)?;
+            let event_ids = read.open_table(REPLAY_IDS).map_err(redb_error)?;
             if event_ids.get(event_id).map_err(redb_error)?.is_some() {
                 return Ok(true);
             }
@@ -1045,7 +1067,6 @@ impl SegmentStore {
 impl SegmentDescriptor {
     fn record_event(&mut self, event: &ChangeEvent, payload_bytes: u64) {
         self.event_count = self.event_count.saturating_add(1);
-        self.event_id_count = self.event_id_count.saturating_add(1);
         self.stored_bytes = self.stored_bytes.saturating_add(payload_bytes);
         self.first_sequence.get_or_insert(event.sequence);
         self.last_sequence = Some(event.sequence);
@@ -1251,7 +1272,7 @@ fn migrate_legacy_store(
             .map_err(redb_error)?;
         drop(metadata);
         write.delete_table(EVENTS).map_err(redb_error)?;
-        write.delete_table(EVENT_IDS).map_err(redb_error)?;
+        write.delete_table(REPLAY_IDS).map_err(redb_error)?;
         write.delete_table(SOURCE_OFFSETS).map_err(redb_error)?;
         write
             .delete_table(SOURCE_REPLAY_FLOORS)
@@ -1279,7 +1300,7 @@ fn copy_legacy_segment(
         sealed: false,
         created_at_ms,
         event_count: 0,
-        event_id_count: 0,
+        replay_id_count: 0,
         stored_bytes: 0,
         first_sequence: None,
         last_sequence: None,
@@ -1290,7 +1311,7 @@ fn copy_legacy_segment(
 
     let legacy_read = legacy.begin_read().map_err(redb_error)?;
     let legacy_events = legacy_read.open_table(EVENTS).map_err(redb_error)?;
-    let legacy_event_ids = legacy_read.open_table(EVENT_IDS).map_err(redb_error)?;
+    let legacy_event_ids = legacy_read.open_table(REPLAY_IDS).map_err(redb_error)?;
     let legacy_offsets = legacy_read.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
     let legacy_replay_floors = legacy_read
         .open_table(SOURCE_REPLAY_FLOORS)
@@ -1300,7 +1321,7 @@ fn copy_legacy_segment(
     let write = segment.begin_write().map_err(redb_error)?;
     {
         let mut events = write.open_table(EVENTS).map_err(redb_error)?;
-        let mut event_ids = write.open_table(EVENT_IDS).map_err(redb_error)?;
+        let mut event_ids = write.open_table(REPLAY_IDS).map_err(redb_error)?;
         let mut offsets = write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
         let mut replay_floors = write.open_table(SOURCE_REPLAY_FLOORS).map_err(redb_error)?;
         let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
@@ -1331,7 +1352,7 @@ fn copy_legacy_segment(
                 .insert(source.value(), sequence.value())
                 .map_err(redb_error)?;
         }
-        descriptor.event_id_count = legacy_event_ids.len().map_err(redb_error)?;
+        descriptor.replay_id_count = legacy_event_ids.len().map_err(redb_error)?;
         descriptor.high_watermark = legacy_metadata
             .get(EVENT_HIGH_WATERMARK_KEY)
             .map_err(redb_error)?
@@ -1371,7 +1392,7 @@ fn create_segment(
         sealed: false,
         created_at_ms: unix_timestamp_ms(),
         event_count: 0,
-        event_id_count: 0,
+        replay_id_count: 0,
         stored_bytes: 0,
         first_sequence: None,
         last_sequence: None,
@@ -1382,7 +1403,7 @@ fn create_segment(
     let write = database.begin_write().map_err(redb_error)?;
     {
         write.open_table(EVENTS).map_err(redb_error)?;
-        write.open_table(EVENT_IDS).map_err(redb_error)?;
+        write.open_table(REPLAY_IDS).map_err(redb_error)?;
         let mut offsets = write.open_table(SOURCE_OFFSETS).map_err(redb_error)?;
         write.open_table(SOURCE_REPLAY_FLOORS).map_err(redb_error)?;
         let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
@@ -1430,7 +1451,7 @@ fn write_segment_statistics(
         .insert(SEGMENT_EVENT_COUNT_KEY, descriptor.event_count)
         .map_err(redb_error)?;
     metadata
-        .insert(SEGMENT_EVENT_ID_COUNT_KEY, descriptor.event_id_count)
+        .insert(SEGMENT_REPLAY_ID_COUNT_KEY, descriptor.replay_id_count)
         .map_err(redb_error)?;
     metadata
         .insert(SEGMENT_STORED_BYTES_KEY, descriptor.stored_bytes)
@@ -1492,7 +1513,7 @@ fn load_segment_descriptor(
     let database = open_database(path, cache_bytes, false)?;
     let read = database.begin_read().map_err(redb_error)?;
     let events = read.open_table(EVENTS).map_err(redb_error)?;
-    let event_ids = read.open_table(EVENT_IDS).map_err(redb_error)?;
+    let event_ids = read.open_table(REPLAY_IDS).map_err(redb_error)?;
     let metadata = read.open_table(METADATA).map_err(redb_error)?;
     let format = required_metadata(&metadata, SEGMENT_FORMAT_KEY)?;
     if format != SEGMENT_FORMAT_VERSION {
@@ -1515,7 +1536,7 @@ fn load_segment_descriptor(
         sealed: required_metadata(&metadata, SEGMENT_SEALED_KEY)? != 0,
         created_at_ms: decode_i64(required_metadata(&metadata, SEGMENT_CREATED_AT_MS_KEY)?),
         event_count: events.len().map_err(redb_error)?,
-        event_id_count: event_ids.len().map_err(redb_error)?,
+        replay_id_count: event_ids.len().map_err(redb_error)?,
         stored_bytes: optional_metadata(&metadata, SEGMENT_STORED_BYTES_KEY)?.unwrap_or(0),
         first_sequence: events
             .first()
@@ -1802,6 +1823,13 @@ fn consumer_offset_key(stream_name: &str, consumer_name: &str) -> String {
     format!("{stream_name}{CONSUMER_OFFSET_SEPARATOR}{consumer_name}")
 }
 
+fn transaction_replay_id(source_name: &str, source_lsn: &str) -> String {
+    format!(
+        "{TRANSACTION_REPLAY_PREFIX}:{}:{source_name}:{source_lsn}",
+        source_name.len()
+    )
+}
+
 fn lsn_is_at_or_before(candidate: &str, durable: &str) -> bool {
     match (parse_lsn(candidate), parse_lsn(durable)) {
         (Some(candidate), Some(durable)) => candidate <= durable,
@@ -1864,7 +1892,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::TransactionStats;
+    use crate::{TransactionEvents, TransactionStats};
 
     #[test]
     fn replay_crosses_segments_and_survives_reopen() {
@@ -1923,7 +1951,15 @@ mod tests {
         };
 
         store
-            .persist_transaction_batch(&[&transaction], "default", "0/10", true, || Ok(()))
+            .persist_transaction_batch(
+                &[SourceTransaction {
+                    events: &transaction,
+                    source_lsn: "0/10",
+                }],
+                "default",
+                true,
+                || Ok(()),
+            )
             .expect("persist oversized transaction");
 
         let state = read_state(&store.state);
@@ -2082,7 +2118,7 @@ mod tests {
             let payload = serde_json::to_vec(&event(1)).expect("serialize legacy event");
             let mut events = write.open_table(EVENTS).expect("legacy events");
             events.insert(1, payload.as_slice()).expect("legacy event");
-            let mut event_ids = write.open_table(EVENT_IDS).expect("legacy ids");
+            let mut event_ids = write.open_table(REPLAY_IDS).expect("legacy ids");
             event_ids.insert("event-1", 1).expect("legacy id");
             let mut source_offsets = write
                 .open_table(SOURCE_OFFSETS)

@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Context, anyhow};
 use lightcdc_postgres::CapturedTransaction;
 use lightcdc_storage::{
-    PersistTransactionOutcome, RedbEventStore, RetentionOutcome, RetentionPolicy, StorageError,
+    PersistTransactionOutcome, RedbEventStore, RetentionOutcome, RetentionPolicy,
+    SourceTransaction, StorageError,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
@@ -281,27 +282,27 @@ fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: Per
     if let Some(delay) = command.delay_before_persist {
         thread::sleep(delay);
     }
-    let ack_lsn = command
-        .batch
-        .transactions
-        .last()
-        .expect("storage writer never receives an empty batch")
-        .ack_lsn;
-    let transaction_events = command
+    let source_lsns = command
         .batch
         .transactions
         .iter()
-        .map(|transaction| &transaction.events)
+        .map(|transaction| transaction.ack_lsn.to_string())
+        .collect::<Vec<_>>();
+    let transactions = command
+        .batch
+        .transactions
+        .iter()
+        .zip(&source_lsns)
+        .map(|(transaction, source_lsn)| SourceTransaction {
+            events: &transaction.events,
+            source_lsn,
+        })
         .collect::<Vec<_>>();
     let persist_started = command.measure_latency.then(Instant::now);
     let result = if command.check_replay {
-        store.persist_transaction_batch(&transaction_events, source_name, &ack_lsn.to_string())
+        store.persist_transaction_batch(&transactions, source_name)
     } else {
-        store.persist_reconciled_transaction_batch(
-            &transaction_events,
-            source_name,
-            &ack_lsn.to_string(),
-        )
+        store.persist_reconciled_transaction_batch(&transactions, source_name)
     };
     let persist_latency = persist_started.map(|persist_started| persist_started.elapsed());
     let _ = command.response.send(StorageCompletion {
@@ -370,6 +371,7 @@ mod tests {
             store.source_offset("default").expect("source offset"),
             Some("0/2".to_owned())
         );
+        assert_eq!(store.stats().expect("store stats").replay_id_count, 2);
     }
 
     #[tokio::test]

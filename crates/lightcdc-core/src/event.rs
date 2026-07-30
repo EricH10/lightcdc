@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct ChangeEvent {
     /// The local monotonically increasing event sequence.
     pub sequence: u64,
-    /// A source-derived identifier used to detect duplicate replay.
+    /// A source-derived identifier consumers can use for event-level idempotency.
     pub event_id: String,
     /// The PostgreSQL source metadata for this event.
     pub source: SourceMetadata,
