@@ -1224,6 +1224,10 @@ fn write_test_config_with_retention(
     write_test_config(config_path, data_dir, fixture)?;
     let config = std::fs::read_to_string(config_path)?;
     let config = config.replace(
+        "capture_batch_max_events = 500",
+        "capture_batch_max_events = 1\nsegment_max_events = 1",
+    );
+    let config = config.replace(
         "capture_batch_max_delay_ms = 5",
         &format!(
             "capture_batch_max_delay_ms = 5\n\

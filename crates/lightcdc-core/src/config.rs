@@ -82,6 +82,15 @@ pub struct RuntimeConfig {
     /// Maximum time the oldest transaction waits for a grouped redb commit.
     #[serde(default = "default_capture_batch_max_delay_ms")]
     pub capture_batch_max_delay_ms: u64,
+    /// Preferred maximum event count in one sequence segment.
+    #[serde(default = "default_segment_max_events")]
+    pub segment_max_events: u64,
+    /// Preferred maximum serialized event bytes in one sequence segment.
+    #[serde(default = "default_segment_max_bytes")]
+    pub segment_max_bytes: u64,
+    /// Maximum time a non-empty sequence segment remains writable.
+    #[serde(default = "default_segment_max_age_seconds")]
+    pub segment_max_age_seconds: u64,
     /// Optional maximum number of event payloads retained locally.
     #[serde(default)]
     pub retention_max_events: Option<u64>,
@@ -91,7 +100,7 @@ pub struct RuntimeConfig {
     /// Delay between background retention sweeps.
     #[serde(default = "default_retention_check_interval_ms")]
     pub retention_check_interval_ms: u64,
-    /// Maximum event prefix removed by one retention sweep.
+    /// Target maximum events retired per sweep; one whole segment may exceed it.
     #[serde(default = "default_retention_delete_batch_size")]
     pub retention_delete_batch_size: usize,
 }
@@ -407,6 +416,18 @@ fn default_capture_batch_max_delay_ms() -> u64 {
     20
 }
 
+fn default_segment_max_events() -> u64 {
+    1_000_000
+}
+
+fn default_segment_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_segment_max_age_seconds() -> u64 {
+    15 * 60
+}
+
 fn default_retention_check_interval_ms() -> u64 {
     1_000
 }
@@ -457,6 +478,9 @@ mod tests {
         assert_eq!(config.runtime.capture_batch_max_events, 500);
         assert_eq!(config.runtime.capture_batch_max_bytes, 4 * 1024 * 1024);
         assert_eq!(config.runtime.capture_batch_max_delay_ms, 20);
+        assert_eq!(config.runtime.segment_max_events, 1_000_000);
+        assert_eq!(config.runtime.segment_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.runtime.segment_max_age_seconds, 15 * 60);
         assert_eq!(config.runtime.retention_max_events, None);
         assert_eq!(config.runtime.retention_max_age_seconds, None);
         assert_eq!(config.runtime.retention_check_interval_ms, 1_000);
@@ -589,6 +613,9 @@ mod tests {
                 capture_batch_max_events: 500,
                 capture_batch_max_bytes: 4 * 1024 * 1024,
                 capture_batch_max_delay_ms: 20,
+                segment_max_events: 1_000_000,
+                segment_max_bytes: 256 * 1024 * 1024,
+                segment_max_age_seconds: 15 * 60,
                 retention_max_events: None,
                 retention_max_age_seconds: None,
                 retention_check_interval_ms: 1_000,

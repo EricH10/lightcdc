@@ -131,7 +131,7 @@ struct PersistCommand {
     response: oneshot::Sender<StorageCompletion>,
 }
 
-/// Enumerates writes that must be serialized against the same redb database.
+/// Enumerates writes serialized against the same segmented event store.
 enum StorageCommand {
     Persist(PersistCommand),
     Prune {
@@ -313,7 +313,7 @@ impl Drop for CaptureStorageWriter {
 #[cfg(test)]
 mod tests {
     use lightcdc_core::{ChangeEvent, Operation, SourceMetadata};
-    use lightcdc_storage::{LogOpenOptions, TransactionEvents, TransactionStats};
+    use lightcdc_storage::{LogOpenOptions, SegmentOptions, TransactionEvents, TransactionStats};
     use tempfile::TempDir;
 
     use super::*;
@@ -321,10 +321,16 @@ mod tests {
     #[tokio::test]
     async fn dedicated_writer_persists_a_batch_and_returns_its_events() {
         let temp = TempDir::new().expect("temp dir");
-        let store = RedbEventStore::open(&LogOpenOptions {
-            data_dir: temp.path().to_path_buf(),
-            database_file: "writer.redb".to_owned(),
-        })
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: temp.path().to_path_buf(),
+                database_file: "writer.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 2,
+                ..SegmentOptions::default()
+            },
+        )
         .expect("open store");
         let writer =
             CaptureStorageWriter::start(store.clone(), "default".to_owned()).expect("start writer");
@@ -374,10 +380,16 @@ mod tests {
     #[tokio::test]
     async fn dedicated_writer_serializes_retention_after_capture_writes() {
         let temp = TempDir::new().expect("temp dir");
-        let store = RedbEventStore::open(&LogOpenOptions {
-            data_dir: temp.path().to_path_buf(),
-            database_file: "writer.redb".to_owned(),
-        })
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: temp.path().to_path_buf(),
+                database_file: "writer.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 2,
+                ..SegmentOptions::default()
+            },
+        )
         .expect("open store");
         let writer =
             CaptureStorageWriter::start(store.clone(), "default".to_owned()).expect("start writer");

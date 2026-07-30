@@ -148,6 +148,9 @@ async fn capture_with_store(
         capture_batch_max_events = batch_limits.max_events,
         capture_batch_max_bytes = batch_limits.max_bytes,
         capture_batch_max_delay_ms = batch_limits.max_delay.as_millis(),
+        segment_max_events = config.runtime.segment_max_events,
+        segment_max_bytes = config.runtime.segment_max_bytes,
+        segment_max_age_seconds = config.runtime.segment_max_age_seconds,
         retention_max_events = ?retention.and_then(|retention| retention.policy.max_events),
         retention_max_age_seconds = ?retention
             .and_then(|retention| retention.policy.max_age)

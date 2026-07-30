@@ -96,8 +96,22 @@ While it commits one group, the Tokio replication task can decode the next
 group. Capture permits only one in-flight write and waits for its successful
 completion before submitting another group or acknowledging PostgreSQL.
 
-Event-log retention is optional and enforced by maximum retained events, event
-age, or whichever boundary is reached first:
+The event log uses one writable segment plus immutable sealed segments. Rotation
+is checked between capture groups, so a PostgreSQL transaction is never split
+between files:
+
+```toml
+segment_max_events = 1000000
+segment_max_bytes = 268435456
+segment_max_age_seconds = 900
+```
+
+The limits are preferred boundaries: a capture group that crosses one stays
+whole, then seals the segment. The active segment is immediately readable by
+replay and gRPC consumers; consumers do not wait for it to seal.
+
+Event-log retention is optional and targets a maximum retained event count,
+event age, or whichever boundary is reached first:
 
 ```toml
 retention_max_events = 10000000
@@ -107,11 +121,18 @@ retention_delete_batch_size = 100000
 ```
 
 Omit both maximum settings to disable retention. Sweeps run on the dedicated
-redb writer thread so they cannot overlap capture commits. Retention is a hard
-log boundary: a durable consumer that falls behind receives an explicit expired
-offset error and must seek to `earliest` or `latest`. `earliest` means the oldest
-payload still retained. redb reuses deleted pages for later writes, although
-the database file is not guaranteed to shrink immediately.
+redb writer thread so they cannot overlap capture commits. They delete whole
+sealed segment files, returning their disk space without rewriting retained
+events. Limits are segment-granular: the active segment and sweep interval can
+temporarily exceed a boundary, count retention may then keep up to one segment
+less than the configured maximum, and age retention waits until every event in
+a sealed segment has expired. Keep segment limits comfortably below the
+retention window. `retention_delete_batch_size` is a target work budget measured
+in events; one indivisible segment may exceed it.
+
+Retention is a hard log boundary: a durable consumer that falls behind receives
+an explicit expired offset error and must seek to `earliest` or `latest`.
+`earliest` means the oldest payload still retained.
 
 Run capture and the gRPC API together:
 
@@ -142,7 +163,7 @@ cargo run -p lightcdc-cli -- inspect --config lightcdc.example.toml --sequence 4
 
 The second command also prints the full decoded event at sequence 42. Stop
 `capture`, `run`, or `serve` before inspecting because redb allows only one
-process to open this database file.
+process to open the control and active segment files.
 
 Serve the gRPC API:
 
@@ -150,7 +171,9 @@ Serve the gRPC API:
 cargo run -p lightcdc-cli -- serve --config lightcdc.example.toml --addr 127.0.0.1:50051
 ```
 
-Use `serve` when capture is not running. For live capture plus streaming consumers, use `run` so both paths share one redb handle inside the same process.
+Use `serve` when capture is not running. For live capture plus streaming
+consumers, use `run` so both paths share one segmented store inside the same
+process.
 
 Run an example gRPC consumer that prints and acks events:
 
@@ -200,14 +223,14 @@ Implemented basics:
 - Core event and config types
 - CLI command shape
 - PostgreSQL connectivity check
-- redb-backed local event store scaffold
+- Segmented redb event store with atomic source checkpoints
 - Logical replication stream connection
 - Combined capture plus gRPC serving command
 - `pgoutput` relation, insert, update, delete, and truncate decoding
 - Source offset persistence and idempotent duplicate replay handling
 - Configured-stream capture planning, publication-table validation,
   capture-side filtering, and logical heartbeat checkpoints
-- Count- and age-based event retention with explicit stale-consumer behavior
+- Whole-segment count and age retention with explicit stale-consumer behavior
 - Bounded transaction accounting with disk-backed spill staging and crash cleanup
 - Opt-in capture group-commit metrics and an end-to-end load-test harness
 - Docker-backed integration tests for capture, abrupt process recovery,
@@ -223,6 +246,6 @@ Implemented basics:
 Not implemented yet:
 
 - Complete `pgoutput` coverage
-- Durable event-format versioning and migrations
+- Complete durable event and staging format migration coverage
 - WASM transform runtime
 - Webhook destinations

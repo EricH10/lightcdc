@@ -54,7 +54,9 @@ them has optional work remaining.
   release must say so prominently.
 - Version the durable event, metadata, consumer-offset, and staging formats.
   Test forward migrations and reject unsupported downgrade or newer formats
-  without mutating the store.
+  without mutating the store. PARTIAL: the control database and segment headers
+  are versioned; legacy single-file migration and mutation-free rejection of a
+  newer control format are tested. Event payload and staging migrations remain.
 - Test the no-loss boundary across process kill, host restart, PostgreSQL
   restart, network interruption, storage failure, retention, and supported
   schema changes. PARTIAL: process, reconnect, transaction, retention, and
@@ -303,15 +305,14 @@ slow consumer cannot stall capture or unrelated consumers.
   the initial hard-retention model: abandoned consumers do not pin disk.
 - Define expiration behavior for abandoned consumers. DONE: an expired offset
   fails explicitly and requires a seek to the retained prefix or latest.
-- Compact events that are no longer needed. PARTIAL: bounded prefix deletion and
-  redb page reuse are implemented; explicit offline file compaction remains.
-- Restore append-like sustained throughput while retention is active. Profile
-  the current prefix-pruning path, benchmark combining append and prune work in
-  one redb transaction, evaluate transaction-level rather than per-event replay
-  deduplication, and compare redb's range-removal APIs. If row-by-row deletion
-  remains the limit, move to size- or time-bounded redb segments so retention
-  can remove whole sealed files; consider multiple writable shards only when
-  measured demand justifies the ordering and replay complexity.
+- Compact events that are no longer needed. DONE with immutable event segments
+  and whole-file deletion; retained events are not rewritten.
+- Restore append-like sustained throughput while retention is active. PARTIAL:
+  count-, byte-, and age-bounded redb segments now make retention a whole-file
+  operation. Rerun sustained retention benchmarks, then evaluate
+  transaction-level rather than per-event replay deduplication. Consider
+  multiple writable shards only when measured demand justifies the ordering and
+  replay complexity.
 - Warn and shed work safely before disk exhaustion.
 
 Complete when storage growth is bounded and stale consumers have explicit,

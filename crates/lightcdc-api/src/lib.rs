@@ -423,11 +423,13 @@ fn internal(error: impl ToString) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
+
     use lightcdc_core::{
         ChangeEvent as CoreChangeEvent, LoggingConfig, Operation as CoreOperation, RuntimeConfig,
         SourceConfig, SourceMetadata, StreamConfig,
     };
-    use lightcdc_storage::{LogOpenOptions, RetentionPolicy};
+    use lightcdc_storage::{LogOpenOptions, RetentionPolicy, SegmentOptions};
     use tempfile::TempDir;
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
@@ -887,12 +889,32 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
-    fn service_with_events(events: &[CoreChangeEvent]) -> LightCdcService {
+    struct TestService {
+        service: LightCdcService,
+        _temp: TempDir,
+    }
+
+    impl Deref for TestService {
+        type Target = LightCdcService;
+
+        fn deref(&self) -> &Self::Target {
+            &self.service
+        }
+    }
+
+    fn service_with_events(events: &[CoreChangeEvent]) -> TestService {
         let temp = TempDir::new().expect("temp dir");
-        let store = RedbEventStore::open(&LogOpenOptions {
-            data_dir: temp.path().to_path_buf(),
-            database_file: "test.redb".to_owned(),
-        })
+        let data_dir = temp.path().to_path_buf();
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: data_dir.clone(),
+                database_file: "test.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 2,
+                ..SegmentOptions::default()
+            },
+        )
         .expect("open store");
 
         for event in events {
@@ -900,8 +922,11 @@ mod tests {
         }
 
         let mut config = config();
-        config.runtime.data_dir = temp.path().display().to_string();
-        LightCdcService::new(config, store)
+        config.runtime.data_dir = data_dir.display().to_string();
+        TestService {
+            service: LightCdcService::new(config, store),
+            _temp: temp,
+        }
     }
 
     fn subscription(consumer: &str, limit: u32) -> SubscribeRequest {
@@ -951,6 +976,9 @@ mod tests {
                 capture_batch_max_events: 500,
                 capture_batch_max_bytes: 4 * 1024 * 1024,
                 capture_batch_max_delay_ms: 20,
+                segment_max_events: 1_000_000,
+                segment_max_bytes: 256 * 1024 * 1024,
+                segment_max_age_seconds: 15 * 60,
                 retention_max_events: None,
                 retention_max_age_seconds: None,
                 retention_check_interval_ms: 1_000,

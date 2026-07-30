@@ -53,10 +53,10 @@ The default workload inserts one 256-byte row per transaction at the maximum
 rate `pgbench` can produce.
 
 The benchmark config retains at most 1,000,000 event payloads. Retention work is
-part of the measured storage cost, and `process.csv` should show data-file
-growth approaching a plateau after the retained window fills. redb may keep
-freed pages in the file for reuse, so live retention bounds are more important
-than expecting the file to shrink during a run.
+part of the measured storage cost, and `process.csv` should show aggregate
+control-plus-segment file growth approaching a plateau after the retained
+window fills. Retention unlinks whole sealed segment files, so their disk space
+is returned without rewriting retained events.
 
 Useful controls:
 

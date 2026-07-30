@@ -35,7 +35,7 @@ pub(crate) enum Command {
         metrics_interval_seconds: u64,
     },
 
-    /// Runs capture and the consumer API against one shared redb handle.
+    /// Runs capture and the consumer API against one shared segmented store.
     Run {
         #[arg(short, long, default_value = "lightcdc.example.toml")]
         config: PathBuf,

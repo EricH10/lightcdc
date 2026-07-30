@@ -15,7 +15,8 @@
 
 ## Runtime Flow
 
-1. `lightcdc run` loads `lightcdc.example.toml`, opens redb once, starts gRPC, and starts capture.
+1. `lightcdc run` loads `lightcdc.example.toml`, opens the segmented store once,
+   starts gRPC, and starts capture.
 2. `capture_with_store` compiles the configured streams into one `CapturePlan`
    and prepares the optional bounded-run target, metrics, transaction staging,
    heartbeats, and the dedicated storage writer.
@@ -35,8 +36,9 @@
    deadline is reached.
 10. `CaptureStorageWriter::submit` moves the group through a bounded channel to
    the long-lived `lightcdc-redb-writer` OS thread.
-11. While that thread runs `RedbEventStore::persist_transaction_batch`, the
-   replication task may assemble the next group.
+11. While that thread commits the group and source checkpoint to the active
+   segment through `RedbEventStore::persist_transaction_batch`, the replication
+   task may assemble the next group.
 12. Capture receives the write result, then `ReplicationReader::ack` tells
     PostgreSQL the final group WAL position is durable.
 13. A PostgreSQL disconnect drops the current reader, waits with capped
@@ -44,8 +46,8 @@
 14. Transactional logical heartbeats provide safe commit boundaries while only
     unrelated tables are changing; their eventless redb commits advance only
     the source checkpoint.
-15. The retention timer serializes bounded prefix pruning through the same redb
-    writer thread used by capture.
+15. The retention timer serializes whole-file deletion of expired sealed
+    segments through the same redb writer thread used by capture.
 16. `LightCdcService::subscribe` claims one active `(stream, consumer)`, replays
     stored events, and waits for capture's post-commit notification when caught up.
 17. `StreamConfig::matches_event` selects each stream's view of the shared log.
@@ -73,10 +75,14 @@
 - `CaptureStorageWriter` owns the dedicated redb writer thread and command channel.
 - `PendingCaptureWrite` represents the one group that may be committing while
   capture assembles its successor.
-- `RedbEventStore` stores events, source offsets, and stream consumer offsets.
+- `RedbEventStore` presents one ordered log across a control database, one
+  active event segment, and immutable sealed segments.
+- `SegmentOptions` controls preferred event-count, byte, and age rotation
+  boundaries plus the sealed-segment handle cache.
 - `EventNotifier` wakes live subscribers after capture durably commits events.
 - `LightCdcService` exposes the stored event log through gRPC Subscribe, Ack, and Seek.
-- `LogOpenOptions` describes where the local redb database file lives.
+- `LogOpenOptions` describes where the control database and segment directory
+  live.
 
 ## Main Functions
 
@@ -101,7 +107,8 @@
 - `RedbEventStore::persist_transaction` atomically stores committed events and their source LSN.
 - `RedbEventStore::persist_transaction_batch` atomically stores several source
   transactions and their final LSN.
-- `RedbEventStore::prune_events` atomically removes one expired event prefix.
+- `RedbEventStore::prune_events` retires expired sealed segments and advances
+  the durable retention floor.
 - `RedbEventStore::replay_from` reads stored events from a sequence number.
 - `RedbEventStore::consumer_offset` reads where a consumer last acked.
 - `LightCdcService::subscribe` streams matching events to a consumer.

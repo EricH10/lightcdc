@@ -104,18 +104,35 @@ Open concern:
 
 ## Local Storage Choice
 
-Initial dependency: `redb`.
+Initial dependency: `redb`, arranged as one control database and a sequence of
+event-segment databases.
 
 Reasoning:
 
 - It is a Rust-native embedded key-value database.
 - Its table model maps well to ordered CDC event storage: `sequence -> event payload`.
-- It supports separate tables for event ID deduplication, source offsets, and consumer offsets without inventing a storage engine too early.
+- Its transactions keep event payloads, deduplication IDs, and source
+  checkpoints atomic inside each segment.
 - It keeps the project closer to systems engineering than SQL schema design while still avoiding a premature custom append-only log.
 
 Tradeoff:
 
-- SQLite would be easier to inspect manually and more widely deployed. redb is a better fit for the shape of this runtime, but the project should keep the storage boundary narrow enough to swap later if benchmarks or operational needs point elsewhere.
+- SQLite would be easier to inspect manually and more widely deployed. redb is
+  a better fit for the shape of this runtime, but the project keeps the storage
+  boundary narrow enough to swap later if benchmarks or operational needs point
+  elsewhere.
+
+The configured `database_file` is the control database. It stores consumer
+offsets, the retention floor, and format metadata. Event files live beside it
+under `<database_file>.segments/`. Exactly one segment is active and writable;
+sealed segments are immutable. Replay scans segment metadata in sequence order,
+opens sealed files through a bounded handle cache, and reads the active segment
+through its shared handle. The active segment is visible immediately.
+
+Rotation happens only between complete capture groups. Event-count, serialized
+byte, and age thresholds are preferred limits because the group that crosses a
+limit remains whole. An unusually large PostgreSQL transaction therefore gets
+one oversized segment rather than being split.
 
 ## Transaction Buffering
 
@@ -147,10 +164,10 @@ transaction briefly while collecting more committed transactions. The group
 flushes when it reaches the configured transaction, event, decoded-byte, or
 time limit. Defaults are 100 transactions, 500 events, 4 MiB, and 20 ms.
 
-One redb write transaction streams every group member, updates the event-ID
-index, and advances the source offset to the final transaction's LSN. Only
-after that commit succeeds does capture acknowledge the final LSN to
-PostgreSQL. A crash before the redb commit replays the whole group; a crash
+One write transaction in the active segment streams every group member, updates
+the event-ID index, and advances the source offset to the final transaction's
+LSN. Only after that commit succeeds does capture acknowledge the final LSN to
+PostgreSQL. A crash before the segment commit replays the whole group; a crash
 afterward resumes from its final durable LSN. Grouping therefore changes
 visibility latency but not the no-loss boundary or individual transaction
 metadata.
@@ -180,23 +197,33 @@ no subsequent transaction.
 
 ## Event Retention
 
-Optional hard retention removes the oldest event payloads when either the
+Optional hard retention removes whole sealed segment files when either the
 configured maximum event count or maximum commit age is exceeded. Each sweep
-deletes a bounded prefix atomically on the same writer thread as capture, so
-retention and source commits cannot race or reorder.
+runs on the same writer thread as capture, so retention and source commits
+cannot race or reorder. The active segment is never deleted.
 
-The store keeps an event-sequence high-water mark outside the retained payload
-table, preventing sequence reuse after every payload has expired. Event IDs for
-the latest durable PostgreSQL checkpoint remain protected until a newer source
-batch commits, preserving duplicate detection if PostgreSQL replays that
-checkpoint after a long idle period.
+The control database keeps the retention floor, consumer offsets, and durable
+format version. New active segments inherit source checkpoints and the
+event-sequence high-water mark, preventing sequence reuse after older files are
+deleted and preserving duplicate detection at the latest durable checkpoint.
 
 Consumer offsets do not pin retention indefinitely. A subscription whose next
 sequence is older than the retention floor fails explicitly and must seek to
 the oldest retained event or to the current high-water mark. This bounds the
 log despite abandoned consumers and avoids silently skipping missing history.
-Deleted redb pages are available for reuse, but immediate filesystem shrinking
-is not part of the retention contract.
+Count and age limits are segment-granular. A count sweep may retain up to one
+segment less than the requested maximum after the active segment and sweep
+interval temporarily exceed it. Age retention cannot delete a segment until
+its newest event has expired. Segment boundaries should therefore be
+comfortably smaller than their corresponding retention windows. Deleting the
+whole file releases disk space without rewriting retained events.
+
+Startup reconstructs the catalog from versioned segment headers. Interrupted
+temporary files are discarded, while a segment renamed for deletion is either
+restored or finished according to the durable control retention floor. A
+legacy single-file store is migrated into the first segment. A sidecar format
+marker is checked before redb opens any file, allowing a newer unsupported
+format to be rejected without mutating it.
 
 ## Failure Classification
 

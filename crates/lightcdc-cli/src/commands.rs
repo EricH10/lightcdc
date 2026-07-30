@@ -33,8 +33,7 @@ pub(crate) async fn replay(
                 .with_context(|| format!("stream {name:?} is not defined in config"))
         })
         .transpose()?;
-    let storage = storage_options(&config);
-    let store = RedbEventStore::open(&storage).context("failed to open local redb event store")?;
+    let store = open_event_store(&config)?;
     let events = replay_from_store(&store, from, limit, stream)
         .with_context(|| format!("failed to replay events from sequence {from}"))?;
 
@@ -90,7 +89,7 @@ pub(crate) fn inspect(
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
     let storage = storage_options(&config);
     let database_path = storage.data_dir.join(&storage.database_file);
-    let store = RedbEventStore::open(&storage).with_context(|| {
+    let store = open_event_store(&config).with_context(|| {
         format!(
             "failed to open {}; stop any other lightcdc process using this redb file",
             database_path.display()
@@ -109,12 +108,12 @@ pub(crate) fn inspect(
     let first_sequence = store
         .first_sequence()
         .context("failed to read first event sequence")?;
-    let file_size = std::fs::metadata(&database_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let segments_path = database_path.with_file_name(format!("{}.segments", storage.database_file));
+    let file_size = store_disk_usage(&database_path, &segments_path);
 
     println!("LightCDC redb inspector");
-    println!("Database       {}", database_path.display());
+    println!("Control        {}", database_path.display());
+    println!("Segments       {}", segments_path.display());
     println!("File size      {}", human_bytes(file_size));
     println!(
         "Event range    {}",
@@ -137,6 +136,11 @@ pub(crate) fn inspect(
             vec![
                 "consumer_offsets".to_owned(),
                 stats.consumer_offset_count.to_string(),
+            ],
+            vec!["segments".to_owned(), stats.segment_count.to_string()],
+            vec![
+                "sealed_segments".to_owned(),
+                stats.sealed_segment_count.to_string(),
             ],
         ],
         &[24, 12],
@@ -213,6 +217,21 @@ pub(crate) fn inspect(
     }
 
     Ok(())
+}
+
+/// Sums logical bytes across the control file and all sequence segments.
+fn store_disk_usage(control_path: &std::path::Path, segments_path: &std::path::Path) -> u64 {
+    let control_bytes = std::fs::metadata(control_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let segment_bytes = std::fs::read_dir(segments_path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    control_bytes.saturating_add(segment_bytes)
 }
 
 /// Serves the gRPC API against an existing event store when capture is not running.
