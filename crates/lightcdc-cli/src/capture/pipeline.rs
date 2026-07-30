@@ -301,6 +301,7 @@ async fn submit_capture_batch(
             .submit(
                 std::mem::take(&mut pipeline.batch),
                 context.metrics.is_some(),
+                !pipeline.replay_reconciled,
             )
             .await?,
     );

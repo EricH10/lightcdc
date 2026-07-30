@@ -4,8 +4,13 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Write,
+    ops::Deref,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        mpsc::{self, Sender},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -62,11 +67,13 @@ pub(crate) struct SegmentStore {
     cache: Mutex<SegmentCache>,
     /// Serializes segment rotation, capture commits, and whole-segment retention.
     write_gate: Mutex<()>,
+    /// Closes large sealed databases without blocking the capture writer.
+    reaper: DatabaseReaper,
 }
 
 struct SegmentState {
     descriptors: Vec<SegmentDescriptor>,
-    active: Option<Arc<Database>>,
+    active: Option<SegmentDatabase>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,7 +95,34 @@ struct SegmentDescriptor {
 struct SegmentCache {
     capacity: usize,
     order: VecDeque<u64>,
-    databases: HashMap<u64, Arc<Database>>,
+    databases: HashMap<u64, SegmentDatabase>,
+}
+
+type SegmentDatabase = Arc<DeferredDatabase>;
+
+/// Defers redb's close-time allocator commit and flush to the reaper thread.
+struct DeferredDatabase {
+    database: Option<Database>,
+    path: PathBuf,
+    reaper: Sender<RetiredDatabase>,
+    pending_closes: Arc<PendingCloses>,
+}
+
+struct DatabaseReaper {
+    sender: Option<Sender<RetiredDatabase>>,
+    pending_closes: Arc<PendingCloses>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct RetiredDatabase {
+    path: PathBuf,
+    database: Database,
+}
+
+#[derive(Default)]
+struct PendingCloses {
+    paths: Mutex<HashSet<PathBuf>>,
+    changed: Condvar,
 }
 
 impl SegmentStore {
@@ -133,13 +167,13 @@ impl SegmentStore {
         }
         validate_segment_catalog(&descriptors)?;
 
+        let reaper = DatabaseReaper::start()?;
         let active_descriptor = descriptors.iter().find(|segment| !segment.sealed).cloned();
         let active = match active_descriptor {
-            Some(segment) => Some(Arc::new(open_database(
-                &segment.path,
-                options.active_cache_bytes,
-                false,
-            )?)),
+            Some(segment) => Some(reaper.wrap(
+                open_database(&segment.path, options.active_cache_bytes, false)?,
+                segment.path.clone(),
+            )),
             None => {
                 let latest = descriptors
                     .last()
@@ -154,11 +188,10 @@ impl SegmentStore {
                     latest.high_watermark,
                     options.active_cache_bytes,
                 )?;
-                let active = Arc::new(open_database(
-                    &descriptor.path,
-                    options.active_cache_bytes,
-                    false,
-                )?);
+                let active = reaper.wrap(
+                    open_database(&descriptor.path, options.active_cache_bytes, false)?,
+                    descriptor.path.clone(),
+                );
                 descriptors.push(descriptor);
                 Some(active)
             }
@@ -174,6 +207,7 @@ impl SegmentStore {
             }),
             cache: Mutex::new(SegmentCache::new(options.sealed_cache_capacity)),
             write_gate: Mutex::new(()),
+            reaper,
         })
     }
 
@@ -218,6 +252,7 @@ impl SegmentStore {
         transaction_events: &[&TransactionEvents],
         source_name: &str,
         source_lsn: &str,
+        check_replay: bool,
         before_commit: F,
     ) -> Result<PersistTransactionOutcome, StorageError>
     where
@@ -251,8 +286,8 @@ impl SegmentStore {
             return Ok(PersistTransactionOutcome::AlreadyPersisted);
         }
 
-        let needs_replay_check =
-            self.batch_may_overlap_checkpoint(transaction_events, durable_lsn.as_deref())?;
+        let needs_replay_check = check_replay
+            && self.batch_may_overlap_checkpoint(transaction_events, durable_lsn.as_deref())?;
         if needs_replay_check {
             let duplicate_count = self.count_duplicate_events(transaction_events)?;
             if duplicate_count == event_count && event_count > 0 {
@@ -652,18 +687,17 @@ impl SegmentStore {
                 self.options.active_cache_bytes,
             )?
         };
-        let database = Arc::new(open_database(
-            &descriptor.path,
-            self.options.active_cache_bytes,
-            false,
-        )?);
+        let database = self.reaper.wrap(
+            open_database(&descriptor.path, self.options.active_cache_bytes, false)?,
+            descriptor.path.clone(),
+        );
         let mut state = write_state(&self.state);
         state.descriptors.push(descriptor);
         state.active = Some(database);
         Ok(())
     }
 
-    fn active_segment(&self) -> Result<(Arc<Database>, SegmentDescriptor), StorageError> {
+    fn active_segment(&self) -> Result<(SegmentDatabase, SegmentDescriptor), StorageError> {
         let state = read_state(&self.state);
         let descriptor = state
             .descriptors
@@ -753,6 +787,7 @@ impl SegmentStore {
         }
         write.commit().map_err(redb_error)?;
         descriptor.sealed = true;
+        mutex(&self.cache).insert(descriptor.id, Arc::clone(&active));
         {
             let mut state = write_state(&self.state);
             if let Some(existing) = state
@@ -772,11 +807,10 @@ impl SegmentStore {
             descriptor.high_watermark,
             self.options.active_cache_bytes,
         )?;
-        let next_database = Arc::new(open_database(
-            &next.path,
-            self.options.active_cache_bytes,
-            false,
-        )?);
+        let next_database = self.reaper.wrap(
+            open_database(&next.path, self.options.active_cache_bytes, false)?,
+            next.path.clone(),
+        );
         let mut state = write_state(&self.state);
         state.descriptors.push(next);
         state.active = Some(next_database);
@@ -804,12 +838,46 @@ impl SegmentStore {
         &self,
         transactions: &[&TransactionEvents],
     ) -> Result<usize, StorageError> {
-        let mut duplicates = 0usize;
+        let mut candidates = HashMap::<String, usize>::new();
         for transaction in transactions {
             for event in transaction.iter()? {
-                if self.event_id_exists(&event?.event_id)? {
-                    duplicates = duplicates.saturating_add(1);
+                let event_id = event?.event_id;
+                *candidates.entry(event_id).or_default() += 1;
+            }
+        }
+
+        let mut duplicates = 0usize;
+        let state = read_state(&self.state);
+        for descriptor in state.descriptors.iter().rev() {
+            let database = if !descriptor.sealed {
+                state
+                    .active
+                    .as_ref()
+                    .cloned()
+                    .ok_or(StorageError::MissingActiveSegment)?
+            } else {
+                self.sealed_database(descriptor)?
+            };
+            let read = database.begin_read().map_err(redb_error)?;
+            let event_ids = read.open_table(EVENT_IDS).map_err(redb_error)?;
+            let mut found = Vec::new();
+            for (event_id, count) in &candidates {
+                if event_ids
+                    .get(event_id.as_str())
+                    .map_err(redb_error)?
+                    .is_some()
+                {
+                    duplicates = duplicates.saturating_add(*count);
+                    found.push(event_id.clone());
                 }
+            }
+            drop(event_ids);
+            drop(read);
+            for event_id in found {
+                candidates.remove(&event_id);
+            }
+            if candidates.is_empty() {
+                break;
             }
         }
         Ok(duplicates)
@@ -891,16 +959,16 @@ impl SegmentStore {
     fn sealed_database(
         &self,
         descriptor: &SegmentDescriptor,
-    ) -> Result<Arc<Database>, StorageError> {
+    ) -> Result<SegmentDatabase, StorageError> {
         let mut cache = mutex(&self.cache);
         if let Some(database) = cache.get(descriptor.id) {
             return Ok(database);
         }
-        let database = Arc::new(open_database(
-            &descriptor.path,
-            self.options.sealed_cache_bytes,
-            false,
-        )?);
+        self.reaper.wait_until_closed(&descriptor.path);
+        let database = self.reaper.wrap(
+            open_database(&descriptor.path, self.options.sealed_cache_bytes, false)?,
+            descriptor.path.clone(),
+        );
         cache.insert(descriptor.id, Arc::clone(&database));
         Ok(database)
     }
@@ -1007,14 +1075,14 @@ impl SegmentCache {
         }
     }
 
-    fn get(&mut self, id: u64) -> Option<Arc<Database>> {
+    fn get(&mut self, id: u64) -> Option<SegmentDatabase> {
         let database = self.databases.get(&id).cloned()?;
         self.order.retain(|candidate| *candidate != id);
         self.order.push_back(id);
         Some(database)
     }
 
-    fn insert(&mut self, id: u64, database: Arc<Database>) {
+    fn insert(&mut self, id: u64, database: SegmentDatabase) {
         self.remove(id);
         self.order.push_back(id);
         self.databases.insert(id, database);
@@ -1028,6 +1096,93 @@ impl SegmentCache {
     fn remove(&mut self, id: u64) {
         self.order.retain(|candidate| *candidate != id);
         self.databases.remove(&id);
+    }
+}
+
+impl Deref for DeferredDatabase {
+    type Target = Database;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+            .as_ref()
+            .expect("segment database remains available until its final handle drops")
+    }
+}
+
+impl Drop for DeferredDatabase {
+    fn drop(&mut self) {
+        let Some(database) = self.database.take() else {
+            return;
+        };
+        mutex(&self.pending_closes.paths).insert(self.path.clone());
+        if let Err(error) = self.reaper.send(RetiredDatabase {
+            path: self.path.clone(),
+            database,
+        }) {
+            drop(error.0.database);
+            self.pending_closes.finish(&self.path);
+        }
+    }
+}
+
+impl DatabaseReaper {
+    fn start() -> Result<Self, StorageError> {
+        let (sender, receiver) = mpsc::channel::<RetiredDatabase>();
+        let pending_closes = Arc::new(PendingCloses::default());
+        let thread_pending_closes = Arc::clone(&pending_closes);
+        let thread = thread::Builder::new()
+            .name("lightcdc-segment-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(retired) = receiver.recv() {
+                    drop(retired.database);
+                    thread_pending_closes.finish(&retired.path);
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            pending_closes,
+            thread: Some(thread),
+        })
+    }
+
+    fn wrap(&self, database: Database, path: PathBuf) -> SegmentDatabase {
+        Arc::new(DeferredDatabase {
+            database: Some(database),
+            path,
+            reaper: self
+                .sender
+                .as_ref()
+                .expect("segment reaper remains available while the store is open")
+                .clone(),
+            pending_closes: Arc::clone(&self.pending_closes),
+        })
+    }
+
+    fn wait_until_closed(&self, path: &Path) {
+        let mut pending = mutex(&self.pending_closes.paths);
+        while pending.contains(path) {
+            pending = self
+                .pending_closes
+                .changed
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl Drop for DatabaseReaper {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl PendingCloses {
+    fn finish(&self, path: &Path) {
+        mutex(&self.paths).remove(path);
+        self.changed.notify_all();
     }
 }
 
@@ -1768,7 +1923,7 @@ mod tests {
         };
 
         store
-            .persist_transaction_batch(&[&transaction], "default", "0/10", || Ok(()))
+            .persist_transaction_batch(&[&transaction], "default", "0/10", true, || Ok(()))
             .expect("persist oversized transaction");
 
         let state = read_state(&store.state);

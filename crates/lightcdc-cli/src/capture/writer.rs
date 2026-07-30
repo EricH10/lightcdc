@@ -126,6 +126,7 @@ pub(super) struct StorageCompletion {
 struct PersistCommand {
     batch: CaptureBatch,
     measure_latency: bool,
+    check_replay: bool,
     #[cfg(test)]
     delay_before_persist: Option<Duration>,
     response: oneshot::Sender<StorageCompletion>,
@@ -189,6 +190,7 @@ impl CaptureStorageWriter {
         &self,
         batch: CaptureBatch,
         measure_latency: bool,
+        check_replay: bool,
     ) -> anyhow::Result<PendingCaptureWrite> {
         if batch.is_empty() {
             return Err(anyhow!("cannot submit an empty capture batch"));
@@ -203,6 +205,7 @@ impl CaptureStorageWriter {
             .send(StorageCommand::Persist(PersistCommand {
                 batch,
                 measure_latency,
+                check_replay,
                 #[cfg(test)]
                 delay_before_persist: None,
                 response,
@@ -235,6 +238,7 @@ impl CaptureStorageWriter {
             .send(StorageCommand::Persist(PersistCommand {
                 batch,
                 measure_latency: false,
+                check_replay: false,
                 delay_before_persist: Some(delay_before_persist),
                 response,
             }))
@@ -290,8 +294,15 @@ fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: Per
         .map(|transaction| &transaction.events)
         .collect::<Vec<_>>();
     let persist_started = command.measure_latency.then(Instant::now);
-    let result =
-        store.persist_transaction_batch(&transaction_events, source_name, &ack_lsn.to_string());
+    let result = if command.check_replay {
+        store.persist_transaction_batch(&transaction_events, source_name, &ack_lsn.to_string())
+    } else {
+        store.persist_reconciled_transaction_batch(
+            &transaction_events,
+            source_name,
+            &ack_lsn.to_string(),
+        )
+    };
     let persist_latency = persist_started.map(|persist_started| persist_started.elapsed());
     let _ = command.response.send(StorageCompletion {
         batch: command.batch,
@@ -338,7 +349,10 @@ mod tests {
         batch.push(transaction(1, "0/1"));
         batch.push(transaction(2, "0/2"));
 
-        let pending = writer.submit(batch, true).await.expect("submit batch");
+        let pending = writer
+            .submit(batch, true, true)
+            .await
+            .expect("submit batch");
         assert_eq!(pending.event_count, 2);
         let completion = pending.response.await.expect("writer response");
 
@@ -369,7 +383,7 @@ mod tests {
         let writer =
             CaptureStorageWriter::start(store, "default".to_owned()).expect("start writer");
 
-        let error = match writer.submit(CaptureBatch::default(), false).await {
+        let error = match writer.submit(CaptureBatch::default(), false, false).await {
             Ok(_) => panic!("empty batch must fail"),
             Err(error) => error,
         };
@@ -397,7 +411,7 @@ mod tests {
         first_batch.push(transaction(1, "0/1"));
         first_batch.push(transaction(2, "0/2"));
         writer
-            .submit(first_batch, false)
+            .submit(first_batch, false, false)
             .await
             .expect("submit first batch")
             .response
@@ -408,7 +422,7 @@ mod tests {
         let mut latest_batch = CaptureBatch::default();
         latest_batch.push(transaction(3, "0/3"));
         writer
-            .submit(latest_batch, false)
+            .submit(latest_batch, false, false)
             .await
             .expect("submit latest batch")
             .response

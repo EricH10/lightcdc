@@ -256,6 +256,22 @@ impl RedbEventStore {
         )
     }
 
+    /// Persists a batch after the caller has reconciled source replay for this session.
+    pub fn persist_reconciled_transaction_batch(
+        &self,
+        transaction_events: &[&TransactionEvents],
+        source_name: &str,
+        source_lsn: &str,
+    ) -> Result<PersistTransactionOutcome, StorageError> {
+        self.inner.persist_transaction_batch(
+            transaction_events,
+            source_name,
+            source_lsn,
+            false,
+            || Ok(()),
+        )
+    }
+
     fn persist_transaction_batch_before_commit<F>(
         &self,
         transaction_events: &[&TransactionEvents],
@@ -270,6 +286,7 @@ impl RedbEventStore {
             transaction_events,
             source_name,
             source_lsn,
+            true,
             before_commit,
         )
     }
@@ -298,8 +315,13 @@ impl RedbEventStore {
                 staged_bytes,
             },
         };
-        self.inner
-            .persist_transaction_batch(&[&events], source_name, source_lsn, before_commit)
+        self.inner.persist_transaction_batch(
+            &[&events],
+            source_name,
+            source_lsn,
+            true,
+            before_commit,
+        )
     }
 
     /// Returns the sequence assigned to the next newly captured event.
@@ -954,6 +976,47 @@ mod tests {
         assert_eq!(
             store.source_offset("default").expect("source offset"),
             Some("0/4".to_owned())
+        );
+    }
+
+    #[test]
+    fn fully_replayed_batch_is_detected_across_sealed_segments() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: temp.path().to_path_buf(),
+                database_file: "test.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 1,
+                ..SegmentOptions::default()
+            },
+        )
+        .expect("open store");
+        let first = event(1, "0/1");
+        let second = event(2, "0/2");
+        store
+            .persist_transaction(std::slice::from_ref(&first), "default", "0/3")
+            .expect("persist first segment");
+        store
+            .persist_transaction(std::slice::from_ref(&second), "default", "0/4")
+            .expect("persist second segment");
+
+        let mut replayed = [first.clone(), second.clone()];
+        replayed[0].sequence = 3;
+        replayed[1].sequence = 4;
+        let outcome = store
+            .persist_transaction(&replayed, "default", "0/5")
+            .expect("reconcile replay across segments");
+
+        assert_eq!(outcome, PersistTransactionOutcome::AlreadyPersisted);
+        assert_eq!(
+            store.replay_from(1, 10).expect("original events"),
+            [first, second]
+        );
+        assert_eq!(
+            store.source_offset("default").expect("source offset"),
+            Some("0/5".to_owned())
         );
     }
 
