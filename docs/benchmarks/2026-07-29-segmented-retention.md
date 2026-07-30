@@ -69,3 +69,24 @@ retention is active. The next performance work should focus on storage density,
 segment cache memory, and longer soak tests. A 50,000 event-per-second sustained
 claim would still require reducing rotation stalls or increasing storage
 parallelism.
+
+## Larger Segment Follow-up
+
+A follow-up repeated the 40,000 event-per-second workload with larger segments.
+The normal limit is one million events **or** 256 MiB of staged event data,
+whichever comes first. This workload reaches 256 MiB around 140,000 events, so
+a separate 4 GiB byte-limit run was required to isolate true million-event
+segments.
+
+| Event / byte limits | Active capture | Average / peak CPU | Peak RSS | Worst interval e2e p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 100,000 / 256 MiB | 38,956/s | 76.0% / 111.5% | 996 MiB | 443 ms |
+| 1,000,000 / 256 MiB | 39,477/s | 74.2% / 98.0% | 513 MiB | 296 ms |
+| 1,000,000 / 4 GiB | 38,959/s | 73.2% / 92.6% | 365 MiB | 289 ms |
+
+Every run captured and consumed every generated event and ended with zero WAL
+and consumer lag. Larger segments materially reduced peak CPU, memory, and tail
+latency, but did not improve fixed-rate throughput. This suggests that frequent
+redb handle retirement and per-segment caches explain much of the resource
+spikes, while steady per-event encoding and redb writes remain the throughput
+limit.
