@@ -22,6 +22,8 @@ and truncate messages.
 - `lightcdc-postgres`: PostgreSQL connectivity and replication support.
 - `lightcdc-storage`: transaction staging plus redb-backed event, source offset,
   and consumer offset storage.
+- `lightcdc-runtime`: shared storage writer, capture batching, and write-command
+  coordination used by capture, retention, and gRPC.
 - `lightcdc-api`: gRPC Subscribe, Ack, and Seek service.
 - `lightcdc-cli`: user-facing binary.
 

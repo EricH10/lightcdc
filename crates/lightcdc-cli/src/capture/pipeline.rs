@@ -2,13 +2,11 @@
 
 use anyhow::Context;
 use lightcdc_postgres::{CapturedTransaction, PostgresError, ReplicationReader, TransactionRead};
+use lightcdc_runtime::{CaptureBatch, CaptureBatchLimits, PendingCaptureWrite, StorageCompletion};
 use lightcdc_storage::PersistTransactionOutcome;
 use tracing::warn;
 
-use super::{
-    CaptureContext,
-    writer::{CaptureBatch, CaptureBatchLimits, PendingCaptureWrite, StorageCompletion},
-};
+use super::CaptureContext;
 use crate::{
     cli::{CaptureOptions, CaptureOutput},
     display::event_to_json,

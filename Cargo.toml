@@ -3,6 +3,7 @@ members = [
     "crates/lightcdc-core",
     "crates/lightcdc-postgres",
     "crates/lightcdc-storage",
+    "crates/lightcdc-runtime",
     "crates/lightcdc-api",
     "crates/lightcdc-cli",
 ]

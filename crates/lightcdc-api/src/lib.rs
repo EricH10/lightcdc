@@ -7,6 +7,7 @@ use std::{
 };
 
 use lightcdc_core::{ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
+use lightcdc_runtime::{CaptureStorageHandle, CaptureStorageWriter};
 use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,6 +32,10 @@ pub struct LightCdcService {
     config: Arc<Config>,
     /// Durable log shared by RPC handlers and long-lived subscription tasks.
     store: Arc<RedbEventStore>,
+    /// Queues consumer offset mutations behind capture and retention writes.
+    storage_writer: CaptureStorageHandle,
+    /// Keeps the writer thread alive when the service was constructed standalone.
+    _storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
     event_notifier: EventNotifier,
     /// Prevents two workers from advancing the same consumer concurrently.
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
@@ -89,15 +94,48 @@ impl LightCdcService {
         Self::new_with_notifier(config, store, EventNotifier::new())
     }
 
-    /// Creates a gRPC service that shares capture commit notifications.
+    /// Creates a standalone service that owns its storage writer thread.
     pub fn new_with_notifier(
         config: Config,
         store: RedbEventStore,
         event_notifier: EventNotifier,
     ) -> Self {
+        let storage_writer_owner = Arc::new(
+            CaptureStorageWriter::start(store.clone(), config.source.name.clone())
+                .expect("failed to start the gRPC storage writer"),
+        );
+        let storage_writer = storage_writer_owner.handle();
+        Self::from_parts(
+            config,
+            store,
+            event_notifier,
+            storage_writer,
+            Some(storage_writer_owner),
+        )
+    }
+
+    /// Creates a service sharing an existing capture storage writer.
+    pub fn new_with_storage_writer(
+        config: Config,
+        store: RedbEventStore,
+        event_notifier: EventNotifier,
+        storage_writer: CaptureStorageHandle,
+    ) -> Self {
+        Self::from_parts(config, store, event_notifier, storage_writer, None)
+    }
+
+    fn from_parts(
+        config: Config,
+        store: RedbEventStore,
+        event_notifier: EventNotifier,
+        storage_writer: CaptureStorageHandle,
+        storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+    ) -> Self {
         Self {
             config: Arc::new(config),
             store: Arc::new(store),
+            storage_writer,
+            _storage_writer_owner: storage_writer_owner,
             event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -121,8 +159,10 @@ pub async fn serve_with_notifier(
     config: Config,
     store: RedbEventStore,
     event_notifier: EventNotifier,
+    storage_writer: CaptureStorageHandle,
 ) -> Result<(), tonic::transport::Error> {
-    let service = LightCdcService::new_with_notifier(config, store, event_notifier);
+    let service =
+        LightCdcService::new_with_storage_writer(config, store, event_notifier, storage_writer);
     serve_service(addr, service).await
 }
 
@@ -242,8 +282,9 @@ impl LightCdc for LightCdcService {
         }
 
         let offset = self
-            .store
-            .acknowledge_consumer_offset(&stream.name, consumer, request.sequence)
+            .storage_writer
+            .acknowledge_consumer_offset(stream.name.clone(), consumer.to_owned(), request.sequence)
+            .await
             .map_err(internal)?;
 
         Ok(Response::new(AckResponse { offset }))
@@ -268,8 +309,9 @@ impl LightCdc for LightCdcService {
             }
         };
 
-        self.store
-            .set_consumer_offset(&stream.name, consumer, offset)
+        self.storage_writer
+            .set_consumer_offset(stream.name.clone(), consumer.to_owned(), offset)
+            .await
             .map_err(internal)?;
         delivery_high_watermarks(&self.delivery_high_watermarks)
             .remove(&(stream.name.clone(), consumer.to_owned()));

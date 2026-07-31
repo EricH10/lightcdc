@@ -5,13 +5,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow};
 use lightcdc_core::{Config, SourceConfig};
 use lightcdc_postgres::{LogicalHeartbeatEmitter, ReplicationReader};
+use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle};
 use lightcdc_storage::RetentionPolicy;
 use tracing::{info, warn};
 
 use super::{
     CaptureContext,
     pipeline::{CaptureSessionExit, requested_event_count_reached, run_capture_session},
-    writer::{CaptureBatchLimits, CaptureStorageHandle},
 };
 
 const RECONNECT_INITIAL_DELAY_MS: u64 = 250;

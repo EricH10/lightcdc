@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use lightcdc_api::EventNotifier;
 use lightcdc_core::{CapturePlan, Config};
+use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageWriter};
 use lightcdc_storage::{RedbEventStore, TransactionBufferOptions};
 use tracing::{info, warn};
 
@@ -14,7 +15,6 @@ use self::{
         capture_batch_limits, capture_heartbeat_interval, capture_retention, run_retention_sweeps,
         supervise_capture,
     },
-    writer::{CaptureBatchLimits, CaptureStorageWriter},
 };
 use crate::{
     cli::CaptureOptions,
@@ -25,7 +25,6 @@ use crate::{
 mod metrics;
 mod pipeline;
 mod supervisor;
-mod writer;
 
 /// Borrows immutable capture dependencies shared by the supervision functions.
 struct CaptureContext<'a> {
@@ -56,7 +55,8 @@ pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> an
     );
 
     let store = open_event_store(&config)?;
-    capture_with_store(config, store, options, None).await
+    let storage_writer = CaptureStorageWriter::start(store.clone(), config.source.name.clone())?;
+    capture_with_store(config, store, options, None, &storage_writer).await
 }
 
 /// Runs capture and the gRPC server in one process sharing one event store.
@@ -82,10 +82,26 @@ pub(crate) async fn run(
     let server_store = store.clone();
     let event_notifier = EventNotifier::new();
     let server_notifier = event_notifier.clone();
+    let source_name = config.source.name.clone();
+    let storage_writer = CaptureStorageWriter::start(store.clone(), source_name.clone())?;
+    let server_storage = storage_writer.handle();
     let mut server = tokio::spawn(async move {
-        lightcdc_api::serve_with_notifier(addr, server_config, server_store, server_notifier).await
+        lightcdc_api::serve_with_notifier(
+            addr,
+            server_config,
+            server_store,
+            server_notifier,
+            server_storage,
+        )
+        .await
     });
-    let capture = capture_with_store(config, store, options, Some(event_notifier));
+    let capture = capture_with_store(
+        config,
+        store,
+        options,
+        Some(event_notifier),
+        &storage_writer,
+    );
     tokio::pin!(capture);
 
     tokio::select! {
@@ -115,6 +131,7 @@ async fn capture_with_store(
     store: RedbEventStore,
     options: CaptureOptions,
     event_notifier: Option<EventNotifier>,
+    storage_writer: &CaptureStorageWriter,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
     let source_name = config.source.name.clone();
@@ -166,13 +183,12 @@ async fn capture_with_store(
         "capture is running; insert, update, or delete rows in the published tables"
     );
 
-    let storage_writer = CaptureStorageWriter::start(store.clone(), source_name.clone())?;
     let retention_task = retention
         .map(|retention| tokio::spawn(run_retention_sweeps(storage_writer.handle(), retention)));
     let capture_result = supervise_capture(CaptureContext {
         config: &config,
         store: &store,
-        storage_writer: &storage_writer,
+        storage_writer,
         options: &options,
         metrics: &metrics,
         event_notifier: &event_notifier,

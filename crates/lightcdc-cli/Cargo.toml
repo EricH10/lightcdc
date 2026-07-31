@@ -16,6 +16,7 @@ clap.workspace = true
 lightcdc-core = { path = "../lightcdc-core" }
 lightcdc-api = { path = "../lightcdc-api" }
 lightcdc-postgres = { path = "../lightcdc-postgres" }
+lightcdc-runtime = { path = "../lightcdc-runtime" }
 lightcdc-storage = { path = "../lightcdc-storage" }
 hdrhistogram.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "lightcdc-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lightcdc-postgres = { path = "../lightcdc-postgres" }
+lightcdc-storage = { path = "../lightcdc-storage" }
+tokio.workspace = true
+
+[dev-dependencies]
+lightcdc-core = { path = "../lightcdc-core" }
+tempfile = "3"

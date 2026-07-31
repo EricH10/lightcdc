@@ -1,4 +1,4 @@
-//! Serializes synchronous redb capture and retention work on one dedicated thread.
+//! Serializes synchronous redb writes from capture and API callers on one thread.
 
 use std::{
     thread::{self, JoinHandle},
@@ -18,37 +18,37 @@ const STORAGE_COMMAND_CAPACITY: usize = 1;
 
 /// Bounds how many complete source transactions share one redb commit.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct CaptureBatchLimits {
+pub struct CaptureBatchLimits {
     /// Maximum grouped source transactions.
-    pub(super) max_transactions: usize,
+    pub max_transactions: usize,
     /// Soft grouped event boundary.
-    pub(super) max_events: usize,
+    pub max_events: usize,
     /// Soft grouped decoded-byte boundary.
-    pub(super) max_bytes: u64,
+    pub max_bytes: u64,
     /// Maximum wait measured from the first grouped transaction.
-    pub(super) max_delay: Duration,
+    pub max_delay: Duration,
 }
 
 /// Accumulates complete source transactions and their resource totals.
 #[derive(Default)]
-pub(super) struct CaptureBatch {
+pub struct CaptureBatch {
     /// Whole source transactions preserved in commit order.
-    pub(super) transactions: Vec<CapturedTransaction>,
+    pub transactions: Vec<CapturedTransaction>,
     /// Total consumer events across the grouped transactions.
-    pub(super) event_count: usize,
+    pub event_count: usize,
     /// Total estimated decoded bytes across the group.
-    pub(super) decoded_bytes: u64,
+    pub decoded_bytes: u64,
     /// Total staged representation bytes across the group.
-    pub(super) staged_bytes: u64,
+    pub staged_bytes: u64,
     /// Transactions whose events currently live in staging files.
-    pub(super) staged_transaction_count: usize,
+    pub staged_transaction_count: usize,
     /// Time the first transaction entered this group.
     started_at: Option<TokioInstant>,
 }
 
 impl CaptureBatch {
     /// Adds a whole source transaction and updates aggregate accounting.
-    pub(super) fn push(&mut self, transaction: CapturedTransaction) {
+    pub fn push(&mut self, transaction: CapturedTransaction) {
         let stats = transaction.events.stats();
         if self.transactions.is_empty() {
             self.started_at = Some(TokioInstant::now());
@@ -61,7 +61,7 @@ impl CaptureBatch {
     }
 
     /// Returns true when the batch contains no source transactions.
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
@@ -69,7 +69,7 @@ impl CaptureBatch {
     ///
     /// An empty batch always accepts one transaction so a source transaction is
     /// never split merely to satisfy redb group-commit limits.
-    pub(super) fn would_exceed(
+    pub fn would_exceed(
         &self,
         transaction: &CapturedTransaction,
         limits: CaptureBatchLimits,
@@ -84,14 +84,14 @@ impl CaptureBatch {
     }
 
     /// Returns true when the current batch has met any flush boundary.
-    pub(super) fn reached_limit(&self, limits: CaptureBatchLimits) -> bool {
+    pub fn reached_limit(&self, limits: CaptureBatchLimits) -> bool {
         self.transactions.len() >= limits.max_transactions
             || self.event_count >= limits.max_events
             || self.decoded_bytes >= limits.max_bytes
     }
 
     /// Returns when the oldest transaction in this batch must be flushed.
-    pub(super) fn deadline(&self, limits: CaptureBatchLimits) -> TokioInstant {
+    pub fn deadline(&self, limits: CaptureBatchLimits) -> TokioInstant {
         self.started_at
             .expect("non-empty capture batch has a start time")
             + limits.max_delay
@@ -99,28 +99,28 @@ impl CaptureBatch {
 }
 
 /// Owns the lifetime of the dedicated redb writer thread.
-pub(super) struct CaptureStorageWriter {
+pub struct CaptureStorageWriter {
     handle: Option<CaptureStorageHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// Sends serialized storage commands to the dedicated writer.
 #[derive(Clone)]
-pub(super) struct CaptureStorageHandle {
+pub struct CaptureStorageHandle {
     sender: mpsc::Sender<StorageCommand>,
 }
 
 /// Tracks one submitted batch until its redb result is available.
-pub(super) struct PendingCaptureWrite {
-    pub(super) response: oneshot::Receiver<StorageCompletion>,
-    pub(super) event_count: usize,
+pub struct PendingCaptureWrite {
+    pub response: oneshot::Receiver<StorageCompletion>,
+    pub event_count: usize,
 }
 
 /// Returns both the original batch and its storage result to the async pipeline.
-pub(super) struct StorageCompletion {
-    pub(super) batch: CaptureBatch,
-    pub(super) result: Result<PersistTransactionOutcome, StorageError>,
-    pub(super) persist_latency: Option<Duration>,
+pub struct StorageCompletion {
+    pub batch: CaptureBatch,
+    pub result: Result<PersistTransactionOutcome, StorageError>,
+    pub persist_latency: Option<Duration>,
 }
 
 /// Carries all state required to persist and report one capture batch.
@@ -141,11 +141,23 @@ enum StorageCommand {
         now_ms: i64,
         response: oneshot::Sender<Result<RetentionOutcome, StorageError>>,
     },
+    AcknowledgeConsumer {
+        stream_name: String,
+        consumer_name: String,
+        sequence: u64,
+        response: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    SetConsumerOffset {
+        stream_name: String,
+        consumer_name: String,
+        offset: u64,
+        response: oneshot::Sender<Result<(), StorageError>>,
+    },
 }
 
 impl CaptureStorageWriter {
     /// Starts the long-lived OS thread that owns synchronous storage work.
-    pub(super) fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
+    pub fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<StorageCommand>(STORAGE_COMMAND_CAPACITY);
         let thread = thread::Builder::new()
             .name("lightcdc-redb-writer".to_owned())
@@ -164,6 +176,30 @@ impl CaptureStorageWriter {
                         } => {
                             let _ = response.send(store.prune_events(policy, now_ms));
                         }
+                        StorageCommand::AcknowledgeConsumer {
+                            stream_name,
+                            consumer_name,
+                            sequence,
+                            response,
+                        } => {
+                            let _ = response.send(store.acknowledge_consumer_offset(
+                                &stream_name,
+                                &consumer_name,
+                                sequence,
+                            ));
+                        }
+                        StorageCommand::SetConsumerOffset {
+                            stream_name,
+                            consumer_name,
+                            offset,
+                            response,
+                        } => {
+                            let _ = response.send(store.set_consumer_offset(
+                                &stream_name,
+                                &consumer_name,
+                                offset,
+                            ));
+                        }
                     }
                 }
             })
@@ -179,7 +215,7 @@ impl CaptureStorageWriter {
     }
 
     /// Clones a lightweight command handle for retention or other producers.
-    pub(super) fn handle(&self) -> CaptureStorageHandle {
+    pub fn handle(&self) -> CaptureStorageHandle {
         self.handle
             .as_ref()
             .expect("redb writer thread is running")
@@ -187,7 +223,7 @@ impl CaptureStorageWriter {
     }
 
     /// Queues one capture batch and returns a receiver for its eventual result.
-    pub(super) async fn submit(
+    pub async fn submit(
         &self,
         batch: CaptureBatch,
         measure_latency: bool,
@@ -255,7 +291,7 @@ impl CaptureStorageWriter {
 
 impl CaptureStorageHandle {
     /// Queues one retention sweep behind any capture write already in progress.
-    pub(super) async fn prune(
+    pub async fn prune(
         &self,
         policy: RetentionPolicy,
         now_ms: i64,
@@ -273,6 +309,54 @@ impl CaptureStorageHandle {
             .await
             .context("redb writer thread stopped before returning retention results")?
             .context("failed to prune retained events from redb")
+    }
+
+    /// Serializes a cumulative consumer acknowledgement with capture writes.
+    pub async fn acknowledge_consumer_offset(
+        &self,
+        stream_name: String,
+        consumer_name: String,
+        sequence: u64,
+    ) -> anyhow::Result<u64> {
+        let (response, response_receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::AcknowledgeConsumer {
+                stream_name,
+                consumer_name,
+                sequence,
+                response,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!("redb writer thread stopped before accepting an acknowledgement")
+            })?;
+        response_receiver
+            .await
+            .context("redb writer thread stopped before returning an acknowledgement")?
+            .context("failed to acknowledge the consumer offset in redb")
+    }
+
+    /// Serializes an explicit consumer seek with capture writes.
+    pub async fn set_consumer_offset(
+        &self,
+        stream_name: String,
+        consumer_name: String,
+        offset: u64,
+    ) -> anyhow::Result<()> {
+        let (response, response_receiver) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::SetConsumerOffset {
+                stream_name,
+                consumer_name,
+                offset,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("redb writer thread stopped before accepting a consumer seek"))?;
+        response_receiver
+            .await
+            .context("redb writer thread stopped before returning a consumer seek")?
+            .context("failed to set the consumer offset in redb")
     }
 }
 
@@ -480,6 +564,44 @@ mod tests {
         assert_eq!(
             completion.result.expect("persist batch"),
             PersistTransactionOutcome::Persisted
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_offset_mutations_share_the_storage_writer() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "writer.redb".to_owned(),
+        })
+        .expect("open store");
+        let writer =
+            CaptureStorageWriter::start(store.clone(), "default".to_owned()).expect("start writer");
+        let handle = writer.handle();
+
+        handle
+            .set_consumer_offset("orders".to_owned(), "search".to_owned(), 5)
+            .await
+            .expect("seek consumer");
+        assert_eq!(
+            handle
+                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 3)
+                .await
+                .expect("monotonic acknowledgement"),
+            5
+        );
+        assert_eq!(
+            handle
+                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 8)
+                .await
+                .expect("advance acknowledgement"),
+            8
+        );
+        assert_eq!(
+            store
+                .consumer_offset("orders", "search")
+                .expect("consumer offset"),
+            Some(8)
         );
     }
 

@@ -827,6 +827,7 @@ dependencies = [
  "clap",
  "hdrhistogram",
  "lightcdc-core",
+ "lightcdc-runtime",
  "lightcdc-storage",
  "prost",
  "protoc-bin-vendored",
@@ -851,6 +852,7 @@ dependencies = [
  "lightcdc-api",
  "lightcdc-core",
  "lightcdc-postgres",
+ "lightcdc-runtime",
  "lightcdc-storage",
  "serde_json",
  "tempfile",
@@ -882,6 +884,18 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+]
+
+[[package]]
+name = "lightcdc-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lightcdc-core",
+ "lightcdc-postgres",
+ "lightcdc-storage",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
