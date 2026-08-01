@@ -28,10 +28,11 @@ them has optional work remaining.
   atomically. DONE for currently supported `pgoutput` row events.
 - Persist and validate PostgreSQL source identity, not only database, slot, and
   publication names, so a replaced or restored source cannot silently continue
-  against old local state.
+  against old local state. DONE with the cluster system identifier and database
+  OID durably bound to the configured source name.
 - Reconcile the local durable source LSN with the slot's
   `confirmed_flush_lsn` before capture. Refuse startup with a clear data-gap
-  error when PostgreSQL can no longer replay the local missing range.
+  error when PostgreSQL can no longer replay the local missing range. DONE.
 - Publish and enforce a supported PostgreSQL and `pgoutput` feature matrix,
   including partitioned tables, replica identity modes, schema changes,
   publication changes, messages, streaming transactions, and prepared
@@ -56,7 +57,8 @@ them has optional work remaining.
   Test forward migrations and reject unsupported downgrade or newer formats
   without mutating the store. PARTIAL: the control database and segment headers
   are versioned; legacy single-file migration and mutation-free rejection of a
-  newer control format are tested. Event payload and staging migrations remain.
+  newer control format are tested. Control format v2 adds source identity with
+  a tested v1 forward migration. Event payload and staging migrations remain.
 - Test the no-loss boundary across process kill, host restart, PostgreSQL
   restart, network interruption, storage failure, retention, and supported
   schema changes. PARTIAL: process, reconnect, transaction, retention, and
@@ -338,12 +340,14 @@ observable behavior.
 - Add webhook delivery with retries and a dead-letter queue.
 - Add sandboxed WASM transforms with transform versioning and replay.
 - Add multiple PostgreSQL sources and additional output adapters.
+- Maintain the optional Redis cache connector and extend its explicit truncate,
+  TOAST-upsert, and Redis Cluster boundaries only with safe semantics. INITIAL
+  standalone connector DONE for atomic invalidation/upsert plus replay-safe
+  Redis progress.
 - Keep the storage boundary replaceable if one-node redb storage is outgrown.
 
 ## Current Next Step
 
-Persist and validate PostgreSQL source identity, then reject a slot
-`confirmed_flush_lsn` that is ahead of the durable local checkpoint before
-capture starts. Next, finish the combined-runtime outage test, explicit runtime
-states, graceful shutdown, and standard health/readiness service before
-returning to retention throughput work.
+Finish the combined-runtime outage test, explicit runtime states, graceful
+shutdown, and standard health/readiness service. Then enforce subscription and
+disk bounds before returning to retention throughput work.

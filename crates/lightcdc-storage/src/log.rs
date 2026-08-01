@@ -7,6 +7,7 @@ use std::{
 };
 
 use lightcdc_core::ChangeEvent;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{TransactionBufferError, TransactionEvents, TransactionStats, segments::SegmentStore};
@@ -61,6 +62,15 @@ pub struct SourceOffset {
     pub source_name: String,
     /// Last durably persisted PostgreSQL commit LSN.
     pub lsn: String,
+}
+
+/// Identifies the physical PostgreSQL cluster and database bound to a source name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SourceIdentity {
+    /// PostgreSQL cluster system identifier from `pg_control_system()`.
+    pub system_identifier: String,
+    /// OID of the configured database inside that cluster.
+    pub database_oid: String,
 }
 
 /// Couples one complete source transaction with its durable commit position.
@@ -381,6 +391,23 @@ impl RedbEventStore {
         self.inner.source_offset(source_name)
     }
 
+    /// Persists a source identity once or verifies that it has not changed.
+    pub fn bind_source_identity(
+        &self,
+        source_name: &str,
+        identity: &SourceIdentity,
+    ) -> Result<(), StorageError> {
+        self.inner.bind_source_identity(source_name, identity)
+    }
+
+    /// Reads the physical PostgreSQL identity bound to a configured source.
+    pub fn source_identity(
+        &self,
+        source_name: &str,
+    ) -> Result<Option<SourceIdentity>, StorageError> {
+        self.inner.source_identity(source_name)
+    }
+
     /// Sets a consumer offset, allowing an explicit seek in either direction.
     pub fn set_consumer_offset(
         &self,
@@ -458,6 +485,17 @@ pub enum StorageError {
     InvalidConsumerOffsetKey(String),
 
     #[error(
+        "source {source_name:?} is already bound to PostgreSQL system {expected_system_identifier} database OID {expected_database_oid}, but the configured server reports system {actual_system_identifier} database OID {actual_database_oid}"
+    )]
+    SourceIdentityMismatch {
+        source_name: String,
+        expected_system_identifier: String,
+        expected_database_oid: String,
+        actual_system_identifier: String,
+        actual_database_oid: String,
+    },
+
+    #[error(
         "event sequence {requested} is no longer retained; first available sequence is {first_available}"
     )]
     SequenceExpired {
@@ -510,7 +548,7 @@ mod tests {
 
     use super::{
         LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionPolicy, SegmentOptions,
-        SourceTransaction, StorageError,
+        SourceIdentity, SourceTransaction, StorageError,
     };
     use crate::{TransactionBuffer, TransactionBufferOptions, TransactionEvents};
 
@@ -575,6 +613,50 @@ mod tests {
         assert_eq!(consumer_offsets[0].stream_name, "orders");
         assert_eq!(consumer_offsets[0].consumer_name, "search-indexer");
         assert_eq!(consumer_offsets[0].sequence, 1);
+    }
+
+    #[test]
+    fn source_identity_is_bound_once_and_mismatches_are_rejected() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        let identity = SourceIdentity {
+            system_identifier: "7412345678901234567".to_owned(),
+            database_oid: "16384".to_owned(),
+        };
+
+        store
+            .bind_source_identity("default", &identity)
+            .expect("bind source identity");
+        store
+            .bind_source_identity("default", &identity)
+            .expect("verify matching identity");
+        assert_eq!(
+            store.source_identity("default").expect("read identity"),
+            Some(identity)
+        );
+
+        let error = store
+            .bind_source_identity(
+                "default",
+                &SourceIdentity {
+                    system_identifier: "999".to_owned(),
+                    database_oid: "16384".to_owned(),
+                },
+            )
+            .expect_err("reject replacement cluster");
+        assert!(matches!(error, StorageError::SourceIdentityMismatch { .. }));
+        assert_eq!(
+            store
+                .source_identity("default")
+                .expect("identity remains readable")
+                .expect("identity remains bound")
+                .system_identifier,
+            "7412345678901234567"
+        );
     }
 
     #[test]

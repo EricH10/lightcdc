@@ -8,7 +8,8 @@ use lightcdc_core::{
     CapturePlan, ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata,
 };
 use lightcdc_storage::{
-    TransactionBuffer, TransactionBufferError, TransactionBufferOptions, TransactionEvents,
+    SourceIdentity, TransactionBuffer, TransactionBufferError, TransactionBufferOptions,
+    TransactionEvents,
 };
 use pgwire_replication::{
     client::{ReplicationClient, ReplicationEvent},
@@ -79,6 +80,25 @@ pub struct LogicalHeartbeatEmitter {
 pub struct PublicationAlignment {
     /// Published tables that no configured stream currently requires.
     pub unnecessary_published_tables: Vec<String>,
+}
+
+/// Describes the validated physical source and its durable slot positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceValidation {
+    /// Physical cluster and database identity that local state must remain bound to.
+    pub identity: SourceIdentity,
+    /// WAL position PostgreSQL believes the client has durably acknowledged.
+    pub confirmed_flush_lsn: Option<String>,
+    /// Oldest WAL position still retained for this slot.
+    pub restart_lsn: Option<String>,
+    /// Alignment between configured stream tables and the publication.
+    pub publication: PublicationAlignment,
+}
+
+struct ValidatedSource {
+    identity: SourceIdentity,
+    confirmed_flush_lsn: Option<String>,
+    restart_lsn: Option<String>,
 }
 
 /// Bundles the events from one committed transaction with its checkpoint.
@@ -489,14 +509,14 @@ pub async fn validate_source_config(config: &SourceConfig) -> Result<(), Postgre
         }
     });
 
-    validate_source_client(&client, config).await
+    validate_source_client(&client, config).await.map(|_| ())
 }
 
 /// Validates the source and ensures its publication contains every configured table.
 pub async fn validate_source_config_with_plan(
     config: &SourceConfig,
     capture_plan: &CapturePlan,
-) -> Result<PublicationAlignment, PostgresError> {
+) -> Result<SourceValidation, PostgresError> {
     if capture_plan.source_name() != config.name {
         return Err(PostgresError::Configuration(format!(
             "capture plan belongs to source {:?}; expected {:?}",
@@ -512,15 +532,21 @@ pub async fn validate_source_config_with_plan(
         }
     });
 
-    validate_source_client(&client, config).await?;
-    validate_publication_alignment(&client, config, capture_plan).await
+    let source = validate_source_client(&client, config).await?;
+    let publication = validate_publication_alignment(&client, config, capture_plan).await?;
+    Ok(SourceValidation {
+        identity: source.identity,
+        confirmed_flush_lsn: source.confirmed_flush_lsn,
+        restart_lsn: source.restart_lsn,
+        publication,
+    })
 }
 
 /// Checks server settings, role privileges, publication presence, and slot identity.
 async fn validate_source_client(
     client: &Client,
     config: &SourceConfig,
-) -> Result<(), PostgresError> {
+) -> Result<ValidatedSource, PostgresError> {
     let row = client
         .query_one(
             r#"
@@ -571,7 +597,12 @@ async fn validate_source_client(
     let slot = client
         .query_opt(
             r#"
-            SELECT slot_type, plugin, database
+            SELECT
+                slot_type,
+                plugin,
+                database,
+                confirmed_flush_lsn::text,
+                restart_lsn::text
             FROM pg_replication_slots
             WHERE slot_name = $1
             "#,
@@ -587,6 +618,8 @@ async fn validate_source_client(
     let slot_type: String = slot.get(0);
     let plugin: Option<String> = slot.get(1);
     let slot_database: Option<String> = slot.get(2);
+    let confirmed_flush_lsn: Option<String> = slot.get(3);
+    let restart_lsn: Option<String> = slot.get(4);
 
     if slot_type != "logical" {
         return Err(PostgresError::Configuration(format!(
@@ -607,6 +640,23 @@ async fn validate_source_client(
         )));
     }
 
+    let identity = client
+        .query_one(
+            r#"
+            SELECT
+                control.system_identifier::text,
+                database.oid::text
+            FROM pg_control_system() AS control
+            JOIN pg_database AS database ON database.datname = current_database()
+            "#,
+            &[],
+        )
+        .await?;
+    let identity = SourceIdentity {
+        system_identifier: identity.get(0),
+        database_oid: identity.get(1),
+    };
+
     info!(
         wal_level,
         database,
@@ -615,9 +665,44 @@ async fn validate_source_client(
         can_replicate,
         publication = %config.publication,
         slot = %config.slot,
+        system_identifier = %identity.system_identifier,
+        database_oid = %identity.database_oid,
+        confirmed_flush_lsn = ?confirmed_flush_lsn,
+        restart_lsn = ?restart_lsn,
         "validated PostgreSQL source config"
     );
 
+    Ok(ValidatedSource {
+        identity,
+        confirmed_flush_lsn,
+        restart_lsn,
+    })
+}
+
+/// Rejects a local checkpoint whose missing WAL has already been acknowledged away.
+pub fn validate_resume_lsn(
+    local_lsn: Option<&str>,
+    confirmed_flush_lsn: Option<&str>,
+) -> Result<(), PostgresError> {
+    let Some(local_lsn) = local_lsn else {
+        return Ok(());
+    };
+    let Some(confirmed_flush_lsn) = confirmed_flush_lsn else {
+        return Ok(());
+    };
+    let local = Lsn::from_str(local_lsn).map_err(|error| {
+        PostgresError::StreamState(format!("invalid durable source LSN {local_lsn:?}: {error}"))
+    })?;
+    let confirmed = Lsn::from_str(confirmed_flush_lsn).map_err(|error| {
+        PostgresError::StreamState(format!(
+            "invalid slot confirmed_flush_lsn {confirmed_flush_lsn:?}: {error}"
+        ))
+    })?;
+    if confirmed > local {
+        return Err(PostgresError::Configuration(format!(
+            "replication slot confirmed_flush_lsn {confirmed_flush_lsn} is ahead of the local durable checkpoint {local_lsn}; PostgreSQL can no longer replay the missing range"
+        )));
+    }
     Ok(())
 }
 
@@ -721,7 +806,9 @@ mod tests {
 
     use pgwire_replication::error::PgWireError;
 
-    use super::{PostgresError, is_retryable_sqlstate, replication_server_sqlstate};
+    use super::{
+        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, validate_resume_lsn,
+    };
 
     #[test]
     fn retries_transient_replication_failures() {
@@ -784,5 +871,17 @@ mod tests {
             replication_server_sqlstate("malformed (SQLSTATE 123)"),
             None
         );
+    }
+
+    #[test]
+    fn resume_validation_allows_replay_and_rejects_acknowledged_gap() {
+        validate_resume_lsn(Some("0/20"), Some("0/10")).expect("slot can replay local LSN");
+        validate_resume_lsn(Some("0/20"), Some("0/20")).expect("positions match");
+        validate_resume_lsn(None, Some("0/20")).expect("fresh local store adopts slot position");
+
+        let error = validate_resume_lsn(Some("0/10"), Some("0/20"))
+            .expect_err("slot acknowledged beyond local durability");
+        assert!(matches!(error, PostgresError::Configuration(_)));
+        assert!(error.to_string().contains("can no longer replay"));
     }
 }

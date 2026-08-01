@@ -14,6 +14,9 @@ setup and a Rust debugging walkthrough.
 See [`docs/consumer-delivery.md`](docs/consumer-delivery.md) for the current
 ordered consumer and acknowledgement contract.
 
+See [`docs/redis-connector.md`](docs/redis-connector.md) for the optional,
+crash-safe Redis cache invalidation and update connector.
+
 ## Prerequisites
 
 - Rust 1.89 or newer
@@ -190,6 +193,17 @@ cargo run -p lightcdc-api --example consumer -- \
   --limit 32
 ```
 
+Run the Redis cache connector:
+
+```bash
+docker compose up -d redis
+cargo run -p lightcdc-redis -- --config redis-connector.example.toml
+```
+
+The connector uses a named LightCDC consumer and atomically stores each applied
+sequence with its Redis cache mutation before acknowledging LightCDC. See the
+connector guide for invalidation, upsert, replay, and retention behavior.
+
 Run checks:
 
 ```bash
@@ -243,6 +257,7 @@ Implemented basics:
 - Stream-filtered replay
 - gRPC `Subscribe`, `Ack`, and `Seek`
 - Local Docker Compose PostgreSQL
+- Optional Redis cache invalidation and JSON-row upsert connector
 - Init SQL for a demo table and publication
 - Architecture and local development notes
 

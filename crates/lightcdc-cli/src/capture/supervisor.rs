@@ -130,10 +130,28 @@ async fn validate_source_until_ready(
         )
         .await
         {
-            Ok(alignment) => {
-                if !alignment.unnecessary_published_tables.is_empty() {
+            Ok(validation) => {
+                let local_lsn = context
+                    .store
+                    .source_offset(context.source_name)
+                    .context("failed to read local checkpoint during source validation")?;
+                lightcdc_postgres::validate_resume_lsn(
+                    local_lsn.as_deref(),
+                    validation.confirmed_flush_lsn.as_deref(),
+                )
+                .context("PostgreSQL replication slot cannot resume local durable state")?;
+                context
+                    .store
+                    .bind_source_identity(context.source_name, &validation.identity)
+                    .context("PostgreSQL source identity does not match local durable state")?;
+
+                if !validation
+                    .publication
+                    .unnecessary_published_tables
+                    .is_empty()
+                {
                     warn!(
-                        tables = ?alignment.unnecessary_published_tables,
+                        tables = ?validation.publication.unnecessary_published_tables,
                         "publication contains tables that no configured stream consumes"
                     );
                 }

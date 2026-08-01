@@ -1,0 +1,24 @@
+[lightcdc]
+endpoint = "http://127.0.0.1:50051"
+stream = "orders"
+consumer = "redis-orders-cache"
+reconnect_initial_ms = 250
+reconnect_max_ms = 15000
+
+[redis]
+# Use url_env in production so credentials are not stored in this file.
+url = "redis://127.0.0.1:6379"
+# url_env = "LIGHTCDC_REDIS_URL"
+# progress_key = "lightcdc:redis:orders:redis-orders-cache:offset"
+
+[[rules]]
+table = "public.orders"
+key = "order:{id}"
+action = "invalidate"
+
+# To maintain JSON row values instead, replace the rule above with:
+# [[rules]]
+# table = "public.orders"
+# key = "order:{id}"
+# action = "upsert"
+# ttl_seconds = 3600

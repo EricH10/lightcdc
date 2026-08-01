@@ -10,8 +10,8 @@ use std::{
 use lightcdc_core::{ChangeEvent, Config, Operation, SourceConfig};
 use lightcdc_postgres::{ReplicationReader, validate_source_config_with_plan};
 use lightcdc_storage::{
-    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, TransactionBufferError,
-    TransactionBufferOptions, TransactionEvents,
+    LogOpenOptions, PersistTransactionOutcome, RedbEventStore, SourceIdentity,
+    TransactionBufferError, TransactionBufferOptions, TransactionEvents,
 };
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -889,6 +889,100 @@ async fn capture_exits_when_a_configured_table_is_missing_from_the_publication()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_rejects_a_replaced_postgres_source_without_mutating_identity() -> anyhow::Result<()>
+{
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let store = open_store(temp.path().to_path_buf())?;
+    let stale_identity = SourceIdentity {
+        system_identifier: "replaced-cluster".to_owned(),
+        database_oid: "999".to_owned(),
+    };
+    store.bind_source_identity(&fixture.source_name, &stale_identity)?;
+    drop(store);
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--output",
+                "none",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let status = capture.wait_for_exit().await?;
+    assert!(!status.success(), "capture must reject a replaced source");
+    let store = open_store(temp.path().to_path_buf())?;
+    assert_eq!(
+        store.source_identity(&fixture.source_name)?,
+        Some(stale_identity)
+    );
+    assert_eq!(store.stats()?.event_count, 0);
+    drop(store);
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn capture_rejects_a_slot_checkpoint_ahead_of_local_durability() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    fixture.insert("gap@example.com", 100).await?;
+    let target_lsn = fixture.current_wal_lsn().await?;
+    fixture.advance_slot_to(&target_lsn).await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let store = open_store(temp.path().to_path_buf())?;
+    store.set_source_offset(&fixture.source_name, "0/0")?;
+    drop(store);
+
+    let mut capture = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "capture",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--output",
+                "none",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let status = capture.wait_for_exit().await?;
+    assert!(
+        !status.success(),
+        "capture must reject an acknowledged WAL gap"
+    );
+    let store = open_store(temp.path().to_path_buf())?;
+    assert_eq!(
+        store.source_offset(&fixture.source_name)?.as_deref(),
+        Some("0/0")
+    );
+    assert_eq!(store.source_identity(&fixture.source_name)?, None);
+    assert_eq!(store.stats()?.event_count, 0);
+    drop(store);
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
 async fn capture_filters_unconfigured_tables_from_a_broad_publication() -> anyhow::Result<()> {
     let fixture = PgFixture::create().await?;
     let unrelated_table = fixture.create_unrelated_table().await?;
@@ -906,7 +1000,7 @@ async fn capture_filters_unconfigured_tables_from_a_broad_publication() -> anyho
     let capture_plan = config.capture_plan()?;
     let alignment = validate_source_config_with_plan(&config.source, &capture_plan).await?;
     assert_eq!(
-        alignment.unnecessary_published_tables,
+        alignment.publication.unnecessary_published_tables,
         [format!("public.{unrelated_table}")]
     );
     let store = open_store(temp.path().to_path_buf())?;
@@ -1516,6 +1610,16 @@ impl PgFixture {
             .query_one("SELECT pg_current_wal_lsn()::text", &[])
             .await?;
         Ok(row.get(0))
+    }
+
+    async fn advance_slot_to(&self, target: &str) -> anyhow::Result<()> {
+        self.client
+            .query_one(
+                "SELECT end_lsn::text FROM pg_replication_slot_advance($1, ($2::text)::pg_lsn)",
+                &[&self.slot, &target],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn wait_for_confirmed_flush_lsn(&self, target: &str) -> anyhow::Result<()> {

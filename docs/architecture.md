@@ -24,6 +24,8 @@ and truncate messages.
   and consumer offset storage.
 - `lightcdc-runtime`: shared storage writer, capture batching, and write-command
   coordination used by capture, retention, and gRPC.
+- `lightcdc-redis`: optional external gRPC consumer that atomically applies
+  ordered cache mutations and Redis-side progress before acknowledging events.
 - `lightcdc-api`: gRPC Subscribe, Ack, and Seek service.
 - `lightcdc-cli`: user-facing binary.
 

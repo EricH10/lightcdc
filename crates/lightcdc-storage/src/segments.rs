@@ -21,7 +21,7 @@ use redb::{
 
 use crate::log::{
     ConsumerOffset, PersistTransactionOutcome, RetentionOutcome, RetentionPolicy, SegmentOptions,
-    SourceOffset, SourceTransaction, StorageError, StoreStats,
+    SourceIdentity, SourceOffset, SourceTransaction, StorageError, StoreStats,
 };
 
 const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
@@ -30,9 +30,10 @@ const SOURCE_OFFSETS: TableDefinition<&str, &str> = TableDefinition::new("source
 const SOURCE_REPLAY_FLOORS: TableDefinition<&str, u64> =
     TableDefinition::new("source_replay_floors");
 const CONSUMER_OFFSETS: TableDefinition<&str, u64> = TableDefinition::new("consumer_offsets");
+const SOURCE_IDENTITIES: TableDefinition<&str, &[u8]> = TableDefinition::new("source_identities");
 const METADATA: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 
-const CONTROL_FORMAT_VERSION: u64 = 1;
+const CONTROL_FORMAT_VERSION: u64 = 2;
 const SEGMENT_FORMAT_VERSION: u64 = 1;
 const CONTROL_FORMAT_KEY: &str = "control_format_version";
 const SEGMENT_FORMAT_KEY: &str = "segment_format_version";
@@ -146,7 +147,7 @@ impl SegmentStore {
             )));
         }
         if let Some(found) = marker_format
-            && found != CONTROL_FORMAT_VERSION
+            && found > CONTROL_FORMAT_VERSION
         {
             return Err(StorageError::UnsupportedControlFormat {
                 found,
@@ -156,7 +157,7 @@ impl SegmentStore {
 
         let mut control = open_database(&control_path, CONTROL_CACHE_BYTES, true)?;
         initialize_or_migrate_control(&mut control, &segments_dir, options)?;
-        if marker_format.is_none() {
+        if marker_format != Some(CONTROL_FORMAT_VERSION) {
             write_control_format_marker(&control_path, CONTROL_FORMAT_VERSION)?;
         }
         fs::create_dir_all(&segments_dir)?;
@@ -598,6 +599,49 @@ impl SegmentStore {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn bind_source_identity(
+        &self,
+        source_name: &str,
+        identity: &SourceIdentity,
+    ) -> Result<(), StorageError> {
+        let encoded = serde_json::to_vec(identity)?;
+        let write = self.control.begin_write().map_err(redb_error)?;
+        {
+            let mut identities = write.open_table(SOURCE_IDENTITIES).map_err(redb_error)?;
+            if let Some(stored) = identities.get(source_name).map_err(redb_error)? {
+                let stored: SourceIdentity = serde_json::from_slice(stored.value())?;
+                if stored != *identity {
+                    return Err(StorageError::SourceIdentityMismatch {
+                        source_name: source_name.to_owned(),
+                        expected_system_identifier: stored.system_identifier,
+                        expected_database_oid: stored.database_oid,
+                        actual_system_identifier: identity.system_identifier.clone(),
+                        actual_database_oid: identity.database_oid.clone(),
+                    });
+                }
+            } else {
+                identities
+                    .insert(source_name, encoded.as_slice())
+                    .map_err(redb_error)?;
+            }
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn source_identity(
+        &self,
+        source_name: &str,
+    ) -> Result<Option<SourceIdentity>, StorageError> {
+        let read = self.control.begin_read().map_err(redb_error)?;
+        let identities = read.open_table(SOURCE_IDENTITIES).map_err(redb_error)?;
+        identities
+            .get(source_name)
+            .map_err(redb_error)?
+            .map(|identity| serde_json::from_slice(identity.value()).map_err(StorageError::from))
+            .transpose()
     }
 
     pub(crate) fn set_consumer_offset(
@@ -1215,6 +1259,7 @@ fn initialize_or_migrate_control(
     let format = read_metadata_value(control, CONTROL_FORMAT_KEY)?;
     match format {
         Some(CONTROL_FORMAT_VERSION) => initialize_control_tables(control),
+        Some(1) => migrate_control_v1_to_v2(control),
         Some(found) if found > CONTROL_FORMAT_VERSION => {
             Err(StorageError::UnsupportedControlFormat {
                 found,
@@ -1237,6 +1282,21 @@ fn initialize_control_tables(control: &Database) -> Result<(), StorageError> {
     let write = control.begin_write().map_err(redb_error)?;
     {
         write.open_table(CONSUMER_OFFSETS).map_err(redb_error)?;
+        write.open_table(SOURCE_IDENTITIES).map_err(redb_error)?;
+        let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
+        metadata
+            .insert(CONTROL_FORMAT_KEY, CONTROL_FORMAT_VERSION)
+            .map_err(redb_error)?;
+    }
+    write.commit().map_err(redb_error)?;
+    Ok(())
+}
+
+fn migrate_control_v1_to_v2(control: &Database) -> Result<(), StorageError> {
+    let write = control.begin_write().map_err(redb_error)?;
+    {
+        write.open_table(CONSUMER_OFFSETS).map_err(redb_error)?;
+        write.open_table(SOURCE_IDENTITIES).map_err(redb_error)?;
         let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
         metadata
             .insert(CONTROL_FORMAT_KEY, CONTROL_FORMAT_VERSION)
@@ -1266,6 +1326,7 @@ fn migrate_legacy_store(
     let write = control.begin_write().map_err(redb_error)?;
     {
         write.open_table(CONSUMER_OFFSETS).map_err(redb_error)?;
+        write.open_table(SOURCE_IDENTITIES).map_err(redb_error)?;
         let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
         metadata
             .insert(CONTROL_FORMAT_KEY, CONTROL_FORMAT_VERSION)
@@ -2072,8 +2133,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedControlFormat {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ));
         assert_eq!(
@@ -2084,6 +2145,41 @@ mod tests {
             !segment_directory(&control_path)
                 .expect("segment directory")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn version_one_control_store_migrates_source_identity_table() {
+        let temp = TempDir::new().expect("temp dir");
+        let control_path = temp.path().join("events.redb");
+        let database = Database::create(&control_path).expect("create v1 control");
+        let write = database.begin_write().expect("begin v1 control");
+        {
+            write
+                .open_table(CONSUMER_OFFSETS)
+                .expect("consumer offsets");
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            metadata.insert(CONTROL_FORMAT_KEY, 1).expect("v1 format");
+        }
+        write.commit().expect("commit v1 control");
+        drop(database);
+        write_control_format_marker(&control_path, 1).expect("write v1 marker");
+
+        let store = SegmentStore::open(control_path.clone(), test_segment_options(10))
+            .expect("migrate v1 control");
+        store
+            .bind_source_identity(
+                "default",
+                &SourceIdentity {
+                    system_identifier: "7412345678901234567".to_owned(),
+                    database_oid: "16384".to_owned(),
+                },
+            )
+            .expect("write identity after migration");
+
+        assert_eq!(
+            read_control_format_marker(&control_path).expect("read marker"),
+            Some(CONTROL_FORMAT_VERSION)
         );
     }
 

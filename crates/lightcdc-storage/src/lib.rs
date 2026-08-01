@@ -8,7 +8,8 @@ pub mod transaction;
 
 pub use log::{
     ConsumerOffset, LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionOutcome,
-    RetentionPolicy, SegmentOptions, SourceOffset, SourceTransaction, StorageError, StoreStats,
+    RetentionPolicy, SegmentOptions, SourceIdentity, SourceOffset, SourceTransaction, StorageError,
+    StoreStats,
 };
 pub use transaction::{
     TransactionBuffer, TransactionBufferError, TransactionBufferOptions, TransactionEventIter,
