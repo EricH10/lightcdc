@@ -1,5 +1,12 @@
 //! Serializes synchronous redb writes from capture and API callers on one thread.
 
+mod state;
+
+pub use state::{
+    RuntimeState, RuntimeStateHandle, RuntimeStateReceiver, ShutdownHandle, ShutdownReceiver,
+    runtime_state_channel, shutdown_channel,
+};
+
 use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},

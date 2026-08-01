@@ -5,9 +5,13 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use lightcdc_api::EventNotifier;
 use lightcdc_core::{CapturePlan, Config};
-use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageWriter};
+use lightcdc_runtime::{
+    CaptureBatchLimits, CaptureStorageWriter, RuntimeState, RuntimeStateHandle,
+    runtime_state_channel, shutdown_channel,
+};
 use lightcdc_storage::{RedbEventStore, TransactionBufferOptions};
-use tracing::{info, warn};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use self::{
     metrics::CaptureMetrics,
@@ -39,6 +43,32 @@ struct CaptureContext<'a> {
     heartbeat_interval: Duration,
     batch_limits: CaptureBatchLimits,
     transaction_buffer_options: TransactionBufferOptions,
+    state: &'a RuntimeStateHandle,
+}
+
+/// Aborts a spawned helper when its owning capture future is cancelled.
+struct AbortTask<T> {
+    task: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortTask<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn abort_and_wait(mut self) -> Result<T, tokio::task::JoinError> {
+        let task = self.task.take().expect("abort task is present");
+        task.abort();
+        task.await
+    }
+}
+
+impl<T> Drop for AbortTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 /// Runs capture only and writes changes into the local event store.
@@ -54,9 +84,27 @@ pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> an
         "loaded lightcdc config"
     );
 
+    let shutdown_timeout = shutdown_timeout(&config)?;
     let store = open_event_store(&config)?;
     let storage_writer = CaptureStorageWriter::start(store.clone(), config.source.name.clone())?;
-    capture_with_store(config, store, options, None, &storage_writer).await
+    let (state, _state_rx) = runtime_state_channel();
+    let outcome = {
+        let capture = capture_with_store(config, store, options, None, &storage_writer, &state);
+        tokio::pin!(capture);
+        tokio::select! {
+            result = &mut capture => result,
+            () = process_shutdown_signal() => {
+                state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
+                info!("capture is draining after shutdown signal");
+                Ok(())
+            }
+        }
+    };
+    close_storage_writer(storage_writer, shutdown_timeout).await?;
+    if let Err(error) = &outcome {
+        state.transition(RuntimeState::Failed, Some(error.to_string()));
+    }
+    outcome
 }
 
 /// Runs capture and the gRPC server in one process sharing one event store.
@@ -77,6 +125,7 @@ pub(crate) async fn run(
         "loaded lightcdc config"
     );
 
+    let shutdown_timeout = shutdown_timeout(&config)?;
     let store = open_event_store(&config)?;
     let server_config = config.clone();
     let server_store = store.clone();
@@ -85,44 +134,78 @@ pub(crate) async fn run(
     let source_name = config.source.name.clone();
     let storage_writer = CaptureStorageWriter::start(store.clone(), source_name.clone())?;
     let server_storage = storage_writer.handle();
+    let (state, state_rx) = runtime_state_channel();
+    let (shutdown, shutdown_rx) = shutdown_channel();
     let mut server = tokio::spawn(async move {
-        lightcdc_api::serve_with_notifier(
+        lightcdc_api::serve_with_runtime(
             addr,
             server_config,
             server_store,
             server_notifier,
             server_storage,
+            state_rx,
+            shutdown_rx,
         )
         .await
     });
-    let capture = capture_with_store(
-        config,
-        store,
-        options,
-        Some(event_notifier),
-        &storage_writer,
-    );
-    tokio::pin!(capture);
+    enum RunExit {
+        Capture(anyhow::Result<()>),
+        Server(Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>),
+        Signal,
+    }
 
-    tokio::select! {
-        result = &mut capture => {
-            server.abort();
-            match server.await {
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => return Err(error).context("gRPC server task failed"),
-                Ok(Err(error)) => return Err(error).context("gRPC server failed"),
-                Ok(Ok(())) => {}
+    let exit = {
+        let capture = capture_with_store(
+            config,
+            store,
+            options,
+            Some(event_notifier),
+            &storage_writer,
+            &state,
+        );
+        tokio::pin!(capture);
+        tokio::select! {
+            result = &mut capture => {
+                RunExit::Capture(result)
             }
+            server_result = &mut server => {
+                RunExit::Server(server_result)
+            }
+            () = process_shutdown_signal() => RunExit::Signal,
+        }
+    };
+
+    let outcome = match exit {
+        RunExit::Capture(result) => {
+            if let Err(error) = &result {
+                state.transition(RuntimeState::Failed, Some(error.to_string()));
+            } else {
+                state.transition(RuntimeState::Draining, Some("capture completed".to_owned()));
+            }
+            shutdown.trigger();
+            await_server_shutdown(&mut server, shutdown_timeout).await?;
             result
         }
-        server_result = &mut server => {
-            match server_result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(error).context("gRPC server failed"),
-                Err(error) => Err(error).context("gRPC server task failed"),
-            }
+        RunExit::Server(result) => {
+            let error = match result {
+                Ok(Ok(())) => anyhow::anyhow!("gRPC server stopped unexpectedly"),
+                Ok(Err(error)) => anyhow::Error::new(error).context("gRPC server failed"),
+                Err(error) => anyhow::Error::new(error).context("gRPC server task failed"),
+            };
+            state.transition(RuntimeState::Failed, Some(error.to_string()));
+            shutdown.trigger();
+            Err(error)
         }
-    }
+        RunExit::Signal => {
+            state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
+            info!("runtime is draining after shutdown signal");
+            shutdown.trigger();
+            await_server_shutdown(&mut server, shutdown_timeout).await?;
+            Ok(())
+        }
+    };
+    close_storage_writer(storage_writer, shutdown_timeout).await?;
+    outcome
 }
 
 /// Captures PostgreSQL changes into an already-opened event store.
@@ -132,6 +215,7 @@ async fn capture_with_store(
     options: CaptureOptions,
     event_notifier: Option<EventNotifier>,
     storage_writer: &CaptureStorageWriter,
+    state: &RuntimeStateHandle,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
     let source_name = config.source.name.clone();
@@ -183,8 +267,13 @@ async fn capture_with_store(
         "capture is running; insert, update, or delete rows in the published tables"
     );
 
-    let retention_task = retention
-        .map(|retention| tokio::spawn(run_retention_sweeps(storage_writer.handle(), retention)));
+    state.transition(RuntimeState::Starting, None);
+    let retention_task = retention.map(|retention| {
+        AbortTask::new(tokio::spawn(run_retention_sweeps(
+            storage_writer.handle(),
+            retention,
+        )))
+    });
     let capture_result = supervise_capture(CaptureContext {
         config: &config,
         store: &store,
@@ -197,15 +286,80 @@ async fn capture_with_store(
         heartbeat_interval,
         batch_limits,
         transaction_buffer_options,
+        state,
     })
     .await;
-    if let Some(retention_task) = retention_task {
-        retention_task.abort();
-        if let Err(error) = retention_task.await
-            && !error.is_cancelled()
-        {
-            warn!(%error, "retention task stopped unexpectedly");
-        }
+    if let Some(retention_task) = retention_task
+        && let Err(error) = retention_task.abort_and_wait().await
+        && !error.is_cancelled()
+    {
+        warn!(%error, "retention task stopped unexpectedly");
     }
     capture_result
+}
+
+/// Converts the configured graceful shutdown timeout into a validated duration.
+pub(crate) fn shutdown_timeout(config: &Config) -> anyhow::Result<Duration> {
+    if config.runtime.shutdown_timeout_ms == 0 {
+        anyhow::bail!("runtime.shutdown_timeout_ms must be greater than zero");
+    }
+    Ok(Duration::from_millis(config.runtime.shutdown_timeout_ms))
+}
+
+/// Listens for SIGINT on every platform and SIGTERM on Unix.
+pub(crate) async fn process_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Waits for tonic's graceful drain and aborts it after the configured limit.
+pub(crate) async fn await_server_shutdown(
+    server: &mut JoinHandle<Result<(), tonic::transport::Error>>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(timeout, &mut *server).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error).context("gRPC server failed while draining"),
+        Ok(Err(error)) => Err(error).context("gRPC server task failed while draining"),
+        Err(_) => {
+            server.abort();
+            error!(
+                timeout_ms = timeout.as_millis(),
+                "gRPC drain timed out; aborting server"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Closes the command channel and waits a bounded time for the redb thread.
+pub(crate) async fn close_storage_writer(
+    writer: CaptureStorageWriter,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let (finished, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("lightcdc-writer-shutdown".to_owned())
+        .spawn(move || {
+            drop(writer);
+            let _ = finished.send(());
+        })
+        .context("start storage shutdown coordinator")?;
+
+    tokio::time::timeout(timeout, receiver)
+        .await
+        .map_err(|_| anyhow::anyhow!("storage writer did not stop within {timeout:?}"))?
+        .context("storage shutdown coordinator stopped unexpectedly")
 }

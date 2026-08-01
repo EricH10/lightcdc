@@ -5,12 +5,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow};
 use lightcdc_core::{Config, SourceConfig};
 use lightcdc_postgres::{LogicalHeartbeatEmitter, ReplicationReader};
-use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle};
+use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle, RuntimeState};
 use lightcdc_storage::RetentionPolicy;
 use tracing::{info, warn};
 
 use super::{
-    CaptureContext,
+    AbortTask, CaptureContext,
     pipeline::{CaptureSessionExit, requested_event_count_reached, run_capture_session},
 };
 
@@ -66,10 +66,10 @@ pub(super) async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Re
     let mut reconnect_count = 0u64;
 
     validate_source_until_ready(&context, &mut retry_attempt, &mut reconnect_count).await?;
-    let heartbeat_task = tokio::spawn(run_logical_heartbeats(
+    let heartbeat_task = AbortTask::new(tokio::spawn(run_logical_heartbeats(
         context.config.source.clone(),
         context.heartbeat_interval,
-    ));
+    )));
     let capture_result = supervise_capture_sessions(
         &context,
         &mut captured,
@@ -77,8 +77,7 @@ pub(super) async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Re
         &mut reconnect_count,
     )
     .await;
-    heartbeat_task.abort();
-    if let Err(error) = heartbeat_task.await
+    if let Err(error) = heartbeat_task.abort_and_wait().await
         && !error.is_cancelled()
     {
         warn!(%error, "logical heartbeat task stopped unexpectedly");
@@ -110,6 +109,9 @@ async fn supervise_capture_sessions(
         match session_result? {
             CaptureSessionExit::RequestedEventCountReached => return Ok(()),
             CaptureSessionExit::Disconnected(reason) => {
+                context
+                    .state
+                    .transition(RuntimeState::Retrying, Some(reason.clone()));
                 wait_before_session_reconnect(context, retry_attempt, reconnect_count, &reason)
                     .await;
             }
@@ -155,9 +157,13 @@ async fn validate_source_until_ready(
                         "publication contains tables that no configured stream consumes"
                     );
                 }
+                context.state.transition(RuntimeState::Starting, None);
                 return Ok(());
             }
             Err(error) if error.is_retryable() => {
+                context
+                    .state
+                    .transition(RuntimeState::Retrying, Some(error.to_string()));
                 record_capture_reconnect(context);
                 wait_before_reconnect(*retry_attempt, *reconnect_count, &error).await;
                 advance_reconnect_state(retry_attempt, reconnect_count);
@@ -203,12 +209,16 @@ async fn connect_capture_reader(
                     source_offset = ?source_offset,
                     "PostgreSQL capture connection is ready"
                 );
+                context.state.transition(RuntimeState::Capturing, None);
                 return Ok((reader, source_offset.is_none()));
             }
             Err(error) if error.is_fatal_capture_error() => {
                 return Err(error).context("failed to initialize transaction buffering");
             }
             Err(error) => {
+                context
+                    .state
+                    .transition(RuntimeState::Retrying, Some(error.to_string()));
                 record_capture_reconnect(context);
                 wait_before_reconnect(*retry_attempt, *reconnect_count, &error).await;
                 advance_reconnect_state(retry_attempt, reconnect_count);

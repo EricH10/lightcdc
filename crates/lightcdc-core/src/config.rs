@@ -54,10 +54,19 @@ pub struct RuntimeConfig {
     pub data_dir: String,
     /// redb filename inside `data_dir`.
     pub storage_file: String,
-    /// Reserved for future pipeline channel sizing; currently unused.
+    /// Per-subscription bounded outbound event channel capacity.
     pub channel_capacity: usize,
     /// Reserved for graceful shutdown coordination; currently unused.
     pub shutdown_timeout_ms: u64,
+    /// Maximum simultaneous gRPC subscriptions across all consumers.
+    #[serde(default = "default_max_active_subscriptions")]
+    pub max_active_subscriptions: usize,
+    /// Maximum UTF-8 bytes in a consumer identity supplied over gRPC.
+    #[serde(default = "default_max_consumer_name_bytes")]
+    pub max_consumer_name_bytes: usize,
+    /// Maximum encoded bytes delivered in one consumer event.
+    #[serde(default = "default_max_outbound_event_bytes")]
+    pub max_outbound_event_bytes: usize,
     /// Delay between transactional logical heartbeat messages.
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
@@ -186,6 +195,12 @@ impl Config {
                 path: path.display().to_string(),
                 reason: error.to_string(),
             })?;
+        config
+            .validate_runtime()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
         Ok(config)
     }
 
@@ -197,6 +212,112 @@ impl Config {
     /// Compiles the union of tables required by every configured durable stream.
     pub fn capture_plan(&self) -> std::result::Result<CapturePlan, CapturePlanError> {
         CapturePlan::from_streams(&self.source.name, &self.streams)
+    }
+
+    /// Rejects zero, contradictory, and ineffectively large runtime settings.
+    pub fn validate_runtime(&self) -> std::result::Result<(), String> {
+        let runtime = &self.runtime;
+        let positive = [
+            ("runtime.channel_capacity", runtime.channel_capacity as u128),
+            (
+                "runtime.shutdown_timeout_ms",
+                runtime.shutdown_timeout_ms as u128,
+            ),
+            (
+                "runtime.max_active_subscriptions",
+                runtime.max_active_subscriptions as u128,
+            ),
+            (
+                "runtime.max_consumer_name_bytes",
+                runtime.max_consumer_name_bytes as u128,
+            ),
+            (
+                "runtime.max_outbound_event_bytes",
+                runtime.max_outbound_event_bytes as u128,
+            ),
+            (
+                "runtime.heartbeat_interval_ms",
+                runtime.heartbeat_interval_ms as u128,
+            ),
+            (
+                "runtime.transaction_memory_threshold_bytes",
+                runtime.transaction_memory_threshold_bytes as u128,
+            ),
+            (
+                "runtime.max_transaction_bytes",
+                runtime.max_transaction_bytes as u128,
+            ),
+            (
+                "runtime.max_transaction_events",
+                runtime.max_transaction_events as u128,
+            ),
+            (
+                "runtime.capture_batch_max_transactions",
+                runtime.capture_batch_max_transactions as u128,
+            ),
+            (
+                "runtime.capture_batch_max_events",
+                runtime.capture_batch_max_events as u128,
+            ),
+            (
+                "runtime.capture_batch_max_bytes",
+                runtime.capture_batch_max_bytes as u128,
+            ),
+            (
+                "runtime.capture_batch_max_delay_ms",
+                runtime.capture_batch_max_delay_ms as u128,
+            ),
+            (
+                "runtime.segment_max_events",
+                runtime.segment_max_events as u128,
+            ),
+            (
+                "runtime.segment_max_bytes",
+                runtime.segment_max_bytes as u128,
+            ),
+            (
+                "runtime.segment_max_age_seconds",
+                runtime.segment_max_age_seconds as u128,
+            ),
+            (
+                "runtime.retention_check_interval_ms",
+                runtime.retention_check_interval_ms as u128,
+            ),
+            (
+                "runtime.retention_delete_batch_size",
+                runtime.retention_delete_batch_size as u128,
+            ),
+        ];
+        if let Some((name, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
+            return Err(format!("{name} must be greater than zero"));
+        }
+        if runtime.channel_capacity > 65_536 {
+            return Err("runtime.channel_capacity must not exceed 65536".to_owned());
+        }
+        if runtime.max_active_subscriptions > 100_000 {
+            return Err("runtime.max_active_subscriptions must not exceed 100000".to_owned());
+        }
+        if runtime.max_consumer_name_bytes > 1_024 {
+            return Err("runtime.max_consumer_name_bytes must not exceed 1024".to_owned());
+        }
+        if runtime.transaction_memory_threshold_bytes > runtime.max_transaction_bytes {
+            return Err(
+                "runtime.transaction_memory_threshold_bytes must not exceed runtime.max_transaction_bytes"
+                    .to_owned(),
+            );
+        }
+        for (name, limit) in [
+            ("runtime.retention_max_events", runtime.retention_max_events),
+            (
+                "runtime.retention_max_age_seconds",
+                runtime.retention_max_age_seconds,
+            ),
+        ] {
+            if limit == Some(0) {
+                return Err(format!("{name} must be greater than zero when configured"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -392,6 +513,18 @@ fn default_heartbeat_interval_ms() -> u64 {
     10_000
 }
 
+fn default_max_active_subscriptions() -> usize {
+    1_024
+}
+
+fn default_max_consumer_name_bytes() -> usize {
+    128
+}
+
+fn default_max_outbound_event_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
 fn default_max_transaction_bytes() -> u64 {
     1024 * 1024 * 1024
 }
@@ -471,6 +604,9 @@ mod tests {
             config.runtime.transaction_memory_threshold_bytes,
             16 * 1024 * 1024
         );
+        assert_eq!(config.runtime.max_active_subscriptions, 1_024);
+        assert_eq!(config.runtime.max_consumer_name_bytes, 128);
+        assert_eq!(config.runtime.max_outbound_event_bytes, 16 * 1024 * 1024);
         assert_eq!(config.runtime.heartbeat_interval_ms, 10_000);
         assert_eq!(config.runtime.max_transaction_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.runtime.max_transaction_events, 1_000_000);
@@ -588,6 +724,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn runtime_validation_rejects_zero_and_contradictory_limits() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        config.runtime.channel_capacity = 0;
+        assert_eq!(
+            config.validate_runtime(),
+            Err("runtime.channel_capacity must be greater than zero".to_owned())
+        );
+
+        config.runtime.channel_capacity = 32;
+        config.runtime.transaction_memory_threshold_bytes = 2_000;
+        config.runtime.max_transaction_bytes = 1_000;
+        assert!(
+            config
+                .validate_runtime()
+                .expect_err("contradictory transaction limits")
+                .contains("must not exceed")
+        );
+    }
+
     fn config_with_streams(streams: Vec<StreamConfig>) -> Config {
         Config {
             source: super::SourceConfig {
@@ -605,6 +765,9 @@ mod tests {
                 storage_file: "events.redb".to_owned(),
                 channel_capacity: 32,
                 shutdown_timeout_ms: 1_000,
+                max_active_subscriptions: 1_024,
+                max_consumer_name_bytes: 128,
+                max_outbound_event_bytes: 16 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,
                 transaction_memory_threshold_bytes: 16 * 1024 * 1024,
                 max_transaction_bytes: 1024 * 1024 * 1024,

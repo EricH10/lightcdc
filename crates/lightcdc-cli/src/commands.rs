@@ -4,9 +4,15 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use lightcdc_core::{ChangeEvent, Config, StreamConfig};
+use lightcdc_runtime::{
+    CaptureStorageWriter, RuntimeState, runtime_state_channel, shutdown_channel,
+};
 use lightcdc_storage::RedbEventStore;
 
 use crate::{
+    capture::{
+        await_server_shutdown, close_storage_writer, process_shutdown_signal, shutdown_timeout,
+    },
     display::{event_to_json, human_bytes, operation_name, print_table},
     logging::init_logging,
     store::{open_event_store, storage_options},
@@ -241,10 +247,36 @@ pub(crate) async fn serve(config_path: PathBuf, addr: SocketAddr) -> anyhow::Res
 
     init_logging(&config.logging.level)?;
 
+    let timeout = shutdown_timeout(&config)?;
     let store = open_event_store(&config)?;
+    let writer = CaptureStorageWriter::start(store.clone(), config.source.name.clone())?;
+    let (state, state_rx) = runtime_state_channel();
+    state.transition(RuntimeState::Capturing, None);
+    let (shutdown, shutdown_rx) = shutdown_channel();
+    let mut server = tokio::spawn(lightcdc_api::serve_with_runtime(
+        addr,
+        config,
+        store,
+        lightcdc_api::EventNotifier::new(),
+        writer.handle(),
+        state_rx,
+        shutdown_rx,
+    ));
 
-    lightcdc_api::serve(addr, config, store).await?;
-    Ok(())
+    let outcome = tokio::select! {
+        result = &mut server => match result {
+            Ok(Ok(())) => Err(anyhow::anyhow!("gRPC server stopped unexpectedly")),
+            Ok(Err(error)) => Err(error).context("gRPC server failed"),
+            Err(error) => Err(error).context("gRPC server task failed"),
+        },
+        () = process_shutdown_signal() => {
+            state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
+            shutdown.trigger();
+            await_server_shutdown(&mut server, timeout).await
+        }
+    };
+    close_storage_writer(writer, timeout).await?;
+    outcome
 }
 
 #[cfg(test)]

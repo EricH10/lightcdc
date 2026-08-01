@@ -1,12 +1,14 @@
 use std::{
     env,
     fs::File,
+    net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use lightcdc_api::proto::{SubscribeRequest, light_cdc_client::LightCdcClient};
 use lightcdc_core::{ChangeEvent, Config, Operation, SourceConfig};
 use lightcdc_postgres::{ReplicationReader, validate_source_config_with_plan};
 use lightcdc_storage::{
@@ -696,6 +698,70 @@ async fn capture_reconnects_after_postgres_terminates_replication_backend() -> a
         "after-reconnect@example.com",
     )?;
 
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn combined_runtime_drains_a_live_subscription_on_sigterm() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+    let mut runtime = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lightcdc"))
+            .args([
+                "run",
+                "--config",
+                config_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("test config path is not UTF-8"))?,
+                "--addr",
+                &addr.to_string(),
+                "--output",
+                "none",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    fixture.wait_for_replication_pid(None).await?;
+    let mut client = timeout(Duration::from_secs(15), async {
+        loop {
+            match LightCdcClient::connect(format!("http://{addr}")).await {
+                Ok(client) => return client,
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await?;
+    let mut subscription = client
+        .subscribe(SubscribeRequest {
+            stream: "orders".to_owned(),
+            consumer: "shutdown-test".to_owned(),
+            limit: 0,
+        })
+        .await?
+        .into_inner();
+
+    runtime.terminate()?;
+    assert!(
+        timeout(Duration::from_secs(5), subscription.message())
+            .await??
+            .is_none(),
+        "graceful shutdown should close the consumer stream"
+    );
+    let status = runtime.wait_for_exit().await?;
+    assert!(status.success(), "SIGTERM should produce a clean exit");
+
+    let store = open_store(temp.path().to_path_buf())?;
+    assert!(store.source_identity(&fixture.source_name)?.is_some());
     drop(store);
     fixture.cleanup().await?;
     Ok(())
@@ -1448,6 +1514,21 @@ impl ChildGuard {
         if let Some(mut child) = self.child.take() {
             child.kill()?;
             child.wait()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn terminate(&self) -> anyhow::Result<()> {
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("child process is no longer available"))?;
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("failed to send SIGTERM to child {}", child.id());
         }
         Ok(())
     }

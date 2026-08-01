@@ -69,8 +69,10 @@ them has optional work remaining.
 - Shut down on SIGINT and SIGTERM at a known durability boundary: stop accepting
   new work, finish or replay the current source transaction, resolve the
   in-flight redb write, acknowledge only durable LSNs, drain or close gRPC
-  streams, and honor a tested timeout. The existing `shutdown_timeout_ms`
-  setting is not yet wired into this lifecycle.
+  streams, and honor a tested timeout. DONE: capture cancellation leaves the
+  partially decoded transaction unacknowledged for replay, the redb writer
+  resolves accepted work, gRPC streams drain, and the combined runtime has a
+  SIGTERM process test. `shutdown_timeout_ms` bounds server and writer drain.
 - Define and test backup and restore for the redb store together with PostgreSQL
   slot state. Document the no-loss boundary, recovery point objective, recovery
   time objective, and what happens when local storage is permanently lost.
@@ -83,13 +85,17 @@ them has optional work remaining.
 - Classify storage and retention failures as healthy, degraded, retryable, or
   terminal instead of logging every retention failure and retrying forever.
 - Move consumer replay, ACK, and seek storage operations off Tokio worker
-  threads. The dedicated storage thread currently covers capture and retention
-  writes only.
+  threads. PARTIAL: capture, retention, ACK, and seek mutations share the
+  dedicated storage thread; replay reads still need a bounded reader pool.
 - Bound active subscriptions, per-connection buffers, request and consumer-name
   sizes, outbound event sizes, and total memory. Validate every configured
   numeric limit and reject zero, contradictory, or ineffective settings.
+  PARTIAL: active subscriptions, per-subscription channels, consumer names, and
+  outbound events are bounded; transport request limits and aggregate replay
+  memory remain.
 - Remove or implement inert configuration fields such as `channel_capacity`;
   production configuration must not appear to control behavior that ignores it.
+  DONE: `channel_capacity` controls each subscription's outbound queue.
 
 ### Security and API Safety
 
@@ -102,22 +108,27 @@ them has optional work remaining.
   avoid requiring plaintext secrets in the main TOML file.
 - Sanitize external gRPC errors so storage paths, database details, and internal
   failures are logged server-side without being returned to untrusted clients.
+  DONE for internal storage failures.
 - Default production capture output to no event payloads so row data is not
   accidentally written to logs and capture throughput is not silently reduced.
+  DONE; JSON output requires explicit CLI opt-in.
 - Document a least-privilege PostgreSQL role and test it in integration tests.
 
 ### Operations, Releases, and Support
 
 - Expose the standard gRPC health service and separate liveness from readiness.
   Readiness must reflect capture state, storage writability, source continuity,
-  and whether serving retained events is still safe.
+  and whether serving retained events is still safe. PARTIAL: standard named
+  liveness/readiness services reflect lifecycle and source reconnect state;
+  explicit disk-pressure and integrity signals remain.
 - Export low-overhead production metrics for source LSN and WAL lag, capture
   rate, redb latency, retention lag, consumer lag, reconnects, subscription
   pressure, disk and staging usage, and terminal state. Define actionable alert
   thresholds and do not rely on benchmark-only JSONL metrics.
 - Add structured runtime states and stable exit behavior so supervisors can
   distinguish starting, capturing, retrying, degraded, draining, and terminal
-  configuration or data-loss failures.
+  configuration or data-loss failures. PARTIAL: shared states now drive health
+  and clean/terminal exits; production metrics still need state transitions.
 - Provide a production container or release binaries that run as a non-root
   user, use a persistent volume, handle signals, expose health checks, and pin
   supported Rust, OS, architecture, PostgreSQL, and redb versions.
@@ -243,14 +254,16 @@ a bulk migration without accidental data loss or unbounded memory and disk use.
   IMPLEMENTED by the retrying capture supervisor and independent gRPC task;
   direct combined-runtime integration coverage remains.
 - Track runtime states such as starting, capturing, retrying, and failed.
-- Add graceful shutdown at a known durability boundary.
+  DONE, including draining and degraded states.
+- Add graceful shutdown at a known durability boundary. DONE.
 
 Complete when temporary PostgreSQL and network outages recover without operator
 intervention.
 
 ## Milestone 4: Health and Observability
 
-- Add gRPC health and readiness reporting.
+- Add gRPC health and readiness reporting. DONE for lifecycle/source state;
+  disk and detailed lag readiness remain.
 - Report PostgreSQL connection state and reconnect count.
 - Report received, persisted, and acknowledged positions.
 - Report slot `confirmed_flush_lsn`, retained WAL bytes, `wal_status`,

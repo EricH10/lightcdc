@@ -7,11 +7,15 @@ use std::{
 };
 
 use lightcdc_core::{ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
-use lightcdc_runtime::{CaptureStorageHandle, CaptureStorageWriter};
+use lightcdc_runtime::{
+    CaptureStorageHandle, CaptureStorageWriter, RuntimeState, RuntimeStateReceiver, ShutdownHandle,
+    ShutdownReceiver, runtime_state_channel, shutdown_channel,
+};
 use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
+use tonic_health::ServingStatus;
 use tracing::{info, warn};
 
 /// Contains Rust types generated from the lightcdc protobuf contract.
@@ -36,6 +40,10 @@ pub struct LightCdcService {
     storage_writer: CaptureStorageHandle,
     /// Keeps the writer thread alive when the service was constructed standalone.
     _storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+    /// Stops long-lived subscription workers during graceful server shutdown.
+    shutdown: ShutdownReceiver,
+    /// Keeps standalone shutdown channels open when no external owner exists.
+    _shutdown_owner: Option<ShutdownHandle>,
     event_notifier: EventNotifier,
     /// Prevents two workers from advancing the same consumer concurrently.
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
@@ -100,6 +108,7 @@ impl LightCdcService {
         store: RedbEventStore,
         event_notifier: EventNotifier,
     ) -> Self {
+        let (shutdown_owner, shutdown) = shutdown_channel();
         let storage_writer_owner = Arc::new(
             CaptureStorageWriter::start(store.clone(), config.source.name.clone())
                 .expect("failed to start the gRPC storage writer"),
@@ -111,6 +120,8 @@ impl LightCdcService {
             event_notifier,
             storage_writer,
             Some(storage_writer_owner),
+            shutdown,
+            Some(shutdown_owner),
         )
     }
 
@@ -121,7 +132,35 @@ impl LightCdcService {
         event_notifier: EventNotifier,
         storage_writer: CaptureStorageHandle,
     ) -> Self {
-        Self::from_parts(config, store, event_notifier, storage_writer, None)
+        let (shutdown_owner, shutdown) = shutdown_channel();
+        Self::from_parts(
+            config,
+            store,
+            event_notifier,
+            storage_writer,
+            None,
+            shutdown,
+            Some(shutdown_owner),
+        )
+    }
+
+    /// Creates a service sharing capture storage and coordinated shutdown.
+    pub fn new_with_runtime(
+        config: Config,
+        store: RedbEventStore,
+        event_notifier: EventNotifier,
+        storage_writer: CaptureStorageHandle,
+        shutdown: ShutdownReceiver,
+    ) -> Self {
+        Self::from_parts(
+            config,
+            store,
+            event_notifier,
+            storage_writer,
+            None,
+            shutdown,
+            None,
+        )
     }
 
     fn from_parts(
@@ -130,12 +169,16 @@ impl LightCdcService {
         event_notifier: EventNotifier,
         storage_writer: CaptureStorageHandle,
         storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+        shutdown: ShutdownReceiver,
+        shutdown_owner: Option<ShutdownHandle>,
     ) -> Self {
         Self {
             config: Arc::new(config),
             store: Arc::new(store),
             storage_writer,
             _storage_writer_owner: storage_writer_owner,
+            shutdown,
+            _shutdown_owner: shutdown_owner,
             event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -150,7 +193,10 @@ pub async fn serve(
     store: RedbEventStore,
 ) -> Result<(), tonic::transport::Error> {
     let service = LightCdcService::new(config, store);
-    serve_service(addr, service).await
+    let (state, state_rx) = runtime_state_channel();
+    state.transition(RuntimeState::Capturing, None);
+    let (_shutdown, shutdown_rx) = shutdown_channel();
+    serve_service(addr, service, state_rx, shutdown_rx).await
 }
 
 /// Runs the gRPC server with notifications from an in-process capture loop.
@@ -163,19 +209,95 @@ pub async fn serve_with_notifier(
 ) -> Result<(), tonic::transport::Error> {
     let service =
         LightCdcService::new_with_storage_writer(config, store, event_notifier, storage_writer);
-    serve_service(addr, service).await
+    let (state, state_rx) = runtime_state_channel();
+    state.transition(RuntimeState::Capturing, None);
+    let (_shutdown, shutdown_rx) = shutdown_channel();
+    serve_service(addr, service, state_rx, shutdown_rx).await
+}
+
+/// Runs gRPC with externally coordinated runtime state and graceful shutdown.
+pub async fn serve_with_runtime(
+    addr: SocketAddr,
+    config: Config,
+    store: RedbEventStore,
+    event_notifier: EventNotifier,
+    storage_writer: CaptureStorageHandle,
+    state: RuntimeStateReceiver,
+    shutdown: ShutdownReceiver,
+) -> Result<(), tonic::transport::Error> {
+    let service = LightCdcService::new_with_runtime(
+        config,
+        store,
+        event_notifier,
+        storage_writer,
+        shutdown.clone(),
+    );
+    serve_service(addr, service, state, shutdown).await
 }
 
 /// Registers an already-built service with tonic and listens on the address.
 async fn serve_service(
     addr: SocketAddr,
     service: LightCdcService,
+    state: RuntimeStateReceiver,
+    mut shutdown: ShutdownReceiver,
 ) -> Result<(), tonic::transport::Error> {
     info!(%addr, "starting lightcdc gRPC server");
-    Server::builder()
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    let health_task = tokio::spawn(report_health(health_reporter, state, shutdown.clone()));
+    let result = Server::builder()
+        .add_service(health_service)
         .add_service(LightCdcServer::new(service))
-        .serve(addr)
-        .await
+        .serve_with_shutdown(addr, async move { shutdown.cancelled().await })
+        .await;
+    health_task.abort();
+    let _ = health_task.await;
+    result
+}
+
+const LIVENESS_SERVICE: &str = "lightcdc.liveness";
+const READINESS_SERVICE: &str = "lightcdc.readiness";
+
+/// Maps runtime lifecycle transitions onto the standard gRPC health protocol.
+async fn report_health(
+    reporter: tonic_health::server::HealthReporter,
+    mut state: RuntimeStateReceiver,
+    mut shutdown: ShutdownReceiver,
+) {
+    reporter
+        .set_service_status(LIVENESS_SERVICE, ServingStatus::Serving)
+        .await;
+    loop {
+        let status = state.current();
+        let serving = if status.state == RuntimeState::Capturing {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        reporter
+            .set_service_status(READINESS_SERVICE, serving)
+            .await;
+        reporter
+            .set_service_status("lightcdc.v1.LightCdc", serving)
+            .await;
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                reporter
+                    .set_service_status(READINESS_SERVICE, ServingStatus::NotServing)
+                    .await;
+                reporter
+                    .set_service_status("lightcdc.v1.LightCdc", ServingStatus::NotServing)
+                    .await;
+                return;
+            }
+            changed = state.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -188,7 +310,10 @@ impl LightCdc for LightCdcService {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let request = request.into_inner();
-        let consumer = validate_consumer(&request.consumer)?;
+        let consumer = validate_consumer(
+            &request.consumer,
+            self.config.runtime.max_consumer_name_bytes,
+        )?;
         let stream = self.stream(&request.stream)?;
         let subscription = self.claim_subscription(&stream.name, consumer)?;
         let stored_offset = self
@@ -200,11 +325,13 @@ impl LightCdc for LightCdcService {
             None => earliest_retained_offset(&self.store).map_err(internal)?,
         };
         let limit = request.limit as usize;
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(self.config.runtime.channel_capacity);
         let store = Arc::clone(&self.store);
         let mut event_notifications = self.event_notifier.subscribe();
         let delivery_key = (stream.name.clone(), consumer.to_owned());
         let delivery_high_watermarks = Arc::clone(&self.delivery_high_watermarks);
+        let mut shutdown = self.shutdown.clone();
+        let max_outbound_event_bytes = self.config.runtime.max_outbound_event_bytes;
 
         // This worker owns cloned state because it can outlive the subscribe RPC.
         tokio::spawn(async move {
@@ -213,6 +340,9 @@ impl LightCdc for LightCdcService {
             let mut emitted = 0usize;
 
             loop {
+                if shutdown.is_triggered() {
+                    return;
+                }
                 let batch = match store.replay_from(next_sequence, 256) {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -224,6 +354,7 @@ impl LightCdc for LightCdcService {
                 if batch.is_empty() {
                     tokio::select! {
                         _ = tx.closed() => return,
+                        _ = shutdown.cancelled() => return,
                         result = event_notifications.changed() => {
                             if result.is_err() {
                                 return;
@@ -238,10 +369,21 @@ impl LightCdc for LightCdcService {
                     if !stream.matches_event(&event) {
                         continue;
                     }
+                    if event_encoded_size(&event) > max_outbound_event_bytes {
+                        let _ = tx
+                            .send(Err(Status::resource_exhausted(
+                                "event exceeds configured outbound size limit",
+                            )))
+                            .await;
+                        return;
+                    }
 
-                    let permit = match tx.reserve().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
+                    let permit = tokio::select! {
+                        result = tx.reserve() => match result {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        },
+                        _ = shutdown.cancelled() => return,
                     };
                     record_delivery(&delivery_high_watermarks, &delivery_key, event.sequence);
                     permit.send(Ok(event.into()));
@@ -260,7 +402,10 @@ impl LightCdc for LightCdcService {
     /// Saves the last event sequence successfully handled by a consumer.
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
         let request = request.into_inner();
-        let consumer = validate_consumer(&request.consumer)?;
+        let consumer = validate_consumer(
+            &request.consumer,
+            self.config.runtime.max_consumer_name_bytes,
+        )?;
         let stream = self.stream(&request.stream)?;
         let key = (stream.name.clone(), consumer.to_owned());
         let highest_delivered = delivery_high_watermarks(&self.delivery_high_watermarks)
@@ -293,7 +438,10 @@ impl LightCdc for LightCdcService {
     /// Moves a consumer offset to earliest, latest, or an absolute sequence.
     async fn seek(&self, request: Request<SeekRequest>) -> Result<Response<SeekResponse>, Status> {
         let request = request.into_inner();
-        let consumer = validate_consumer(&request.consumer)?;
+        let consumer = validate_consumer(
+            &request.consumer,
+            self.config.runtime.max_consumer_name_bytes,
+        )?;
         let stream = self.stream(&request.stream)?;
         let position =
             SeekPosition::try_from(request.position).unwrap_or(SeekPosition::Unspecified);
@@ -335,6 +483,12 @@ impl LightCdcService {
                 "consumer {consumer:?} already has an active subscription to stream {stream:?}"
             )));
         }
+        if active.len() > self.config.runtime.max_active_subscriptions {
+            active.remove(&key);
+            return Err(Status::resource_exhausted(
+                "active subscription limit reached",
+            ));
+        }
         drop(active);
 
         Ok(ActiveSubscription {
@@ -347,6 +501,9 @@ impl LightCdcService {
     fn stream(&self, name: &str) -> Result<StreamConfig, Status> {
         if name.is_empty() {
             return Err(Status::invalid_argument("stream name is required"));
+        }
+        if name.len() > 128 {
+            return Err(Status::invalid_argument("stream name exceeds 128 bytes"));
         }
 
         self.config
@@ -396,12 +553,31 @@ fn operation_to_proto(operation: Operation) -> i32 {
 }
 
 /// Validates that a consumer name was provided.
-fn validate_consumer(consumer: &str) -> Result<&str, Status> {
+fn validate_consumer(consumer: &str, max_bytes: usize) -> Result<&str, Status> {
     if consumer.is_empty() {
         Err(Status::invalid_argument("consumer name is required"))
+    } else if consumer.len() > max_bytes {
+        Err(Status::invalid_argument(format!(
+            "consumer name exceeds configured {max_bytes}-byte limit"
+        )))
     } else {
         Ok(consumer)
     }
+}
+
+/// Estimates encoded event memory before cloning it into the protobuf response.
+fn event_encoded_size(event: &CoreChangeEvent) -> usize {
+    event
+        .event_id
+        .len()
+        .saturating_add(event.schema.len())
+        .saturating_add(event.table.len())
+        .saturating_add(event.source.database.len())
+        .saturating_add(event.source.slot.len())
+        .saturating_add(event.source.lsn.len())
+        .saturating_add(event.key.as_ref().map_or(0, Vec::len))
+        .saturating_add(event.before.as_ref().map_or(0, Vec::len))
+        .saturating_add(event.after.as_ref().map_or(0, Vec::len))
 }
 
 /// Recovers the active-subscription set if another task panicked while holding it.
@@ -460,7 +636,7 @@ fn replay_status(error: StorageError) -> Status {
 fn internal(error: impl ToString) -> Status {
     let message = error.to_string();
     warn!(error = %message, "gRPC request failed");
-    Status::internal(message)
+    Status::internal("internal service error")
 }
 
 #[cfg(test)]
@@ -475,6 +651,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
+    use tonic_health::pb::{HealthCheckRequest, health_server::Health};
 
     use super::*;
 
@@ -534,6 +711,109 @@ mod tests {
             .expect("stream item")
             .expect("change event");
         assert_eq!(delivered.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_a_waiting_subscription() {
+        let service = service_with_events(&[]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+
+        service
+            ._shutdown_owner
+            .as_ref()
+            .expect("standalone shutdown owner")
+            .trigger();
+
+        assert!(
+            timeout(Duration::from_secs(1), subscription.next())
+                .await
+                .expect("subscription shutdown")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_names_counts_and_event_sizes_are_bounded() {
+        let mut service = service_with_events(&[event(1, "public", "orders")]);
+        let config = Arc::get_mut(&mut service.service.config).expect("unique test config");
+        config.runtime.max_consumer_name_bytes = 3;
+        config.runtime.max_active_subscriptions = 1;
+        config.runtime.max_outbound_event_bytes = 1;
+
+        let name_error = service
+            .subscribe(Request::new(subscription("long", 0)))
+            .await
+            .expect_err("long consumer name");
+        assert_eq!(name_error.code(), tonic::Code::InvalidArgument);
+
+        let mut first = service
+            .subscribe(Request::new(subscription("one", 0)))
+            .await
+            .expect("first subscription")
+            .into_inner();
+        let oversized = first
+            .next()
+            .await
+            .expect("oversized event status")
+            .expect_err("event should exceed outbound limit");
+        assert_eq!(oversized.code(), tonic::Code::ResourceExhausted);
+        wait_for_subscription_release(&service, "one").await;
+
+        config_for_service(&mut service)
+            .runtime
+            .max_outbound_event_bytes = 1024;
+        let _active = service
+            .subscribe(Request::new(subscription("one", 0)))
+            .await
+            .expect("active subscription");
+        let limit_error = service
+            .subscribe(Request::new(subscription("two", 0)))
+            .await
+            .expect_err("subscription count limit");
+        assert_eq!(limit_error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn health_separates_liveness_from_capture_readiness() {
+        let (state, state_rx) = runtime_state_channel();
+        let (shutdown, shutdown_rx) = shutdown_channel();
+        let reporter = tonic_health::server::HealthReporter::new();
+        let health = tonic_health::server::HealthService::from_health_reporter(reporter.clone());
+        let task = tokio::spawn(report_health(reporter, state_rx, shutdown_rx));
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            health_status(&health, LIVENESS_SERVICE).await,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+        );
+        assert_eq!(
+            health_status(&health, READINESS_SERVICE).await,
+            tonic_health::pb::health_check_response::ServingStatus::NotServing as i32
+        );
+
+        state.transition(RuntimeState::Capturing, None);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            health_status(&health, READINESS_SERVICE).await,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+        );
+
+        shutdown.trigger();
+        task.await.expect("health task");
+        assert_eq!(
+            health_status(&health, READINESS_SERVICE).await,
+            tonic_health::pb::health_check_response::ServingStatus::NotServing as i32
+        );
+    }
+
+    #[test]
+    fn internal_status_does_not_expose_private_error_details() {
+        let status = internal("/private/path/events.redb failed");
+        assert_eq!(status.message(), "internal service error");
     }
 
     #[tokio::test]
@@ -993,6 +1273,21 @@ mod tests {
         .expect("subscription task should stop after client disconnects");
     }
 
+    async fn health_status<H: Health>(health: &H, service: &str) -> i32 {
+        health
+            .check(Request::new(HealthCheckRequest {
+                service: service.to_owned(),
+            }))
+            .await
+            .expect("health response")
+            .into_inner()
+            .status
+    }
+
+    fn config_for_service(service: &mut TestService) -> &mut Config {
+        Arc::get_mut(&mut service.service.config).expect("unique test config")
+    }
+
     fn config() -> Config {
         Config {
             source: SourceConfig {
@@ -1010,6 +1305,9 @@ mod tests {
                 storage_file: "lightcdc.redb".to_owned(),
                 channel_capacity: 1024,
                 shutdown_timeout_ms: 10000,
+                max_active_subscriptions: 1_024,
+                max_consumer_name_bytes: 128,
+                max_outbound_event_bytes: 16 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,
                 transaction_memory_threshold_bytes: 16 * 1024 * 1024,
                 max_transaction_bytes: 1024 * 1024 * 1024,

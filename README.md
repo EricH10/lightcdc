@@ -36,6 +36,9 @@ Run the CLI:
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
 ```
 
+Capture does not print row payloads by default. Add `--output json` only for
+local debugging when stdout is approved to contain source data.
+
 For a bounded local smoke test:
 
 ```bash
@@ -68,6 +71,21 @@ heartbeat_interval_ms = 10000
 Heartbeat transactions persist only the source checkpoint and do not create
 consumer events. Changing a stream's tables affects future capture only;
 historical rows and changes require a snapshot or backfill.
+
+Consumer resource limits are validated at startup and applied by the gRPC
+service:
+
+```toml
+channel_capacity = 1024
+max_active_subscriptions = 1024
+max_consumer_name_bytes = 128
+max_outbound_event_bytes = 16777216
+shutdown_timeout_ms = 10000
+```
+
+`channel_capacity` is the bounded per-subscription event queue. An oversized
+event or exhausted subscription limit returns `RESOURCE_EXHAUSTED` without
+advancing the consumer offset.
 
 Transaction buffering is bounded by three `[runtime]` settings:
 
@@ -180,6 +198,12 @@ cargo run -p lightcdc-cli -- serve --config lightcdc.example.toml --addr 127.0.0
 Use `serve` when capture is not running. For live capture plus streaming
 consumers, use `run` so both paths share one segmented store inside the same
 process.
+
+The server implements the standard gRPC health protocol. Check
+`lightcdc.liveness` for process liveness and `lightcdc.readiness` for capture
+readiness. Readiness is serving only in the `capturing` state; startup,
+PostgreSQL reconnect, draining, and terminal states report not serving while
+retained-event APIs remain available until shutdown begins.
 
 Run an example gRPC consumer that prints and acks events:
 

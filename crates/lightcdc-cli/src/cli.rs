@@ -25,7 +25,7 @@ pub(crate) enum Command {
         #[arg(long, alias = "max-events")]
         stop_after_events: Option<usize>,
 
-        #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
+        #[arg(long, value_enum, default_value_t = CaptureOutput::None)]
         output: CaptureOutput,
 
         #[arg(long)]
@@ -47,7 +47,7 @@ pub(crate) enum Command {
         #[arg(long, alias = "max-events")]
         stop_after_events: Option<usize>,
 
-        #[arg(long, value_enum, default_value_t = CaptureOutput::Json)]
+        #[arg(long, value_enum, default_value_t = CaptureOutput::None)]
         output: CaptureOutput,
 
         #[arg(long)]
@@ -98,7 +98,7 @@ pub(crate) enum Command {
 }
 
 /// Controls whether capture writes each durable event to standard output.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum CaptureOutput {
     Json,
     None,
@@ -112,4 +112,30 @@ pub(crate) struct CaptureOptions {
     pub(crate) output: CaptureOutput,
     pub(crate) metrics_file: Option<PathBuf>,
     pub(crate) metrics_interval: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_and_run_default_to_no_payload_output() {
+        let capture = Cli::try_parse_from(["lightcdc", "capture"]).expect("capture CLI");
+        let run = Cli::try_parse_from(["lightcdc", "run"]).expect("run CLI");
+
+        assert!(matches!(
+            capture.command,
+            Command::Capture {
+                output: CaptureOutput::None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            run.command,
+            Command::Run {
+                output: CaptureOutput::None,
+                ..
+            }
+        ));
+    }
 }
