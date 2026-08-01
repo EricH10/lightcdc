@@ -375,7 +375,17 @@ impl RedbEventStore {
         sequence: u64,
         limit: usize,
     ) -> Result<Vec<ChangeEvent>, StorageError> {
-        self.inner.replay_from(sequence, limit)
+        self.inner.replay_from(sequence, limit, u64::MAX)
+    }
+
+    /// Replays an event-count and serialized-byte bounded batch.
+    pub fn replay_from_bounded(
+        &self,
+        sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> Result<Vec<ChangeEvent>, StorageError> {
+        self.inner.replay_from(sequence, max_events, max_bytes)
     }
 
     /// Removes whole sealed segment files that exceed retention boundaries.
@@ -712,6 +722,24 @@ mod tests {
 
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].sequence, 1);
+    }
+
+    #[test]
+    fn replay_byte_limit_returns_at_least_one_event_and_bounds_the_rest() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+        store.append_event(&event(1, "0/1")).expect("first event");
+        store.append_event(&event(2, "0/2")).expect("second event");
+
+        let batch = store
+            .replay_from_bounded(1, 10, 1)
+            .expect("byte-bounded replay");
+
+        assert_eq!(batch, [event(1, "0/1")]);
     }
 
     #[test]

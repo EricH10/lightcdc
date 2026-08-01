@@ -15,12 +15,13 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use lightcdc_core::ChangeEvent;
 use lightcdc_postgres::CapturedTransaction;
 use lightcdc_storage::{
     PersistTransactionOutcome, RedbEventStore, RetentionOutcome, RetentionPolicy,
     SourceTransaction, StorageError,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 const STORAGE_COMMAND_CAPACITY: usize = 1;
@@ -131,6 +132,40 @@ pub struct CaptureStorageHandle {
     sender: mpsc::Sender<StorageCommand>,
 }
 
+/// Owns a fixed set of OS threads used for synchronous replay reads.
+pub struct StorageReaderPool {
+    handle: Option<StorageReaderHandle>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+/// Submits bounded storage reads without blocking a Tokio worker.
+#[derive(Clone)]
+pub struct StorageReaderHandle {
+    sender: flume::Sender<StorageReadCommand>,
+    replay_permits: std::sync::Arc<Semaphore>,
+}
+
+/// Keeps one byte-bounded replay response inside the pool's aggregate limit.
+pub struct ReplayBatch {
+    events: Vec<ChangeEvent>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ReplayBatch {
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+impl IntoIterator for ReplayBatch {
+    type Item = ChangeEvent;
+    type IntoIter = std::vec::IntoIter<ChangeEvent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.into_iter()
+    }
+}
+
 /// Tracks one submitted batch until its redb result is available.
 pub struct PendingCaptureWrite {
     pub response: oneshot::Receiver<StorageCompletion>,
@@ -174,6 +209,184 @@ enum StorageCommand {
         offset: u64,
         response: oneshot::Sender<Result<(), StorageError>>,
     },
+}
+
+enum StorageReadCommand {
+    ReplayFrom {
+        sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+        response: oneshot::Sender<Result<Vec<ChangeEvent>, StorageError>>,
+    },
+    FirstSequence {
+        response: oneshot::Sender<Result<Option<u64>, StorageError>>,
+    },
+    LastSequence {
+        response: oneshot::Sender<Result<Option<u64>, StorageError>>,
+    },
+    ConsumerOffset {
+        stream_name: String,
+        consumer_name: String,
+        response: oneshot::Sender<Result<Option<u64>, StorageError>>,
+    },
+    Shutdown,
+}
+
+impl StorageReaderPool {
+    /// Starts a fixed reader pool behind one bounded Tokio command queue.
+    pub fn start(
+        store: RedbEventStore,
+        worker_count: usize,
+        queue_capacity: usize,
+    ) -> anyhow::Result<Self> {
+        if worker_count == 0 || queue_capacity == 0 {
+            return Err(anyhow!(
+                "storage reader workers and queue capacity must be nonzero"
+            ));
+        }
+        let (sender, receiver) = flume::bounded(queue_capacity);
+        let replay_permits = std::sync::Arc::new(Semaphore::new(worker_count));
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let store = store.clone();
+            let receiver = receiver.clone();
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("lightcdc-redb-reader-{index}"))
+                    .spawn(move || {
+                        loop {
+                            let command = receiver.recv();
+                            let Ok(command) = command else {
+                                break;
+                            };
+                            if matches!(command, StorageReadCommand::Shutdown) {
+                                break;
+                            }
+                            execute_storage_read(&store, command);
+                        }
+                    })
+                    .context("failed to start redb reader thread")?,
+            );
+        }
+        Ok(Self {
+            handle: Some(StorageReaderHandle {
+                sender,
+                replay_permits,
+            }),
+            workers,
+        })
+    }
+
+    /// Clones the lightweight asynchronous command handle.
+    pub fn handle(&self) -> StorageReaderHandle {
+        self.handle
+            .as_ref()
+            .expect("storage reader pool is running")
+            .clone()
+    }
+}
+
+impl StorageReaderHandle {
+    pub async fn replay_from(
+        &self,
+        sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> anyhow::Result<ReplayBatch> {
+        let permit = std::sync::Arc::clone(&self.replay_permits)
+            .acquire_owned()
+            .await
+            .context("storage reader replay permits closed")?;
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send_async(StorageReadCommand::ReplayFrom {
+                sequence,
+                max_events,
+                max_bytes,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("storage reader pool stopped before accepting replay"))?;
+        let events = receiver
+            .await
+            .context("storage reader pool stopped before returning replay")?
+            .context("failed to replay events from redb")?;
+        Ok(ReplayBatch {
+            events,
+            _permit: permit,
+        })
+    }
+
+    pub async fn first_sequence(&self) -> anyhow::Result<Option<u64>> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send_async(StorageReadCommand::FirstSequence { response })
+            .await
+            .map_err(|_| anyhow!("storage reader pool stopped before accepting first sequence"))?;
+        receiver
+            .await
+            .context("storage reader pool stopped before returning first sequence")?
+            .context("failed to read first sequence from redb")
+    }
+
+    pub async fn last_sequence(&self) -> anyhow::Result<Option<u64>> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send_async(StorageReadCommand::LastSequence { response })
+            .await
+            .map_err(|_| anyhow!("storage reader pool stopped before accepting last sequence"))?;
+        receiver
+            .await
+            .context("storage reader pool stopped before returning last sequence")?
+            .context("failed to read last sequence from redb")
+    }
+
+    pub async fn consumer_offset(
+        &self,
+        stream_name: String,
+        consumer_name: String,
+    ) -> anyhow::Result<Option<u64>> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send_async(StorageReadCommand::ConsumerOffset {
+                stream_name,
+                consumer_name,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("storage reader pool stopped before accepting offset read"))?;
+        receiver
+            .await
+            .context("storage reader pool stopped before returning offset")?
+            .context("failed to read consumer offset from redb")
+    }
+}
+
+fn execute_storage_read(store: &RedbEventStore, command: StorageReadCommand) {
+    match command {
+        StorageReadCommand::ReplayFrom {
+            sequence,
+            max_events,
+            max_bytes,
+            response,
+        } => {
+            let _ = response.send(store.replay_from_bounded(sequence, max_events, max_bytes));
+        }
+        StorageReadCommand::FirstSequence { response } => {
+            let _ = response.send(store.first_sequence());
+        }
+        StorageReadCommand::LastSequence { response } => {
+            let _ = response.send(store.last_sequence());
+        }
+        StorageReadCommand::ConsumerOffset {
+            stream_name,
+            consumer_name,
+            response,
+        } => {
+            let _ = response.send(store.consumer_offset(&stream_name, &consumer_name));
+        }
+        StorageReadCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
+    }
 }
 
 impl CaptureStorageWriter {
@@ -491,6 +704,19 @@ impl Drop for CaptureStorageWriter {
     }
 }
 
+impl Drop for StorageReaderPool {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            for _ in 0..self.workers.len() {
+                let _ = handle.sender.send(StorageReadCommand::Shutdown);
+            }
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use lightcdc_core::{ChangeEvent, Operation, SourceMetadata};
@@ -726,6 +952,58 @@ mod tests {
                 .expect("consumer offset"),
             Some(8)
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_pool_serves_replay_and_shuts_down_with_a_stale_handle() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "reader.redb".to_owned(),
+        })
+        .expect("open store");
+        store.append_event(&event(1)).expect("append event");
+        store
+            .set_consumer_offset("orders", "search", 1)
+            .expect("set offset");
+        let pool = StorageReaderPool::start(store, 1, 4).expect("reader pool");
+        let handle = pool.handle();
+
+        let first_batch = handle
+            .replay_from(1, 10, 1024 * 1024)
+            .await
+            .expect("first replay");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                handle.replay_from(1, 10, 1024 * 1024),
+            )
+            .await
+            .is_err(),
+            "a second replay waits while the only aggregate-memory permit is held"
+        );
+        drop(first_batch);
+        assert_eq!(
+            handle
+                .replay_from(1, 10, 1024 * 1024)
+                .await
+                .expect("replay")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [event(1)]
+        );
+        assert_eq!(handle.first_sequence().await.expect("first"), Some(1));
+        assert_eq!(handle.last_sequence().await.expect("last"), Some(1));
+        assert_eq!(
+            handle
+                .consumer_offset("orders".to_owned(), "search".to_owned())
+                .await
+                .expect("offset"),
+            Some(1)
+        );
+
+        drop(pool);
+        assert!(handle.last_sequence().await.is_err());
     }
 
     fn transaction(sequence: u64, ack_lsn: &str) -> CapturedTransaction {

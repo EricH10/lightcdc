@@ -9,10 +9,11 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 fs2.workspace = true
+flume.workspace = true
+lightcdc-core = { path = "../lightcdc-core" }
 lightcdc-postgres = { path = "../lightcdc-postgres" }
 lightcdc-storage = { path = "../lightcdc-storage" }
 tokio.workspace = true
 
 [dev-dependencies]
-lightcdc-core = { path = "../lightcdc-core" }
 tempfile = "3"

@@ -94,14 +94,16 @@ them has optional work remaining.
   without acknowledging PostgreSQL; source reconnect classification remains
   independent.
 - Move consumer replay, ACK, and seek storage operations off Tokio worker
-  threads. PARTIAL: capture, retention, ACK, and seek mutations share the
-  dedicated storage thread; replay reads still need a bounded reader pool.
+  threads. DONE: mutations share the dedicated writer and replay/offset/range
+  reads use a fixed OS-thread pool with bounded command and response memory.
 - Bound active subscriptions, per-connection buffers, request and consumer-name
   sizes, outbound event sizes, and total memory. Validate every configured
   numeric limit and reject zero, contradictory, or ineffective settings.
-  PARTIAL: active subscriptions, per-subscription channels, consumer names, and
-  outbound events are bounded; transport request limits and aggregate replay
-  memory remain.
+  DONE for the single-node API: active subscriptions, subscription queues,
+  consumer names, inbound/outbound messages, HTTP/2 headers and per-connection
+  request concurrency, TCP connections, replay queueing, and aggregate replay
+  batches are bounded. Multi-instance deployments should additionally enforce
+  aggregate limits at their service manager or ingress.
 - Remove or implement inert configuration fields such as `channel_capacity`;
   production configuration must not appear to control behavior that ignores it.
   DONE: `channel_capacity` controls each subscription's outbound queue.
@@ -308,9 +310,9 @@ per-consumer polling has been removed:
   time limits; consumer acknowledgement batching remains client-controlled.
 - Move synchronous storage work onto a dedicated blocking boundary. PARTIAL:
   capture pipelines one in-flight group through a long-lived redb writer thread
-  while the Tokio replication task assembles the next group; gRPC replay,
-  acknowledgement, and seek still call redb from Tokio tasks.
-- Limit active subscriptions to protect memory and file descriptors.
+  while the Tokio replication task assembles the next group; gRPC mutations use
+  that writer and reads use a fixed bounded reader pool. DONE.
+- Limit active subscriptions to protect memory and file descriptors. DONE.
 - Define duplicate consumer-name and consumer-group behavior. DONE for the
   ordered-cursor mode; shared groups are deferred to leased-message delivery.
 - Add a leased-message shared-worker mode with opaque acknowledgement IDs,

@@ -4,22 +4,32 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::Context;
 use lightcdc_core::{ApiConfig, ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
 use lightcdc_runtime::{
     CaptureStorageHandle, CaptureStorageWriter, RuntimeState, RuntimeStateReceiver, ShutdownHandle,
-    ShutdownReceiver, runtime_state_channel, shutdown_channel,
+    ShutdownReceiver, StorageReaderHandle, StorageReaderPool, runtime_state_channel,
+    shutdown_channel,
 };
 use lightcdc_storage::{RedbEventStore, StorageError};
-use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+};
+use tokio_stream::{
+    StreamExt,
+    wrappers::{ReceiverStream, TcpListenerStream},
+};
 use tonic::{
     Request, Response, Status,
     metadata::MetadataMap,
-    transport::{Identity, Server, ServerTlsConfig},
+    transport::{Identity, Server, ServerTlsConfig, server::Connected},
 };
 use tonic_health::ServingStatus;
 use tracing::{info, warn};
@@ -40,12 +50,17 @@ use proto::{
 pub struct LightCdcService {
     /// Immutable stream definitions shared with spawned subscription tasks.
     config: Arc<Config>,
-    /// Durable log shared by RPC handlers and long-lived subscription tasks.
+    /// Direct test access; production reads go through the bounded reader pool.
+    #[cfg(test)]
     store: Arc<RedbEventStore>,
     /// Queues consumer offset mutations behind capture and retention writes.
     storage_writer: CaptureStorageHandle,
     /// Keeps the writer thread alive when the service was constructed standalone.
     _storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+    /// Runs synchronous redb reads on a fixed set of OS threads.
+    storage_reader: StorageReaderHandle,
+    /// Keeps the bounded reader pool alive for every service clone.
+    _storage_reader_owner: Arc<StorageReaderPool>,
     /// Stops long-lived subscription workers during graceful server shutdown.
     shutdown: ShutdownReceiver,
     /// Keeps standalone shutdown channels open when no external owner exists.
@@ -70,6 +85,56 @@ struct ApiPrincipal {
     token: Vec<u8>,
     streams: HashSet<String>,
     allow_seek: bool,
+}
+
+/// Holds a connection permit until tonic drops the accepted socket.
+struct LimitedConnection {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+}
+
+impl Connected for LimitedConnection {
+    type ConnectInfo = SocketAddr;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,6 +285,8 @@ struct ServiceParts {
     event_notifier: EventNotifier,
     storage_writer: CaptureStorageHandle,
     storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+    storage_reader: StorageReaderHandle,
+    storage_reader_owner: Arc<StorageReaderPool>,
     shutdown: ShutdownReceiver,
     shutdown_owner: Option<ShutdownHandle>,
 }
@@ -242,6 +309,8 @@ impl LightCdcService {
                 .expect("failed to start the gRPC storage writer"),
         );
         let storage_writer = storage_writer_owner.handle();
+        let (storage_reader_owner, storage_reader) =
+            start_storage_readers(&config, &store).expect("failed to start gRPC storage readers");
         Self::from_parts(
             ServiceParts {
                 config,
@@ -249,6 +318,8 @@ impl LightCdcService {
                 event_notifier,
                 storage_writer,
                 storage_writer_owner: Some(storage_writer_owner),
+                storage_reader,
+                storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
             },
@@ -268,6 +339,7 @@ impl LightCdcService {
             config.source.name.clone(),
         )?);
         let storage_writer = storage_writer_owner.handle();
+        let (storage_reader_owner, storage_reader) = start_storage_readers(&config, &store)?;
         Ok(Self::from_parts(
             ServiceParts {
                 config,
@@ -275,6 +347,8 @@ impl LightCdcService {
                 event_notifier,
                 storage_writer,
                 storage_writer_owner: Some(storage_writer_owner),
+                storage_reader,
+                storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
             },
@@ -290,6 +364,8 @@ impl LightCdcService {
         storage_writer: CaptureStorageHandle,
     ) -> Self {
         let (shutdown_owner, shutdown) = shutdown_channel();
+        let (storage_reader_owner, storage_reader) =
+            start_storage_readers(&config, &store).expect("failed to start gRPC storage readers");
         Self::from_parts(
             ServiceParts {
                 config,
@@ -297,6 +373,8 @@ impl LightCdcService {
                 event_notifier,
                 storage_writer,
                 storage_writer_owner: None,
+                storage_reader,
+                storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
             },
@@ -313,6 +391,7 @@ impl LightCdcService {
         shutdown: ShutdownReceiver,
     ) -> anyhow::Result<Self> {
         let authorizer = ApiAuthorizer::from_config(&config.api)?;
+        let (storage_reader_owner, storage_reader) = start_storage_readers(&config, &store)?;
         Ok(Self::from_parts(
             ServiceParts {
                 config,
@@ -320,6 +399,8 @@ impl LightCdcService {
                 event_notifier,
                 storage_writer,
                 storage_writer_owner: None,
+                storage_reader,
+                storage_reader_owner,
                 shutdown,
                 shutdown_owner: None,
             },
@@ -328,11 +409,16 @@ impl LightCdcService {
     }
 
     fn from_parts(parts: ServiceParts, authorizer: ApiAuthorizer) -> Self {
+        #[cfg(not(test))]
+        drop(parts.store);
         Self {
             config: Arc::new(parts.config),
+            #[cfg(test)]
             store: Arc::new(parts.store),
             storage_writer: parts.storage_writer,
             _storage_writer_owner: parts.storage_writer_owner,
+            storage_reader: parts.storage_reader,
+            _storage_reader_owner: parts.storage_reader_owner,
             shutdown: parts.shutdown,
             _shutdown_owner: parts.shutdown_owner,
             event_notifier: parts.event_notifier,
@@ -341,6 +427,19 @@ impl LightCdcService {
             authorizer: Arc::new(authorizer),
         }
     }
+}
+
+fn start_storage_readers(
+    config: &Config,
+    store: &RedbEventStore,
+) -> anyhow::Result<(Arc<StorageReaderPool>, StorageReaderHandle)> {
+    let owner = Arc::new(StorageReaderPool::start(
+        store.clone(),
+        config.runtime.replay_reader_threads,
+        config.runtime.replay_reader_queue_capacity,
+    )?);
+    let handle = owner.handle();
+    Ok((owner, handle))
 }
 
 /// Prevents an unauthenticated plaintext API from binding beyond loopback.
@@ -441,9 +540,16 @@ async fn serve_service(
     tls: Option<Identity>,
 ) -> anyhow::Result<()> {
     info!(%addr, "starting lightcdc gRPC server");
+    let max_inbound_request_bytes = service.config.runtime.max_inbound_request_bytes;
+    let max_outbound_event_bytes = service.config.runtime.max_outbound_event_bytes;
+    let max_requests_per_connection = service.config.runtime.max_requests_per_connection;
+    let max_api_connections = service.config.runtime.max_api_connections;
+    let max_header_list_bytes = service.config.runtime.max_header_list_bytes;
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     let health_task = tokio::spawn(report_health(health_reporter, state, shutdown.clone()));
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(max_requests_per_connection)
+        .http2_max_header_list_size(max_header_list_bytes);
     if let Some(identity) = tls {
         server = server
             .tls_config(ServerTlsConfig::new().identity(identity))
@@ -451,12 +557,45 @@ async fn serve_service(
     }
     let result = server
         .add_service(health_service)
-        .add_service(LightCdcServer::new(service))
-        .serve_with_shutdown(addr, async move { shutdown.cancelled().await })
+        .add_service(
+            LightCdcServer::new(service)
+                .max_decoding_message_size(max_inbound_request_bytes)
+                .max_encoding_message_size(max_outbound_event_bytes.saturating_add(64 * 1024)),
+        )
+        .serve_with_incoming_shutdown(
+            limited_incoming(addr, max_api_connections).await?,
+            async move { shutdown.cancelled().await },
+        )
         .await;
     health_task.abort();
     let _ = health_task.await;
     result.context("serve gRPC API")
+}
+
+async fn limited_incoming(
+    addr: SocketAddr,
+    maximum: usize,
+) -> anyhow::Result<impl tokio_stream::Stream<Item = Result<LimitedConnection, std::io::Error>>> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind gRPC listener {addr}"))?;
+    Ok(limited_incoming_from(listener, maximum))
+}
+
+fn limited_incoming_from(
+    listener: TcpListener,
+    maximum: usize,
+) -> impl tokio_stream::Stream<Item = Result<LimitedConnection, std::io::Error>> {
+    let permits = Arc::new(Semaphore::new(maximum));
+    TcpListenerStream::new(listener).filter_map(move |incoming| match incoming {
+        Ok(stream) => Arc::clone(&permits).try_acquire_owned().ok().map(|permit| {
+            Ok(LimitedConnection {
+                stream,
+                _permit: permit,
+            })
+        }),
+        Err(error) => Some(Err(error)),
+    })
 }
 
 const LIVENESS_SERVICE: &str = "lightcdc.liveness";
@@ -526,21 +665,26 @@ impl LightCdc for LightCdcService {
         let stream = self.stream(&request.stream)?;
         let subscription = self.claim_subscription(&stream.name, consumer)?;
         let stored_offset = self
-            .store
-            .consumer_offset(&stream.name, consumer)
+            .storage_reader
+            .consumer_offset(stream.name.clone(), consumer.to_owned())
+            .await
             .map_err(internal)?;
         let start_offset = match stored_offset {
             Some(offset) => offset,
-            None => earliest_retained_offset(&self.store).map_err(internal)?,
+            None => earliest_retained_offset(&self.storage_reader)
+                .await
+                .map_err(internal)?,
         };
         let limit = request.limit as usize;
         let (tx, rx) = mpsc::channel(self.config.runtime.channel_capacity);
-        let store = Arc::clone(&self.store);
+        let storage_reader = self.storage_reader.clone();
         let mut event_notifications = self.event_notifier.subscribe();
         let delivery_key = (stream.name.clone(), consumer.to_owned());
         let delivery_high_watermarks = Arc::clone(&self.delivery_high_watermarks);
         let mut shutdown = self.shutdown.clone();
         let max_outbound_event_bytes = self.config.runtime.max_outbound_event_bytes;
+        let replay_batch_events = self.config.runtime.replay_batch_events;
+        let replay_batch_max_bytes = self.config.runtime.replay_batch_max_bytes;
 
         // This worker owns cloned state because it can outlive the subscribe RPC.
         tokio::spawn(async move {
@@ -552,7 +696,10 @@ impl LightCdc for LightCdcService {
                 if shutdown.is_triggered() {
                     return;
                 }
-                let batch = match store.replay_from(next_sequence, 256) {
+                let batch = match storage_reader
+                    .replay_from(next_sequence, replay_batch_events, replay_batch_max_bytes)
+                    .await
+                {
                     Ok(batch) => batch,
                     Err(error) => {
                         let _ = tx.send(Err(replay_status(error))).await;
@@ -666,8 +813,15 @@ impl LightCdc for LightCdcService {
             SeekPosition::try_from(request.position).unwrap_or(SeekPosition::Unspecified);
 
         let offset = match position {
-            SeekPosition::Earliest => earliest_retained_offset(&self.store).map_err(internal)?,
-            SeekPosition::Latest => self.store.last_sequence().map_err(internal)?.unwrap_or(0),
+            SeekPosition::Earliest => earliest_retained_offset(&self.storage_reader)
+                .await
+                .map_err(internal)?,
+            SeekPosition::Latest => self
+                .storage_reader
+                .last_sequence()
+                .await
+                .map_err(internal)?
+                .unwrap_or(0),
             SeekPosition::Absolute => request.sequence,
             SeekPosition::Unspecified => {
                 return Err(Status::invalid_argument(
@@ -830,24 +984,24 @@ fn record_delivery(
 }
 
 /// Returns the offset immediately before the oldest retained event.
-fn earliest_retained_offset(store: &RedbEventStore) -> Result<u64, StorageError> {
-    match store.first_sequence()? {
+async fn earliest_retained_offset(reader: &StorageReaderHandle) -> anyhow::Result<u64> {
+    match reader.first_sequence().await? {
         Some(first_sequence) => Ok(first_sequence.saturating_sub(1)),
-        None => Ok(store.last_sequence()?.unwrap_or(0)),
+        None => Ok(reader.last_sequence().await?.unwrap_or(0)),
     }
 }
 
 /// Converts an expired replay position into an actionable consumer error.
-fn replay_status(error: StorageError) -> Status {
-    match error {
-        StorageError::SequenceExpired {
+fn replay_status(error: anyhow::Error) -> Status {
+    match error.downcast_ref::<StorageError>() {
+        Some(StorageError::SequenceExpired {
             requested,
             first_available,
-        } => Status::failed_precondition(format!(
+        }) => Status::failed_precondition(format!(
             "consumer offset expired at sequence {requested}; first retained sequence is \
              {first_available}; seek to earliest or latest before subscribing again"
         )),
-        error => internal(format!("failed to read events from redb: {error}")),
+        _ => internal(format!("failed to read events from redb: {error}")),
     }
 }
 
@@ -873,6 +1027,36 @@ mod tests {
     use tonic_health::pb::{HealthCheckRequest, health_server::Health};
 
     use super::*;
+
+    #[tokio::test]
+    async fn connection_limit_rejects_excess_and_recovers_after_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("listener address");
+        let mut incoming = Box::pin(limited_incoming_from(listener, 1));
+
+        let _first_client = TcpStream::connect(addr).await.expect("first client");
+        let first_server = incoming
+            .next()
+            .await
+            .expect("first incoming connection")
+            .expect("first accepted connection");
+
+        let _excess_client = TcpStream::connect(addr).await.expect("excess client");
+        assert!(
+            timeout(Duration::from_millis(25), incoming.next())
+                .await
+                .is_err(),
+            "an excess connection must not reach tonic"
+        );
+
+        drop(first_server);
+        let _next_client = TcpStream::connect(addr).await.expect("next client");
+        incoming
+            .next()
+            .await
+            .expect("next incoming connection")
+            .expect("connection accepted after permit release");
+    }
 
     #[tokio::test]
     async fn subscribe_filters_events_by_stream() {
@@ -1603,8 +1787,16 @@ mod tests {
                 channel_capacity: 1024,
                 shutdown_timeout_ms: 10000,
                 max_active_subscriptions: 1_024,
+                replay_reader_threads: 2,
+                replay_reader_queue_capacity: 1_024,
+                replay_batch_events: 256,
+                replay_batch_max_bytes: 64 * 1024 * 1024,
                 max_consumer_name_bytes: 128,
                 max_outbound_event_bytes: 16 * 1024 * 1024,
+                max_inbound_request_bytes: 64 * 1024,
+                max_requests_per_connection: 128,
+                max_api_connections: 1_024,
+                max_header_list_bytes: 32 * 1024,
                 max_storage_bytes: 100 * 1024 * 1024 * 1024,
                 min_free_disk_bytes: 1024 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,

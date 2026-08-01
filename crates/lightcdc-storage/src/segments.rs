@@ -382,6 +382,7 @@ impl SegmentStore {
         &self,
         sequence: u64,
         limit: usize,
+        max_bytes: u64,
     ) -> Result<Vec<ChangeEvent>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -419,13 +420,19 @@ impl SegmentStore {
 
         let mut output = Vec::with_capacity(limit);
         let mut next_sequence = sequence;
+        let mut output_bytes = 0u64;
         for (_descriptor, database) in snapshots {
             let read = database.begin_read().map_err(redb_error)?;
             let events = read.open_table(EVENTS).map_err(redb_error)?;
             for entry in events.range(next_sequence..).map_err(redb_error)? {
                 let (stored_sequence, payload) = entry.map_err(redb_error)?;
+                let payload_bytes = payload.value().len() as u64;
+                if !output.is_empty() && output_bytes.saturating_add(payload_bytes) > max_bytes {
+                    return Ok(output);
+                }
                 let event: ChangeEvent = serde_json::from_slice(payload.value())?;
                 next_sequence = stored_sequence.value().saturating_add(1);
+                output_bytes = output_bytes.saturating_add(payload_bytes);
                 output.push(event);
                 if output.len() >= limit {
                     return Ok(output);
@@ -2144,7 +2151,7 @@ mod tests {
 
         assert_eq!(
             store
-                .replay_from(2, 4)
+                .replay_from(2, 4, u64::MAX)
                 .expect("replay across segments")
                 .iter()
                 .map(|event| event.sequence)
@@ -2159,7 +2166,7 @@ mod tests {
         let reopened = SegmentStore::open(control_path, options).expect("reopen segmented store");
         assert_eq!(
             reopened
-                .replay_from(1, 10)
+                .replay_from(1, 10, u64::MAX)
                 .expect("replay reopened segments")
                 .iter()
                 .map(|event| event.sequence)
@@ -2258,7 +2265,9 @@ mod tests {
             .expect("migrate legacy store");
 
         assert_eq!(
-            store.replay_from(1, 10).expect("replay migrated events"),
+            store
+                .replay_from(1, 10, u64::MAX)
+                .expect("replay migrated events"),
             [event(1)]
         );
         assert_eq!(
@@ -2277,7 +2286,10 @@ mod tests {
 
         let reopened = SegmentStore::open(control_path, test_segment_options(10))
             .expect("reopen migrated store");
-        assert_eq!(reopened.replay_from(1, 10).expect("replay"), [event(1)]);
+        assert_eq!(
+            reopened.replay_from(1, 10, u64::MAX).expect("replay"),
+            [event(1)]
+        );
     }
 
     #[test]
@@ -2373,7 +2385,9 @@ mod tests {
         let reopened =
             SegmentStore::open(control_path, options).expect("recover interrupted deletion");
         assert_eq!(
-            reopened.replay_from(1, 1).expect("replay restored"),
+            reopened
+                .replay_from(1, 1, u64::MAX)
+                .expect("replay restored"),
             [event(1)]
         );
         assert!(first_path.exists());

@@ -88,12 +88,36 @@ pub struct RuntimeConfig {
     /// Maximum simultaneous gRPC subscriptions across all consumers.
     #[serde(default = "default_max_active_subscriptions")]
     pub max_active_subscriptions: usize,
+    /// Fixed OS threads available for synchronous redb replay reads.
+    #[serde(default = "default_replay_reader_threads")]
+    pub replay_reader_threads: usize,
+    /// Bounded queued redb reads shared by all subscriptions.
+    #[serde(default = "default_replay_reader_queue_capacity")]
+    pub replay_reader_queue_capacity: usize,
+    /// Maximum events loaded by one reader command.
+    #[serde(default = "default_replay_batch_events")]
+    pub replay_batch_events: usize,
+    /// Soft serialized-byte boundary for one reader command.
+    #[serde(default = "default_replay_batch_max_bytes")]
+    pub replay_batch_max_bytes: u64,
     /// Maximum UTF-8 bytes in a consumer identity supplied over gRPC.
     #[serde(default = "default_max_consumer_name_bytes")]
     pub max_consumer_name_bytes: usize,
     /// Maximum encoded bytes delivered in one consumer event.
     #[serde(default = "default_max_outbound_event_bytes")]
     pub max_outbound_event_bytes: usize,
+    /// Maximum decoded protobuf bytes accepted for one RPC request.
+    #[serde(default = "default_max_inbound_request_bytes")]
+    pub max_inbound_request_bytes: usize,
+    /// Maximum concurrent HTTP/2 requests accepted on one connection.
+    #[serde(default = "default_max_requests_per_connection")]
+    pub max_requests_per_connection: usize,
+    /// Maximum simultaneous TCP connections accepted by the gRPC listener.
+    #[serde(default = "default_max_api_connections")]
+    pub max_api_connections: usize,
+    /// Maximum HTTP/2 header-list bytes accepted per request.
+    #[serde(default = "default_max_header_list_bytes")]
+    pub max_header_list_bytes: u32,
     /// Hard bound across the control database, segments, and staging files.
     #[serde(default = "default_max_storage_bytes")]
     pub max_storage_bytes: u64,
@@ -319,12 +343,44 @@ impl Config {
                 runtime.max_active_subscriptions as u128,
             ),
             (
+                "runtime.replay_reader_threads",
+                runtime.replay_reader_threads as u128,
+            ),
+            (
+                "runtime.replay_reader_queue_capacity",
+                runtime.replay_reader_queue_capacity as u128,
+            ),
+            (
+                "runtime.replay_batch_events",
+                runtime.replay_batch_events as u128,
+            ),
+            (
+                "runtime.replay_batch_max_bytes",
+                runtime.replay_batch_max_bytes as u128,
+            ),
+            (
                 "runtime.max_consumer_name_bytes",
                 runtime.max_consumer_name_bytes as u128,
             ),
             (
                 "runtime.max_outbound_event_bytes",
                 runtime.max_outbound_event_bytes as u128,
+            ),
+            (
+                "runtime.max_inbound_request_bytes",
+                runtime.max_inbound_request_bytes as u128,
+            ),
+            (
+                "runtime.max_requests_per_connection",
+                runtime.max_requests_per_connection as u128,
+            ),
+            (
+                "runtime.max_api_connections",
+                runtime.max_api_connections as u128,
+            ),
+            (
+                "runtime.max_header_list_bytes",
+                runtime.max_header_list_bytes as u128,
             ),
             (
                 "runtime.max_storage_bytes",
@@ -395,6 +451,30 @@ impl Config {
         }
         if runtime.max_active_subscriptions > 100_000 {
             return Err("runtime.max_active_subscriptions must not exceed 100000".to_owned());
+        }
+        if runtime.replay_reader_threads > 64 {
+            return Err("runtime.replay_reader_threads must not exceed 64".to_owned());
+        }
+        if runtime.replay_reader_queue_capacity > 65_536 {
+            return Err("runtime.replay_reader_queue_capacity must not exceed 65536".to_owned());
+        }
+        if runtime.replay_batch_events > 4_096 {
+            return Err("runtime.replay_batch_events must not exceed 4096".to_owned());
+        }
+        if runtime.replay_batch_max_bytes > 1024 * 1024 * 1024 {
+            return Err("runtime.replay_batch_max_bytes must not exceed 1 GiB".to_owned());
+        }
+        if runtime.max_inbound_request_bytes > 16 * 1024 * 1024 {
+            return Err("runtime.max_inbound_request_bytes must not exceed 16 MiB".to_owned());
+        }
+        if runtime.max_requests_per_connection > 100_000 {
+            return Err("runtime.max_requests_per_connection must not exceed 100000".to_owned());
+        }
+        if runtime.max_api_connections > 100_000 {
+            return Err("runtime.max_api_connections must not exceed 100000".to_owned());
+        }
+        if runtime.max_header_list_bytes > 1024 * 1024 {
+            return Err("runtime.max_header_list_bytes must not exceed 1 MiB".to_owned());
         }
         if runtime.max_consumer_name_bytes > 1_024 {
             return Err("runtime.max_consumer_name_bytes must not exceed 1024".to_owned());
@@ -713,12 +793,44 @@ fn default_max_active_subscriptions() -> usize {
     1_024
 }
 
+fn default_replay_reader_threads() -> usize {
+    2
+}
+
+fn default_replay_reader_queue_capacity() -> usize {
+    1_024
+}
+
+fn default_replay_batch_events() -> usize {
+    256
+}
+
+fn default_replay_batch_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
 fn default_max_consumer_name_bytes() -> usize {
     128
 }
 
 fn default_max_outbound_event_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_max_inbound_request_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_requests_per_connection() -> usize {
+    128
+}
+
+fn default_max_api_connections() -> usize {
+    1_024
+}
+
+fn default_max_header_list_bytes() -> u32 {
+    32 * 1024
 }
 
 fn default_max_storage_bytes() -> u64 {
@@ -1046,8 +1158,16 @@ mod tests {
                 channel_capacity: 32,
                 shutdown_timeout_ms: 1_000,
                 max_active_subscriptions: 1_024,
+                replay_reader_threads: 2,
+                replay_reader_queue_capacity: 1_024,
+                replay_batch_events: 256,
+                replay_batch_max_bytes: 64 * 1024 * 1024,
                 max_consumer_name_bytes: 128,
                 max_outbound_event_bytes: 16 * 1024 * 1024,
+                max_inbound_request_bytes: 64 * 1024,
+                max_requests_per_connection: 128,
+                max_api_connections: 1_024,
+                max_header_list_bytes: 32 * 1024,
                 max_storage_bytes: 100 * 1024 * 1024 * 1024,
                 min_free_disk_bytes: 1024 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,

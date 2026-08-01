@@ -80,6 +80,14 @@ channel_capacity = 1024
 max_active_subscriptions = 1024
 max_consumer_name_bytes = 128
 max_outbound_event_bytes = 16777216
+max_inbound_request_bytes = 65536
+max_requests_per_connection = 128
+max_api_connections = 1024
+max_header_list_bytes = 32768
+replay_reader_threads = 2
+replay_reader_queue_capacity = 1024
+replay_batch_events = 256
+replay_batch_max_bytes = 67108864
 max_storage_bytes = 107374182400
 min_free_disk_bytes = 1073741824
 shutdown_timeout_ms = 10000
@@ -87,7 +95,10 @@ shutdown_timeout_ms = 10000
 
 `channel_capacity` is the bounded per-subscription event queue. An oversized
 event or exhausted subscription limit returns `RESOURCE_EXHAUSTED` without
-advancing the consumer offset.
+advancing the consumer offset. Synchronous redb replay runs on a fixed reader
+pool, not Tokio workers. Its command queue, event count, byte size, and
+simultaneous completed batches are bounded. Tonic also enforces request,
+header-list, TCP connection, and per-connection concurrent-request limits.
 
 Transaction buffering is bounded by three `[runtime]` settings:
 
