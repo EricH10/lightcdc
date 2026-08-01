@@ -38,6 +38,23 @@ pub struct StoreStats {
     pub sealed_segment_count: u64,
 }
 
+/// Summarizes a complete durable-store integrity traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityReport {
+    /// Segment databases checked, including the active segment.
+    pub segment_count: u64,
+    /// Retained event payloads decoded and sequence-validated.
+    pub event_count: u64,
+    /// Transaction replay markers checked.
+    pub replay_id_count: u64,
+    /// Logical bytes occupied by segment database files.
+    pub segment_file_bytes: u64,
+    /// Oldest retained payload sequence.
+    pub first_sequence: Option<u64>,
+    /// Highest sequence ever assigned, including an expired prefix.
+    pub high_watermark: Option<u64>,
+}
+
 /// Controls when the one active event file is sealed and replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentOptions {
@@ -375,6 +392,11 @@ impl RedbEventStore {
         self.inner.stats()
     }
 
+    /// Traverses every durable table and validates cross-segment invariants.
+    pub fn verify_integrity(&self) -> Result<IntegrityReport, StorageError> {
+        self.inner.verify_integrity()
+    }
+
     /// Lists the latest durable source checkpoints.
     pub fn source_offsets(&self) -> Result<Vec<SourceOffset>, StorageError> {
         self.inner.source_offsets()
@@ -519,6 +541,9 @@ pub enum StorageError {
     #[error("invalid segment catalog: {0}")]
     InvalidSegmentCatalog(String),
 
+    #[error("integrity check failed: {0}")]
+    Integrity(String),
+
     #[error("invalid durable format marker: {}", .0.display())]
     InvalidFormatMarker(PathBuf),
 
@@ -551,6 +576,7 @@ mod tests {
     use std::time::Duration;
 
     use lightcdc_core::{ChangeEvent, Operation, SourceMetadata};
+    use redb::{Database, TableDefinition};
     use tempfile::TempDir;
 
     use super::{
@@ -1026,6 +1052,43 @@ mod tests {
         let stats = reopened.stats().expect("store stats");
         assert_eq!(stats.event_count, 2);
         assert_eq!(stats.replay_id_count, 1);
+    }
+
+    #[test]
+    fn integrity_check_traverses_events_and_rejects_corrupt_payloads() {
+        let temp = TempDir::new().expect("temp dir");
+        let options = LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        };
+        let store = RedbEventStore::open(&options).expect("open store");
+        store
+            .persist_transaction(&[event(1, "0/1")], "default", "0/2")
+            .expect("persist event");
+        let report = store.verify_integrity().expect("integrity report");
+        assert_eq!(report.event_count, 1);
+        assert_eq!(report.first_sequence, Some(1));
+        assert_eq!(report.high_watermark, Some(1));
+        drop(store);
+
+        let segment_path = temp
+            .path()
+            .join("test.redb.segments")
+            .join("segment-00000000000000000001.redb");
+        let database = Database::open(segment_path).expect("open segment directly");
+        let write = database.begin_write().expect("write transaction");
+        {
+            const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
+            let mut events = write.open_table(EVENTS).expect("events table");
+            events
+                .insert(1, b"not-json".as_slice())
+                .expect("corrupt payload");
+        }
+        write.commit().expect("commit corruption fixture");
+        drop(database);
+
+        let reopened = RedbEventStore::open(&options).expect("catalog still opens");
+        assert!(reopened.verify_integrity().is_err());
     }
 
     #[test]

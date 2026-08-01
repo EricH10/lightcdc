@@ -73,8 +73,12 @@ impl<T> Drop for AbortTask<T> {
 
 /// Runs capture only and writes changes into the local event store.
 pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> anyhow::Result<()> {
-    let config = Config::from_path(&config_path)
+    let mut config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
+    config
+        .resolve_source_password()
+        .map_err(anyhow::Error::msg)
+        .context("could not resolve PostgreSQL password")?;
 
     init_logging(&config.logging.level)?;
 
@@ -117,8 +121,12 @@ pub(crate) async fn run(
     addr: SocketAddr,
     options: CaptureOptions,
 ) -> anyhow::Result<()> {
-    let config = Config::from_path(&config_path)
+    let mut config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
+    config
+        .resolve_source_password()
+        .map_err(anyhow::Error::msg)
+        .context("could not resolve PostgreSQL password")?;
 
     init_logging(&config.logging.level)?;
 

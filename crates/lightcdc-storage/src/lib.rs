@@ -7,9 +7,9 @@ mod segments;
 pub mod transaction;
 
 pub use log::{
-    ConsumerOffset, LogOpenOptions, PersistTransactionOutcome, RedbEventStore, RetentionOutcome,
-    RetentionPolicy, SegmentOptions, SourceIdentity, SourceOffset, SourceTransaction, StorageError,
-    StoreStats,
+    ConsumerOffset, IntegrityReport, LogOpenOptions, PersistTransactionOutcome, RedbEventStore,
+    RetentionOutcome, RetentionPolicy, SegmentOptions, SourceIdentity, SourceOffset,
+    SourceTransaction, StorageError, StoreStats,
 };
 pub use transaction::{
     TransactionBuffer, TransactionBufferError, TransactionBufferOptions, TransactionEventIter,

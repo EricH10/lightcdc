@@ -76,9 +76,13 @@ them has optional work remaining.
 - Define and test backup and restore for the redb store together with PostgreSQL
   slot state. Document the no-loss boundary, recovery point objective, recovery
   time objective, and what happens when local storage is permanently lost.
+  DONE for offline checksummed backup/restore with a tested round trip and
+  documented PostgreSQL WAL/slot coordination boundary.
 - Detect redb corruption and incompatible files at startup, fail without
   destructive repair, and provide a tested integrity-check and recovery
-  procedure.
+  procedure. DONE with catalog/format checks at open and an offline deep check
+  that traverses event payloads, metadata, identities, and offsets; corruption
+  and tampered-backup fixtures fail before restore publication.
 - Enforce byte-size retention, staging-space limits, minimum free-space
   thresholds, and a reserved emergency margin. Stop or shed work before disk
   exhaustion and surface the resulting PostgreSQL WAL-retention risk. DONE for

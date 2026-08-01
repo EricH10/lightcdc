@@ -7,6 +7,7 @@ use clap::Parser;
 use crate::{
     cli::{CaptureOptions, Cli, Command},
     commands::{inspect, replay, serve},
+    maintenance::{backup, check, restore},
 };
 
 mod capture;
@@ -14,6 +15,7 @@ mod cli;
 mod commands;
 mod display;
 mod logging;
+mod maintenance;
 mod store;
 
 /// Parses CLI arguments and dispatches to the requested command.
@@ -72,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
             limit,
             sequence,
         } => inspect(config, limit, sequence),
+        Command::Check { config } => check(config),
+        Command::Backup { config, output } => backup(config, output),
+        Command::Restore { config, input } => restore(config, input),
         Command::Serve { config, addr } => serve(config, addr).await,
     }
 }

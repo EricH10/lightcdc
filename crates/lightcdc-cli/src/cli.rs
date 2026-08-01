@@ -87,6 +87,30 @@ pub(crate) enum Command {
         sequence: Option<u64>,
     },
 
+    /// Traverses every retained event and durable metadata table.
+    Check {
+        #[arg(short, long, default_value = "lightcdc.example.toml")]
+        config: PathBuf,
+    },
+
+    /// Creates an offline, checksummed store backup directory.
+    Backup {
+        #[arg(short, long, default_value = "lightcdc.example.toml")]
+        config: PathBuf,
+
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Restores a verified backup into an empty configured data directory.
+    Restore {
+        #[arg(short, long, default_value = "lightcdc.example.toml")]
+        config: PathBuf,
+
+        #[arg(short, long)]
+        input: PathBuf,
+    },
+
     /// Serves retained events without running PostgreSQL capture.
     Serve {
         #[arg(short, long, default_value = "lightcdc.example.toml")]

@@ -231,6 +231,25 @@ The second command also prints the full decoded event at sequence 42. Stop
 `capture`, `run`, or `serve` before inspecting because redb allows only one
 process to open the control and active segment files.
 
+Run a deep offline integrity traversal, or create and restore a checksummed
+backup directory:
+
+```bash
+cargo run -p lightcdc-cli -- check --config lightcdc.example.toml
+cargo run -p lightcdc-cli -- backup --config lightcdc.example.toml \
+  --output /backups/lightcdc-2026-08-01
+cargo run -p lightcdc-cli -- restore --config lightcdc.example.toml \
+  --input /backups/lightcdc-2026-08-01
+```
+
+Stop every LightCDC command using the store first. Backup holds redb's process
+lock, verifies every retained event and metadata table, copies only durable
+control/segment files, records SHA-256 checksums and source recovery metadata,
+then atomically publishes the destination. Restore requires an empty configured
+data directory and verifies checksums plus the complete temporary store before
+publishing it. See [`docs/operations.md`](docs/operations.md) for the required
+PostgreSQL slot/WAL coordination and recovery boundaries.
+
 Serve the gRPC API:
 
 ```bash

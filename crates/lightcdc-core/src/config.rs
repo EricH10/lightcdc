@@ -254,12 +254,12 @@ impl Config {
             source,
         })?;
 
-        let mut config: Self = toml::from_str(&raw).map_err(|source| Error::ParseConfig {
+        let config: Self = toml::from_str(&raw).map_err(|source| Error::ParseConfig {
             path: path.display().to_string(),
             source,
         })?;
         config
-            .resolve_source_password()
+            .validate_source_password_config()
             .map_err(|reason| Error::InvalidConfig {
                 path: path.display().to_string(),
                 reason,
@@ -298,6 +298,16 @@ impl Config {
     /// Rejects zero, contradictory, and ineffectively large runtime settings.
     pub fn validate_runtime(&self) -> std::result::Result<(), String> {
         let runtime = &self.runtime;
+        let storage_file = Path::new(&runtime.storage_file);
+        if runtime.storage_file.is_empty()
+            || storage_file.is_absolute()
+            || storage_file.components().count() != 1
+        {
+            return Err(
+                "runtime.storage_file must be one relative filename without path components"
+                    .to_owned(),
+            );
+        }
         let positive = [
             ("runtime.channel_capacity", runtime.channel_capacity as u128),
             (
@@ -430,9 +440,9 @@ impl Config {
         Ok(())
     }
 
-    fn resolve_source_password(&mut self) -> std::result::Result<(), String> {
-        let direct = (!self.source.password.is_empty()).then_some(self.source.password.clone());
-        let selected = usize::from(direct.is_some())
+    fn validate_source_password_config(&self) -> std::result::Result<(), String> {
+        let direct = !self.source.password.is_empty();
+        let selected = usize::from(direct)
             + usize::from(self.source.password_env.is_some())
             + usize::from(self.source.password_file.is_some());
         if selected != 1 {
@@ -441,6 +451,13 @@ impl Config {
                     .to_owned(),
             );
         }
+        Ok(())
+    }
+
+    /// Resolves the PostgreSQL password only for commands that connect upstream.
+    pub fn resolve_source_password(&mut self) -> std::result::Result<(), String> {
+        self.validate_source_password_config()?;
+        let direct = (!self.source.password.is_empty()).then_some(self.source.password.clone());
         self.source.password = match (
             direct,
             &self.source.password_env,
@@ -952,6 +969,29 @@ mod tests {
         config.resolve_source_password().expect("resolve password");
 
         assert_eq!(config.source.password, "file-secret");
+    }
+
+    #[test]
+    fn offline_config_loading_does_not_require_the_postgres_secret() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("lightcdc.toml");
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        config.source.password.clear();
+        config.source.password_env = Some("LIGHTCDC_TEST_MISSING_PASSWORD".to_owned());
+        std::fs::write(&path, toml::to_string(&config).expect("serialize config"))
+            .expect("write config");
+
+        let loaded = Config::from_path(&path).expect("load without resolving secret");
+
+        assert!(loaded.source.password.is_empty());
+        assert_eq!(
+            loaded.source.password_env.as_deref(),
+            Some("LIGHTCDC_TEST_MISSING_PASSWORD")
+        );
     }
 
     #[test]
