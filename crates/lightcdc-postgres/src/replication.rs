@@ -30,6 +30,8 @@ use tracing::{debug, info};
 use crate::decoder::{DecodeError, PgOutputDecoder, PgOutputMessage, Relation, RowChange};
 
 const POSTGRES_EPOCH_UNIX_MS: i64 = 946_684_800_000;
+/// Reserved logical-message prefix used only for safe idle checkpoints.
+pub const LIGHTCDC_HEARTBEAT_PREFIX: &str = "lightcdc.heartbeat";
 
 /// Represents failures while connecting to or decoding PostgreSQL replication.
 #[derive(Debug, Error)]
@@ -51,6 +53,9 @@ pub enum PostgresError {
 
     #[error("transaction buffering error: {0}")]
     TransactionBuffer(#[from] TransactionBufferError),
+
+    #[error("unsupported PostgreSQL feature: {0}")]
+    UnsupportedFeature(String),
 }
 
 /// Reads PostgreSQL logical replication messages and emits committed transactions.
@@ -103,6 +108,7 @@ struct ValidatedSource {
     identity: SourceIdentity,
     confirmed_flush_lsn: Option<String>,
     restart_lsn: Option<String>,
+    publish_via_partition_root: bool,
 }
 
 /// Bundles the events from one committed transaction with its checkpoint.
@@ -375,7 +381,13 @@ impl ReplicationReader {
                     PgOutputMessage::Ignored => {}
                 },
                 ReplicationEvent::Message { prefix, lsn, .. } => {
-                    debug!(%prefix, %lsn, "ignored logical decoding message");
+                    if prefix != LIGHTCDC_HEARTBEAT_PREFIX {
+                        return Err(PostgresError::UnsupportedFeature(format!(
+                            "logical message prefix {prefix:?} at {lsn}; only the reserved \
+                             {LIGHTCDC_HEARTBEAT_PREFIX:?} heartbeat is accepted"
+                        )));
+                    }
+                    debug!(%prefix, %lsn, "received LightCDC logical heartbeat");
                 }
                 ReplicationEvent::StoppedAt { reached } => {
                     debug!(%reached, "replication stopped at configured LSN");
@@ -464,7 +476,8 @@ impl PostgresError {
             | Self::StreamState(_)
             | Self::Replication(_)
             | Self::Decode(_)
-            | Self::TransactionBuffer(_) => false,
+            | Self::TransactionBuffer(_)
+            | Self::UnsupportedFeature(_) => false,
         }
     }
 
@@ -526,7 +539,13 @@ pub async fn validate_source_config_with_plan(
     let (client, _connection_task) = connect_sql(config, "validation").await?;
 
     let source = validate_source_client(&client, config).await?;
-    let publication = validate_publication_alignment(&client, config, capture_plan).await?;
+    let publication = validate_publication_alignment(
+        &client,
+        config,
+        capture_plan,
+        source.publish_via_partition_root,
+    )
+    .await?;
     Ok(SourceValidation {
         identity: source.identity,
         confirmed_flush_lsn: source.confirmed_flush_lsn,
@@ -651,17 +670,37 @@ async fn validate_source_client(
         )));
     }
 
-    let publication_exists: bool = client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+    let publication = client
+        .query_opt(
+            r#"
+            SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
+            FROM pg_publication
+            WHERE pubname = $1
+            "#,
             &[&config.publication],
         )
         .await?
-        .get(0);
-    if !publication_exists {
+        .ok_or_else(|| {
+            PostgresError::Configuration(format!(
+                "publication {:?} does not exist",
+                config.publication
+            ))
+        })?;
+    let published_operations = [
+        ("insert", publication.get::<_, bool>(0)),
+        ("update", publication.get::<_, bool>(1)),
+        ("delete", publication.get::<_, bool>(2)),
+        ("truncate", publication.get::<_, bool>(3)),
+    ];
+    let missing_operations = published_operations
+        .into_iter()
+        .filter_map(|(name, enabled)| (!enabled).then_some(name))
+        .collect::<Vec<_>>();
+    if !missing_operations.is_empty() {
         return Err(PostgresError::Configuration(format!(
-            "publication {:?} does not exist",
-            config.publication
+            "publication {:?} must publish insert, update, delete, and truncate; missing {}",
+            config.publication,
+            missing_operations.join(", ")
         )));
     }
 
@@ -673,7 +712,8 @@ async fn validate_source_client(
                 plugin,
                 database,
                 confirmed_flush_lsn::text,
-                restart_lsn::text
+                restart_lsn::text,
+                two_phase
             FROM pg_replication_slots
             WHERE slot_name = $1
             "#,
@@ -691,6 +731,7 @@ async fn validate_source_client(
     let slot_database: Option<String> = slot.get(2);
     let confirmed_flush_lsn: Option<String> = slot.get(3);
     let restart_lsn: Option<String> = slot.get(4);
+    let two_phase: bool = slot.get(5);
 
     if slot_type != "logical" {
         return Err(PostgresError::Configuration(format!(
@@ -708,6 +749,12 @@ async fn validate_source_client(
         return Err(PostgresError::Configuration(format!(
             "replication slot {:?} belongs to database {slot_database:?}; expected {:?}",
             config.slot, config.database
+        )));
+    }
+    if two_phase {
+        return Err(PostgresError::Configuration(format!(
+            "replication slot {:?} has two_phase enabled; prepared transactions are unsupported",
+            config.slot
         )));
     }
 
@@ -734,6 +781,7 @@ async fn validate_source_client(
         user,
         is_superuser,
         can_replicate,
+        publication_via_partition_root = publication.get::<_, bool>(4),
         publication = %config.publication,
         slot = %config.slot,
         system_identifier = %identity.system_identifier,
@@ -747,6 +795,7 @@ async fn validate_source_client(
         identity,
         confirmed_flush_lsn,
         restart_lsn,
+        publish_via_partition_root: publication.get(4),
     })
 }
 
@@ -782,14 +831,27 @@ async fn validate_publication_alignment(
     client: &Client,
     config: &SourceConfig,
     capture_plan: &CapturePlan,
+    publish_via_partition_root: bool,
 ) -> Result<PublicationAlignment, PostgresError> {
     let published_rows = client
         .query(
             r#"
-            SELECT schemaname, tablename
-            FROM pg_publication_tables
-            WHERE pubname = $1
-            ORDER BY schemaname, tablename
+            SELECT
+                tables.schemaname,
+                tables.tablename,
+                relation.prattrs IS NOT NULL AS has_column_filter,
+                relation.prqual IS NOT NULL AS has_row_filter
+            FROM pg_publication_tables AS tables
+            JOIN pg_publication AS publication ON publication.pubname = tables.pubname
+            JOIN pg_namespace AS namespace ON namespace.nspname = tables.schemaname
+            JOIN pg_class AS class
+              ON class.relnamespace = namespace.oid
+             AND class.relname = tables.tablename
+            LEFT JOIN pg_publication_rel AS relation
+              ON relation.prpubid = publication.oid
+             AND relation.prrelid = class.oid
+            WHERE tables.pubname = $1
+            ORDER BY tables.schemaname, tables.tablename
             "#,
             &[&config.publication],
         )
@@ -802,11 +864,47 @@ async fn validate_publication_alignment(
             format!("{schema}.{table}")
         })
         .collect::<BTreeSet<_>>();
+    let restricted_tables = published_rows
+        .iter()
+        .filter_map(|row| {
+            let has_column_filter: bool = row.get(2);
+            let has_row_filter: bool = row.get(3);
+            (has_column_filter || has_row_filter).then(|| {
+                let schema: String = row.get(0);
+                let table: String = row.get(1);
+                format!("{schema}.{table}")
+            })
+        })
+        .collect::<BTreeSet<_>>();
 
     let database_rows = client
         .query(
             r#"
-            SELECT namespace.nspname, relation.relname
+            SELECT
+                namespace.nspname,
+                relation.relname,
+                relation.relkind::text,
+                relation.relispartition,
+                relation.relreplident::text,
+                relation.relreplident = 'f'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM pg_index AS identity_index
+                    WHERE identity_index.indrelid = relation.oid
+                      AND identity_index.indisvalid
+                      AND (
+                        (relation.relreplident = 'd' AND identity_index.indisprimary)
+                        OR (relation.relreplident = 'i' AND identity_index.indisreplident)
+                      )
+                  ) AS has_usable_replica_identity
+                , EXISTS (
+                    SELECT 1
+                    FROM pg_attribute AS generated_column
+                    WHERE generated_column.attrelid = relation.oid
+                      AND generated_column.attnum > 0
+                      AND NOT generated_column.attisdropped
+                      AND generated_column.attgenerated <> ''
+                  ) AS has_generated_columns
             FROM pg_class AS relation
             JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
             WHERE relation.relkind IN ('r', 'p')
@@ -820,12 +918,22 @@ async fn validate_publication_alignment(
         .await?;
     let database_tables = database_rows
         .iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, bool>(3),
+                row.get::<_, String>(4),
+                row.get::<_, bool>(5),
+                row.get::<_, bool>(6),
+            )
+        })
         .collect::<Vec<_>>();
     let required_tables = capture_plan.required_tables(
         database_tables
             .iter()
-            .map(|(schema, table)| (schema.as_str(), table.as_str())),
+            .map(|(schema, table, ..)| (schema.as_str(), table.as_str())),
     );
     let missing_tables = required_tables
         .difference(&published_tables)
@@ -837,6 +945,54 @@ async fn validate_publication_alignment(
             config.publication,
             missing_tables.join(", ")
         )));
+    }
+    let restricted_required = required_tables
+        .intersection(&restricted_tables)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !restricted_required.is_empty() {
+        return Err(PostgresError::Configuration(format!(
+            "publication {:?} applies a row or column filter to configured capture tables: {}",
+            config.publication,
+            restricted_required.join(", ")
+        )));
+    }
+    for (
+        schema,
+        table,
+        relation_kind,
+        is_partition,
+        replica_identity,
+        usable_identity,
+        has_generated_columns,
+    ) in &database_tables
+    {
+        let qualified = format!("{schema}.{table}");
+        if !required_tables.contains(&qualified) {
+            continue;
+        }
+        if relation_kind == "p" && !publish_via_partition_root {
+            return Err(PostgresError::Configuration(format!(
+                "configured partitioned table {qualified} requires publication {:?} WITH (publish_via_partition_root = true)",
+                config.publication
+            )));
+        }
+        if *is_partition && publish_via_partition_root {
+            return Err(PostgresError::Configuration(format!(
+                "configured leaf partition {qualified} cannot be captured by name while publication {:?} routes changes through partition roots",
+                config.publication
+            )));
+        }
+        if !usable_identity {
+            return Err(PostgresError::Configuration(format!(
+                "configured table {qualified} has replica identity {replica_identity:?} without a usable identity; configure a primary key, REPLICA IDENTITY USING INDEX, or REPLICA IDENTITY FULL"
+            )));
+        }
+        if *has_generated_columns {
+            return Err(PostgresError::Configuration(format!(
+                "configured table {qualified} contains generated columns, which PostgreSQL 17 pgoutput does not publish"
+            )));
+        }
     }
 
     let unnecessary_published_tables = published_tables

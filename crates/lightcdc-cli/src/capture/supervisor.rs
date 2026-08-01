@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use lightcdc_core::{Config, SourceConfig};
-use lightcdc_postgres::{LogicalHeartbeatEmitter, ReplicationReader};
+use lightcdc_postgres::{LIGHTCDC_HEARTBEAT_PREFIX, LogicalHeartbeatEmitter, ReplicationReader};
 use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle, RuntimeState};
 use lightcdc_storage::RetentionPolicy;
 use tracing::{info, warn};
@@ -16,7 +16,6 @@ use super::{
 
 const RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
-const HEARTBEAT_PREFIX: &str = "lightcdc.heartbeat";
 
 /// Combines a retention policy with its background sweep interval.
 #[derive(Clone, Copy)]
@@ -317,7 +316,7 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    match emitter.emit(HEARTBEAT_PREFIX, &content).await {
+                    match emitter.emit(LIGHTCDC_HEARTBEAT_PREFIX, &content).await {
                         Ok(lsn) => {
                             tracing::debug!(%lsn, "emitted PostgreSQL logical heartbeat");
                         }

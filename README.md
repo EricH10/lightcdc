@@ -17,6 +17,9 @@ ordered consumer and acknowledgement contract.
 See [`docs/redis-connector.md`](docs/redis-connector.md) for the optional,
 crash-safe Redis cache invalidation and update connector.
 
+See [`docs/postgres-support.md`](docs/postgres-support.md) for the PostgreSQL 17
+feature matrix, change-only bootstrap boundary, and least-privilege role.
+
 ## Prerequisites
 
 - Rust 1.89 or newer

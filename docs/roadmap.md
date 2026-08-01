@@ -37,6 +37,10 @@ them has optional work remaining.
   including partitioned tables, replica identity modes, schema changes,
   publication changes, messages, streaming transactions, and prepared
   transactions. Unsupported modes must fail before acknowledging affected WAL.
+  DONE for the PostgreSQL 17 release boundary: startup validates publication
+  operations/filters, partition routing, replica identity, generated columns,
+  and two-phase slots; arbitrary logical messages fail before ACK; protocol-v1
+  transaction streaming and prepared transactions are not requested.
 - Derive the union of tables required by configured durable streams and push
   that selection into the PostgreSQL publication. Capture must not depend on
   which consumers happen to be connected, and startup must reject missing
@@ -52,7 +56,9 @@ them has optional work remaining.
   DONE with configurable transactional logical heartbeats.
 - Provide a consistent bootstrap procedure: either a built-in initial snapshot
   or a documented external snapshot plus resume-LSN workflow. A change-only
-  release must say so prominently.
+  release must say so prominently. DONE as an explicit change-only limitation;
+  the support matrix requires an externally coordinated downstream snapshot
+  when historical rows are needed. A built-in snapshot remains future work.
 - Version the durable event, metadata, consumer-offset, and staging formats.
   Test forward migrations and reject unsupported downgrade or newer formats
   without mutating the store. DONE: control v2 and segment v2 have tested v1
@@ -129,6 +135,8 @@ them has optional work remaining.
   accidentally written to logs and capture throughput is not silently reduced.
   DONE; JSON output requires explicit CLI opt-in.
 - Document a least-privilege PostgreSQL role and test it in integration tests.
+  DONE with a non-superuser `LOGIN REPLICATION` role limited to database
+  connect, schema usage, and configured-table select privileges.
 
 ### Operations, Releases, and Support
 

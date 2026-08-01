@@ -955,6 +955,160 @@ async fn capture_exits_when_a_configured_table_is_missing_from_the_publication()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose postgres on localhost:5432"]
+async fn source_validation_rejects_lossy_publication_and_identity_settings() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let config = Config::from_path(&config_path)?;
+    let capture_plan = config.capture_plan()?;
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {} SET (publish = 'insert')",
+            fixture.publication
+        ))
+        .await?;
+    let error = validate_source_config_with_plan(&config.source, &capture_plan)
+        .await
+        .expect_err("partial operation publication must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("missing update, delete, truncate")
+    );
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate'); \
+             ALTER PUBLICATION {} SET TABLE public.{} WHERE (total_cents > 0)",
+            fixture.publication, fixture.publication, fixture.table
+        ))
+        .await?;
+    let error = validate_source_config_with_plan(&config.source, &capture_plan)
+        .await
+        .expect_err("row-filtered publication must fail");
+    assert!(error.to_string().contains("row or column filter"));
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {} SET TABLE public.{}; \
+             ALTER TABLE public.{} REPLICA IDENTITY NOTHING",
+            fixture.publication, fixture.table, fixture.table
+        ))
+        .await?;
+    let error = validate_source_config_with_plan(&config.source, &capture_plan)
+        .await
+        .expect_err("missing replica identity must fail");
+    assert!(error.to_string().contains("without a usable identity"));
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "ALTER TABLE public.{} REPLICA IDENTITY FULL; \
+             ALTER TABLE public.{} ADD COLUMN generated_total BIGINT \
+             GENERATED ALWAYS AS (total_cents * 2) STORED",
+            fixture.table, fixture.table
+        ))
+        .await?;
+    let error = validate_source_config_with_plan(&config.source, &capture_plan)
+        .await
+        .expect_err("generated columns must fail");
+    assert!(error.to_string().contains("generated columns"));
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn unsupported_logical_message_stops_before_transaction_persistence() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let store = open_store(temp.path().to_path_buf())?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(store.next_sequence()?);
+
+    fixture
+        .client
+        .batch_execute(&format!(
+            "BEGIN; \
+             INSERT INTO public.{} (customer_email, total_cents) \
+             VALUES ('message@example.com', 1); \
+             SELECT pg_logical_emit_message(true, 'application.message', 'payload'); \
+             COMMIT",
+            fixture.table
+        ))
+        .await?;
+
+    let error = match timeout(Duration::from_secs(15), reader.next_transaction()).await? {
+        Ok(_) => anyhow::bail!("unsupported logical message must stop capture"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        lightcdc_postgres::PostgresError::UnsupportedFeature(_)
+    ));
+    assert!(store.replay_from(1, 10)?.is_empty());
+    assert_eq!(store.source_offset(&fixture.source_name)?, None);
+
+    reader.shutdown().await?;
+    drop(store);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn least_privilege_replication_role_validates_and_captures() -> anyhow::Result<()> {
+    let fixture = PgFixture::create().await?;
+    let role = format!("lightcdc_reader_{}", unique_suffix());
+    let password = "least-privilege-password";
+    let temp = TempDir::new()?;
+    let config_path = temp.path().join("lightcdc-test.toml");
+    write_test_config(&config_path, temp.path(), &fixture)?;
+    let config = Config::from_path(config_path)?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN REPLICATION PASSWORD '{password}'; \
+             GRANT CONNECT ON DATABASE lightcdc TO {role}; \
+             GRANT USAGE ON SCHEMA public TO {role}; \
+             GRANT SELECT ON TABLE public.{table} TO {role}",
+            table = fixture.table
+        ))
+        .await?;
+
+    let mut source = config.source.clone();
+    source.user = role.clone();
+    source.password = password.to_owned();
+    let capture_plan = config.capture_plan()?;
+    validate_source_config_with_plan(&source, &capture_plan).await?;
+    let mut reader = ReplicationReader::connect(source).await?;
+    fixture.insert("least-privilege@example.com", 1).await?;
+    let transaction = timeout(Duration::from_secs(15), reader.next_transaction())
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("replication ended before least-privilege event"))?;
+    assert_eq!(transaction.events.len(), 1);
+    reader.shutdown().await?;
+
+    fixture.cleanup().await?;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "REVOKE CONNECT ON DATABASE lightcdc FROM {role}; \
+             REVOKE USAGE ON SCHEMA public FROM {role}; \
+             DROP ROLE {role}"
+        ))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
 async fn capture_rejects_a_replaced_postgres_source_without_mutating_identity() -> anyhow::Result<()>
 {
     let fixture = PgFixture::create().await?;
