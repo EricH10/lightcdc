@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 lightcdc-core = { path = "../lightcdc-core" }
 lightcdc-runtime = { path = "../lightcdc-runtime" }
 lightcdc-storage = { path = "../lightcdc-storage" }
@@ -23,7 +24,6 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-anyhow.workspace = true
 clap.workspace = true
 hdrhistogram.workspace = true
 serde_json.workspace = true

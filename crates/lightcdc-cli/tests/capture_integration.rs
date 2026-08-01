@@ -1345,6 +1345,7 @@ port = {port}
 database = {database}
 user = {user}
 password = {password}
+tls_mode = "disable"
 publication = {publication}
 slot = {slot}
 
@@ -1363,6 +1364,9 @@ capture_batch_max_delay_ms = {capture_batch_max_delay_ms}
 
 [logging]
 level = "info"
+
+[api]
+allow_insecure_localhost = true
 
 [[streams]]
 name = "orders"
@@ -1601,6 +1605,10 @@ impl PgFixture {
             database: "lightcdc".to_owned(),
             user: "lightcdc".to_owned(),
             password: "lightcdc".to_owned(),
+            password_env: None,
+            password_file: None,
+            tls_mode: lightcdc_core::PostgresTlsMode::Disable,
+            tls_ca_file: None,
             publication: publication.clone(),
             slot: slot.clone(),
         };

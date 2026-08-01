@@ -20,6 +20,9 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     /// Process logging configuration.
     pub logging: LoggingConfig,
+    /// gRPC transport and authorization policy.
+    #[serde(default)]
+    pub api: ApiConfig,
     /// Durable consumer-facing stream definitions.
     #[serde(default = "default_streams")]
     pub streams: Vec<StreamConfig>,
@@ -39,12 +42,36 @@ pub struct SourceConfig {
     pub database: String,
     /// Login role with replication privileges.
     pub user: String,
-    /// Login password used by PostgreSQL clients.
+    /// Login password used by PostgreSQL clients; prefer an env var or file.
+    #[serde(default)]
     pub password: String,
+    /// Environment variable containing the PostgreSQL password.
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// File containing only the PostgreSQL password.
+    #[serde(default)]
+    pub password_file: Option<String>,
+    /// PostgreSQL transport security; defaults to certificate and hostname verification.
+    #[serde(default)]
+    pub tls_mode: PostgresTlsMode,
+    /// Optional PEM CA bundle used instead of platform roots.
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
     /// Operator-managed publication read by pgoutput.
     pub publication: String,
     /// Durable logical replication slot assigned to this LightCDC source.
     pub slot: String,
+}
+
+/// Supported PostgreSQL TLS modes avoid encryption without authentication.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresTlsMode {
+    /// Local-development opt-out for a server without TLS.
+    Disable,
+    /// Verify the certificate chain and configured PostgreSQL hostname.
+    #[default]
+    VerifyFull,
 }
 
 /// Describes local runtime settings such as storage paths and buffer sizes.
@@ -121,6 +148,39 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// Controls secure gRPC binding, TLS identity, and bearer principals.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ApiConfig {
+    /// Explicitly permits plaintext unauthenticated serving on loopback only.
+    #[serde(default)]
+    pub allow_insecure_localhost: bool,
+    /// PEM certificate chain presented by the gRPC server.
+    #[serde(default)]
+    pub tls_cert_file: Option<String>,
+    /// PEM private key paired with `tls_cert_file`.
+    #[serde(default)]
+    pub tls_key_file: Option<String>,
+    /// Bearer principals authorized to consume configured streams.
+    #[serde(default)]
+    pub tokens: Vec<ApiTokenConfig>,
+}
+
+/// Resolves one bearer token and its least-privilege stream permissions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiTokenConfig {
+    /// Stable operator-facing principal name; never treated as a credential.
+    pub name: String,
+    /// Environment variable containing the bearer token.
+    pub token_env: Option<String>,
+    /// File containing only the bearer token.
+    pub token_file: Option<String>,
+    /// Allowed stream names, or `*` for every configured stream.
+    pub streams: Vec<String>,
+    /// Separately authorizes the administrative seek operation.
+    #[serde(default)]
+    pub allow_seek: bool,
+}
+
 /// Names a consumable stream and the tables it includes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamConfig {
@@ -185,10 +245,16 @@ impl Config {
             source,
         })?;
 
-        let config: Self = toml::from_str(&raw).map_err(|source| Error::ParseConfig {
+        let mut config: Self = toml::from_str(&raw).map_err(|source| Error::ParseConfig {
             path: path.display().to_string(),
             source,
         })?;
+        config
+            .resolve_source_password()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
         config
             .capture_plan()
             .map_err(|error| Error::InvalidConfig {
@@ -197,6 +263,12 @@ impl Config {
             })?;
         config
             .validate_runtime()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
+        config
+            .validate_api()
             .map_err(|reason| Error::InvalidConfig {
                 path: path.display().to_string(),
                 reason,
@@ -315,6 +387,75 @@ impl Config {
         ] {
             if limit == Some(0) {
                 return Err(format!("{name} must be greater than zero when configured"));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_source_password(&mut self) -> std::result::Result<(), String> {
+        let direct = (!self.source.password.is_empty()).then_some(self.source.password.clone());
+        let selected = usize::from(direct.is_some())
+            + usize::from(self.source.password_env.is_some())
+            + usize::from(self.source.password_file.is_some());
+        if selected != 1 {
+            return Err(
+                "configure exactly one of source.password, source.password_env, or source.password_file"
+                    .to_owned(),
+            );
+        }
+        self.source.password = match (
+            direct,
+            &self.source.password_env,
+            &self.source.password_file,
+        ) {
+            (Some(password), None, None) => password,
+            (None, Some(variable), None) => std::env::var(variable).map_err(|_| {
+                format!("PostgreSQL password environment variable {variable:?} is unset")
+            })?,
+            (None, None, Some(path)) => fs::read_to_string(path)
+                .map_err(|error| {
+                    format!("failed to read PostgreSQL password file {path:?}: {error}")
+                })?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned(),
+            _ => unreachable!("exactly one password source was selected"),
+        };
+        if self.source.password.is_empty() {
+            return Err("PostgreSQL password must not be empty".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_api(&self) -> std::result::Result<(), String> {
+        if self.api.tls_cert_file.is_some() != self.api.tls_key_file.is_some() {
+            return Err(
+                "api.tls_cert_file and api.tls_key_file must be configured together".to_owned(),
+            );
+        }
+        let mut names = HashSet::new();
+        for token in &self.api.tokens {
+            if token.name.trim().is_empty() || !names.insert(token.name.as_str()) {
+                return Err("API token principal names must be nonempty and unique".to_owned());
+            }
+            if token.token_env.is_some() == token.token_file.is_some() {
+                return Err(format!(
+                    "API principal {:?} must configure exactly one of token_env or token_file",
+                    token.name
+                ));
+            }
+            if token.streams.is_empty() {
+                return Err(format!(
+                    "API principal {:?} must allow at least one stream",
+                    token.name
+                ));
+            }
+            for stream in &token.streams {
+                if stream != "*" && self.stream(stream).is_none() {
+                    return Err(format!(
+                        "API principal {:?} references unknown stream {stream:?}",
+                        token.name
+                    ));
+                }
             }
         }
         Ok(())
@@ -574,6 +715,7 @@ mod tests {
     use crate::{Operation, SourceMetadata};
 
     use super::{CapturePlanError, Config, StreamConfig};
+    use tempfile::TempDir;
 
     #[test]
     fn transaction_limits_have_bounded_defaults() {
@@ -748,6 +890,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_password_can_be_loaded_from_a_secret_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let secret = temp.path().join("postgres-password");
+        std::fs::write(&secret, "file-secret\n").expect("write secret");
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        config.source.password.clear();
+        config.source.password_file = Some(secret.display().to_string());
+
+        config.resolve_source_password().expect("resolve password");
+
+        assert_eq!(config.source.password, "file-secret");
+    }
+
+    #[test]
+    fn api_policy_rejects_unknown_streams_and_ambiguous_token_sources() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        config.api.tokens.push(super::ApiTokenConfig {
+            name: "reader".to_owned(),
+            token_env: Some("TOKEN".to_owned()),
+            token_file: Some("token.file".to_owned()),
+            streams: vec!["missing".to_owned()],
+            allow_seek: false,
+        });
+        assert!(
+            config
+                .validate_api()
+                .expect_err("ambiguous token source")
+                .contains("exactly one")
+        );
+
+        config.api.tokens[0].token_file = None;
+        assert!(
+            config
+                .validate_api()
+                .expect_err("unknown stream")
+                .contains("unknown stream")
+        );
+    }
+
     fn config_with_streams(streams: Vec<StreamConfig>) -> Config {
         Config {
             source: super::SourceConfig {
@@ -757,6 +947,10 @@ mod tests {
                 database: "lightcdc".to_owned(),
                 user: "lightcdc".to_owned(),
                 password: "secret".to_owned(),
+                password_env: None,
+                password_file: None,
+                tls_mode: super::PostgresTlsMode::Disable,
+                tls_ca_file: None,
                 publication: "publication".to_owned(),
                 slot: "slot".to_owned(),
             },
@@ -786,6 +980,10 @@ mod tests {
             },
             logging: super::LoggingConfig {
                 level: "info".to_owned(),
+            },
+            api: super::ApiConfig {
+                allow_insecure_localhost: true,
+                ..super::ApiConfig::default()
             },
             streams,
         }

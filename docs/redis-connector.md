@@ -61,11 +61,35 @@ ttl_seconds = 3600
 
 PostgreSQL text-format values are JSON strings, so `{id}` renders without JSON
 quotes. Placeholders must resolve to non-null scalar fields. In production,
-put credentials in an environment variable instead of TOML:
+put credentials in environment variables or mounted secret files instead of
+TOML:
 
 ```toml
+[lightcdc]
+endpoint = "https://lightcdc.internal:50051"
+stream = "orders"
+consumer = "redis-orders-cache"
+token_file = "/run/secrets/lightcdc-api-token"
+# tls_ca_file = "/run/secrets/lightcdc-ca.pem" # private CA only
+
 [redis]
-url_env = "LIGHTCDC_REDIS_URL"
+url_file = "/run/secrets/redis-url"
+```
+
+The matching LightCDC API principal must allow this stream and must grant seek.
+Seek is required because the connector reconciles the LightCDC consumer offset
+to its atomically stored Redis progress after every restart:
+
+```toml
+[api]
+tls_cert_file = "/run/secrets/lightcdc-server.pem"
+tls_key_file = "/run/secrets/lightcdc-server-key.pem"
+
+[[api.tokens]]
+name = "redis-orders-cache"
+token_file = "/run/secrets/lightcdc-api-token"
+streams = ["orders"]
+allow_seek = true
 ```
 
 `redis://` and certificate-verified `rediss://` URLs are supported by the Redis
@@ -83,6 +107,9 @@ different hash slots.
 - Cache changes made outside this connector are outside its delivery guarantee.
 - LightCDC retention must exceed the longest expected Redis outage. Otherwise a
   stale connector requires a deliberate cache rebuild and seek.
+- Redis and LightCDC are not one distributed transaction. The Redis-side
+  sequence makes crashes idempotent, but restoring only one system to a newer
+  point than the other requires replay or a deliberate cache rebuild.
 
 Run the live atomicity and duplicate-replay test with:
 

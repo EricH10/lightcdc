@@ -2,11 +2,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
-use lightcdc_core::{ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
+use anyhow::Context;
+use lightcdc_core::{ApiConfig, ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
 use lightcdc_runtime::{
     CaptureStorageHandle, CaptureStorageWriter, RuntimeState, RuntimeStateReceiver, ShutdownHandle,
     ShutdownReceiver, runtime_state_channel, shutdown_channel,
@@ -14,7 +16,11 @@ use lightcdc_runtime::{
 use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    metadata::MetadataMap,
+    transport::{Identity, Server, ServerTlsConfig},
+};
 use tonic_health::ServingStatus;
 use tracing::{info, warn};
 
@@ -49,6 +55,117 @@ pub struct LightCdcService {
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
     /// Bounds acknowledgements to sequences this process actually delivered.
     delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
+    /// Resolved bearer principals and per-stream permissions.
+    authorizer: Arc<ApiAuthorizer>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ApiAuthorizer {
+    principals: Vec<ApiPrincipal>,
+}
+
+#[derive(Clone, Debug)]
+struct ApiPrincipal {
+    name: String,
+    token: Vec<u8>,
+    streams: HashSet<String>,
+    allow_seek: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ApiPermission {
+    Consume,
+    Seek,
+}
+
+impl ApiAuthorizer {
+    fn from_config(config: &ApiConfig) -> anyhow::Result<Self> {
+        let mut principals = Vec::with_capacity(config.tokens.len());
+        for principal in &config.tokens {
+            let token = match (&principal.token_env, &principal.token_file) {
+                (Some(variable), None) => std::env::var(variable).with_context(|| {
+                    format!(
+                        "API token environment variable {variable:?} for principal {:?} is unset",
+                        principal.name
+                    )
+                })?,
+                (None, Some(path)) => fs::read_to_string(path)
+                    .with_context(|| {
+                        format!(
+                            "read API token file {path:?} for principal {:?}",
+                            principal.name
+                        )
+                    })?
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned(),
+                _ => anyhow::bail!(
+                    "API principal {:?} must configure exactly one token source",
+                    principal.name
+                ),
+            };
+            if token.is_empty() {
+                anyhow::bail!("API token for principal {:?} is empty", principal.name);
+            }
+            if principals
+                .iter()
+                .any(|existing: &ApiPrincipal| constant_time_eq(&existing.token, token.as_bytes()))
+            {
+                anyhow::bail!("API principals must not resolve to duplicate bearer tokens");
+            }
+            principals.push(ApiPrincipal {
+                name: principal.name.clone(),
+                token: token.into_bytes(),
+                streams: principal.streams.iter().cloned().collect(),
+                allow_seek: principal.allow_seek,
+            });
+        }
+        Ok(Self { principals })
+    }
+
+    fn authorize(
+        &self,
+        metadata: &MetadataMap,
+        stream: &str,
+        permission: ApiPermission,
+    ) -> Result<(), Status> {
+        if self.principals.is_empty() {
+            return Ok(());
+        }
+        let bearer = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or_else(|| Status::unauthenticated("valid bearer token required"))?;
+        let principal = self
+            .principals
+            .iter()
+            .find(|principal| constant_time_eq(&principal.token, bearer.as_bytes()))
+            .ok_or_else(|| Status::unauthenticated("valid bearer token required"))?;
+        if !principal.streams.contains("*") && !principal.streams.contains(stream) {
+            warn!(principal = %principal.name, %stream, "gRPC stream access denied");
+            return Err(Status::permission_denied(
+                "principal is not authorized for this stream",
+            ));
+        }
+        if matches!(permission, ApiPermission::Seek) && !principal.allow_seek {
+            warn!(principal = %principal.name, %stream, "gRPC seek access denied");
+            return Err(Status::permission_denied(
+                "principal is not authorized to seek consumers",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
+    let mut difference = expected.len() ^ actual.len();
+    for index in 0..expected.len().max(actual.len()) {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or_default()
+                ^ actual.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
 }
 
 /// Identifies one consumer independently within one configured stream.
@@ -96,6 +213,17 @@ impl Drop for ActiveSubscription {
     }
 }
 
+/// Groups constructor-only dependencies so service ownership remains explicit.
+struct ServiceParts {
+    config: Config,
+    store: RedbEventStore,
+    event_notifier: EventNotifier,
+    storage_writer: CaptureStorageHandle,
+    storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
+    shutdown: ShutdownReceiver,
+    shutdown_owner: Option<ShutdownHandle>,
+}
+
 impl LightCdcService {
     /// Creates a gRPC service from configuration and a shared event store.
     pub fn new(config: Config, store: RedbEventStore) -> Self {
@@ -115,14 +243,43 @@ impl LightCdcService {
         );
         let storage_writer = storage_writer_owner.handle();
         Self::from_parts(
-            config,
-            store,
-            event_notifier,
-            storage_writer,
-            Some(storage_writer_owner),
-            shutdown,
-            Some(shutdown_owner),
+            ServiceParts {
+                config,
+                store,
+                event_notifier,
+                storage_writer,
+                storage_writer_owner: Some(storage_writer_owner),
+                shutdown,
+                shutdown_owner: Some(shutdown_owner),
+            },
+            ApiAuthorizer::default(),
         )
+    }
+
+    fn new_authorized(
+        config: Config,
+        store: RedbEventStore,
+        event_notifier: EventNotifier,
+    ) -> anyhow::Result<Self> {
+        let authorizer = ApiAuthorizer::from_config(&config.api)?;
+        let (shutdown_owner, shutdown) = shutdown_channel();
+        let storage_writer_owner = Arc::new(CaptureStorageWriter::start(
+            store.clone(),
+            config.source.name.clone(),
+        )?);
+        let storage_writer = storage_writer_owner.handle();
+        Ok(Self::from_parts(
+            ServiceParts {
+                config,
+                store,
+                event_notifier,
+                storage_writer,
+                storage_writer_owner: Some(storage_writer_owner),
+                shutdown,
+                shutdown_owner: Some(shutdown_owner),
+            },
+            authorizer,
+        ))
     }
 
     /// Creates a service sharing an existing capture storage writer.
@@ -134,13 +291,16 @@ impl LightCdcService {
     ) -> Self {
         let (shutdown_owner, shutdown) = shutdown_channel();
         Self::from_parts(
-            config,
-            store,
-            event_notifier,
-            storage_writer,
-            None,
-            shutdown,
-            Some(shutdown_owner),
+            ServiceParts {
+                config,
+                store,
+                event_notifier,
+                storage_writer,
+                storage_writer_owner: None,
+                shutdown,
+                shutdown_owner: Some(shutdown_owner),
+            },
+            ApiAuthorizer::default(),
         )
     }
 
@@ -151,52 +311,80 @@ impl LightCdcService {
         event_notifier: EventNotifier,
         storage_writer: CaptureStorageHandle,
         shutdown: ShutdownReceiver,
-    ) -> Self {
-        Self::from_parts(
-            config,
-            store,
-            event_notifier,
-            storage_writer,
-            None,
-            shutdown,
-            None,
-        )
+    ) -> anyhow::Result<Self> {
+        let authorizer = ApiAuthorizer::from_config(&config.api)?;
+        Ok(Self::from_parts(
+            ServiceParts {
+                config,
+                store,
+                event_notifier,
+                storage_writer,
+                storage_writer_owner: None,
+                shutdown,
+                shutdown_owner: None,
+            },
+            authorizer,
+        ))
     }
 
-    fn from_parts(
-        config: Config,
-        store: RedbEventStore,
-        event_notifier: EventNotifier,
-        storage_writer: CaptureStorageHandle,
-        storage_writer_owner: Option<Arc<CaptureStorageWriter>>,
-        shutdown: ShutdownReceiver,
-        shutdown_owner: Option<ShutdownHandle>,
-    ) -> Self {
+    fn from_parts(parts: ServiceParts, authorizer: ApiAuthorizer) -> Self {
         Self {
-            config: Arc::new(config),
-            store: Arc::new(store),
-            storage_writer,
-            _storage_writer_owner: storage_writer_owner,
-            shutdown,
-            _shutdown_owner: shutdown_owner,
-            event_notifier,
+            config: Arc::new(parts.config),
+            store: Arc::new(parts.store),
+            storage_writer: parts.storage_writer,
+            _storage_writer_owner: parts.storage_writer_owner,
+            shutdown: parts.shutdown,
+            _shutdown_owner: parts.shutdown_owner,
+            event_notifier: parts.event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            authorizer: Arc::new(authorizer),
         }
     }
 }
 
+/// Prevents an unauthenticated plaintext API from binding beyond loopback.
+fn validate_api_binding(addr: SocketAddr, config: &ApiConfig) -> anyhow::Result<()> {
+    let tls_enabled = config.tls_cert_file.is_some() && config.tls_key_file.is_some();
+    if addr.ip().is_loopback() {
+        if !tls_enabled && !config.allow_insecure_localhost {
+            anyhow::bail!("plaintext loopback gRPC requires api.allow_insecure_localhost = true");
+        }
+        return Ok(());
+    }
+    if !tls_enabled {
+        anyhow::bail!("non-loopback gRPC binding requires api TLS certificate and key files");
+    }
+    if config.tokens.is_empty() {
+        anyhow::bail!("non-loopback gRPC binding requires at least one API bearer principal");
+    }
+    Ok(())
+}
+
+/// Loads the PEM identity only after binding policy has accepted the config.
+fn server_tls_identity(config: &ApiConfig) -> anyhow::Result<Option<Identity>> {
+    match (&config.tls_cert_file, &config.tls_key_file) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = fs::read(cert_path)
+                .with_context(|| format!("read gRPC TLS certificate {cert_path:?}"))?;
+            let key = fs::read(key_path)
+                .with_context(|| format!("read gRPC TLS private key {key_path:?}"))?;
+            Ok(Some(Identity::from_pem(cert, key)))
+        }
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("gRPC TLS certificate and key must be configured together"),
+    }
+}
+
 /// Runs the lightcdc gRPC server until it is stopped.
-pub async fn serve(
-    addr: SocketAddr,
-    config: Config,
-    store: RedbEventStore,
-) -> Result<(), tonic::transport::Error> {
-    let service = LightCdcService::new(config, store);
+pub async fn serve(addr: SocketAddr, config: Config, store: RedbEventStore) -> anyhow::Result<()> {
+    validate_api_binding(addr, &config.api)?;
+    let tls = server_tls_identity(&config.api)?;
     let (state, state_rx) = runtime_state_channel();
     state.transition(RuntimeState::Capturing, None);
     let (_shutdown, shutdown_rx) = shutdown_channel();
-    serve_service(addr, service, state_rx, shutdown_rx).await
+    let service = LightCdcService::new_authorized(config, store, EventNotifier::new())?;
+    serve_service(addr, service, state_rx, shutdown_rx, tls).await
 }
 
 /// Runs the gRPC server with notifications from an in-process capture loop.
@@ -206,13 +394,20 @@ pub async fn serve_with_notifier(
     store: RedbEventStore,
     event_notifier: EventNotifier,
     storage_writer: CaptureStorageHandle,
-) -> Result<(), tonic::transport::Error> {
-    let service =
-        LightCdcService::new_with_storage_writer(config, store, event_notifier, storage_writer);
+) -> anyhow::Result<()> {
     let (state, state_rx) = runtime_state_channel();
     state.transition(RuntimeState::Capturing, None);
     let (_shutdown, shutdown_rx) = shutdown_channel();
-    serve_service(addr, service, state_rx, shutdown_rx).await
+    serve_with_runtime(
+        addr,
+        config,
+        store,
+        event_notifier,
+        storage_writer,
+        state_rx,
+        shutdown_rx,
+    )
+    .await
 }
 
 /// Runs gRPC with externally coordinated runtime state and graceful shutdown.
@@ -224,15 +419,17 @@ pub async fn serve_with_runtime(
     storage_writer: CaptureStorageHandle,
     state: RuntimeStateReceiver,
     shutdown: ShutdownReceiver,
-) -> Result<(), tonic::transport::Error> {
+) -> anyhow::Result<()> {
+    validate_api_binding(addr, &config.api)?;
+    let tls = server_tls_identity(&config.api)?;
     let service = LightCdcService::new_with_runtime(
         config,
         store,
         event_notifier,
         storage_writer,
         shutdown.clone(),
-    );
-    serve_service(addr, service, state, shutdown).await
+    )?;
+    serve_service(addr, service, state, shutdown, tls).await
 }
 
 /// Registers an already-built service with tonic and listens on the address.
@@ -241,18 +438,25 @@ async fn serve_service(
     service: LightCdcService,
     state: RuntimeStateReceiver,
     mut shutdown: ShutdownReceiver,
-) -> Result<(), tonic::transport::Error> {
+    tls: Option<Identity>,
+) -> anyhow::Result<()> {
     info!(%addr, "starting lightcdc gRPC server");
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     let health_task = tokio::spawn(report_health(health_reporter, state, shutdown.clone()));
-    let result = Server::builder()
+    let mut server = Server::builder();
+    if let Some(identity) = tls {
+        server = server
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .context("configure gRPC TLS identity")?;
+    }
+    let result = server
         .add_service(health_service)
         .add_service(LightCdcServer::new(service))
         .serve_with_shutdown(addr, async move { shutdown.cancelled().await })
         .await;
     health_task.abort();
     let _ = health_task.await;
-    result
+    result.context("serve gRPC API")
 }
 
 const LIVENESS_SERVICE: &str = "lightcdc.liveness";
@@ -309,6 +513,11 @@ impl LightCdc for LightCdcService {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        self.authorizer.authorize(
+            request.metadata(),
+            &request.get_ref().stream,
+            ApiPermission::Consume,
+        )?;
         let request = request.into_inner();
         let consumer = validate_consumer(
             &request.consumer,
@@ -401,6 +610,11 @@ impl LightCdc for LightCdcService {
 
     /// Saves the last event sequence successfully handled by a consumer.
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
+        self.authorizer.authorize(
+            request.metadata(),
+            &request.get_ref().stream,
+            ApiPermission::Consume,
+        )?;
         let request = request.into_inner();
         let consumer = validate_consumer(
             &request.consumer,
@@ -437,6 +651,11 @@ impl LightCdc for LightCdcService {
 
     /// Moves a consumer offset to earliest, latest, or an absolute sequence.
     async fn seek(&self, request: Request<SeekRequest>) -> Result<Response<SeekResponse>, Status> {
+        self.authorizer.authorize(
+            request.metadata(),
+            &request.get_ref().stream,
+            ApiPermission::Seek,
+        )?;
         let request = request.into_inner();
         let consumer = validate_consumer(
             &request.consumer,
@@ -775,6 +994,78 @@ mod tests {
             .await
             .expect_err("subscription count limit");
         assert_eq!(limit_error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn bearer_principals_enforce_stream_and_seek_permissions() {
+        let mut service = service_with_events(&[event(1, "public", "orders")]);
+        service.service.authorizer = Arc::new(ApiAuthorizer {
+            principals: vec![ApiPrincipal {
+                name: "orders-reader".to_owned(),
+                token: b"secret-token".to_vec(),
+                streams: HashSet::from(["orders".to_owned()]),
+                allow_seek: false,
+            }],
+        });
+
+        let missing = service
+            .subscribe(Request::new(subscription("reader", 1)))
+            .await
+            .expect_err("missing bearer token");
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let mut seek_request = Request::new(SeekRequest {
+            stream: "orders".to_owned(),
+            consumer: "reader".to_owned(),
+            position: SeekPosition::Latest as i32,
+            sequence: 0,
+        });
+        seek_request.metadata_mut().insert(
+            "authorization",
+            "Bearer secret-token"
+                .parse()
+                .expect("authorization metadata"),
+        );
+        let denied = service
+            .seek(seek_request)
+            .await
+            .expect_err("seek needs separate permission");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let mut subscribe_request = Request::new(subscription("reader", 1));
+        subscribe_request.metadata_mut().insert(
+            "authorization",
+            "Bearer secret-token"
+                .parse()
+                .expect("authorization metadata"),
+        );
+        service
+            .subscribe(subscribe_request)
+            .await
+            .expect("authorized stream subscription");
+    }
+
+    #[test]
+    fn external_binding_requires_tls_and_authentication() {
+        let external: SocketAddr = "0.0.0.0:50051".parse().expect("external address");
+        let loopback: SocketAddr = "127.0.0.1:50051".parse().expect("loopback address");
+        let mut api = ApiConfig::default();
+        assert!(validate_api_binding(external, &api).is_err());
+        assert!(validate_api_binding(loopback, &api).is_err());
+
+        api.allow_insecure_localhost = true;
+        assert!(validate_api_binding(loopback, &api).is_ok());
+
+        api.tls_cert_file = Some("server.pem".to_owned());
+        api.tls_key_file = Some("server.key".to_owned());
+        api.tokens.push(lightcdc_core::ApiTokenConfig {
+            name: "reader".to_owned(),
+            token_env: Some("TOKEN".to_owned()),
+            token_file: None,
+            streams: vec!["orders".to_owned()],
+            allow_seek: false,
+        });
+        assert!(validate_api_binding(external, &api).is_ok());
     }
 
     #[tokio::test]
@@ -1297,6 +1588,10 @@ mod tests {
                 database: "lightcdc".to_owned(),
                 user: "lightcdc".to_owned(),
                 password: "lightcdc".to_owned(),
+                password_env: None,
+                password_file: None,
+                tls_mode: lightcdc_core::PostgresTlsMode::Disable,
+                tls_ca_file: None,
                 publication: "publication".to_owned(),
                 slot: "slot".to_owned(),
             },
@@ -1326,6 +1621,10 @@ mod tests {
             },
             logging: LoggingConfig {
                 level: "info".to_owned(),
+            },
+            api: lightcdc_core::ApiConfig {
+                allow_insecure_localhost: true,
+                ..lightcdc_core::ApiConfig::default()
             },
             streams: vec![StreamConfig {
                 name: "orders".to_owned(),

@@ -150,7 +150,7 @@ pub(crate) async fn run(
     });
     enum RunExit {
         Capture(anyhow::Result<()>),
-        Server(Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>),
+        Server(Result<anyhow::Result<()>, tokio::task::JoinError>),
         Signal,
     }
 
@@ -189,7 +189,7 @@ pub(crate) async fn run(
         RunExit::Server(result) => {
             let error = match result {
                 Ok(Ok(())) => anyhow::anyhow!("gRPC server stopped unexpectedly"),
-                Ok(Err(error)) => anyhow::Error::new(error).context("gRPC server failed"),
+                Ok(Err(error)) => error.context("gRPC server failed"),
                 Err(error) => anyhow::Error::new(error).context("gRPC server task failed"),
             };
             state.transition(RuntimeState::Failed, Some(error.to_string()));
@@ -326,7 +326,7 @@ pub(crate) async fn process_shutdown_signal() {
 
 /// Waits for tonic's graceful drain and aborts it after the configured limit.
 pub(crate) async fn await_server_shutdown(
-    server: &mut JoinHandle<Result<(), tonic::transport::Error>>,
+    server: &mut JoinHandle<anyhow::Result<()>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     match tokio::time::timeout(timeout, &mut *server).await {

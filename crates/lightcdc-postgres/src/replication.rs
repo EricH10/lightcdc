@@ -1,11 +1,14 @@
 //! Turns PostgreSQL logical replication messages into committed source transactions.
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::BufReader;
 use std::str::FromStr;
 use std::time::Duration;
 
 use lightcdc_core::{
-    CapturePlan, ChangeEvent, Operation, SourceConfig, SourceMetadata, TransactionMetadata,
+    CapturePlan, ChangeEvent, Operation, PostgresTlsMode, SourceConfig, SourceMetadata,
+    TransactionMetadata,
 };
 use lightcdc_storage::{
     SourceIdentity, TransactionBuffer, TransactionBufferError, TransactionBufferOptions,
@@ -21,6 +24,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, info};
 
 use crate::decoder::{DecodeError, PgOutputDecoder, PgOutputMessage, Relation, RowChange};
@@ -170,6 +174,12 @@ impl ReplicationReader {
             None => Lsn::ZERO,
         };
 
+        let tls = match source.tls_mode {
+            PostgresTlsMode::Disable => TlsConfig::disabled(),
+            PostgresTlsMode::VerifyFull => {
+                TlsConfig::verify_full(source.tls_ca_file.as_deref().map(std::path::PathBuf::from))
+            }
+        };
         let replication_config = ReplicationConfig::new(
             source.host.clone(),
             source.user.clone(),
@@ -179,7 +189,7 @@ impl ReplicationReader {
             source.publication.clone(),
         )
         .with_port(source.port)
-        .with_tls(TlsConfig::disabled())
+        .with_tls(tls)
         .with_start_lsn(start_lsn)
         .with_status_interval(Duration::from_secs(1))
         .with_wakeup_interval(Duration::from_secs(5));
@@ -467,13 +477,7 @@ impl PostgresError {
 impl LogicalHeartbeatEmitter {
     /// Opens one ordinary PostgreSQL connection used only to emit heartbeats.
     pub async fn connect(source: &SourceConfig) -> Result<Self, PostgresError> {
-        let (client, connection) =
-            tokio_postgres::connect(&source.connection_string(), NoTls).await?;
-        let connection_task = tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::warn!(%error, "PostgreSQL heartbeat connection stopped");
-            }
-        });
+        let (client, connection_task) = connect_sql(source, "heartbeat").await?;
         Ok(Self {
             client,
             connection_task,
@@ -501,13 +505,7 @@ impl Drop for LogicalHeartbeatEmitter {
 
 /// Checks that PostgreSQL accepts a normal connection for the configured source.
 pub async fn validate_source_config(config: &SourceConfig) -> Result<(), PostgresError> {
-    let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
-
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!(%error, "PostgreSQL connection task failed");
-        }
-    });
+    let (client, _connection_task) = connect_sql(config, "validation").await?;
 
     validate_source_client(&client, config).await.map(|_| ())
 }
@@ -525,12 +523,7 @@ pub async fn validate_source_config_with_plan(
         )));
     }
 
-    let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!(%error, "PostgreSQL validation connection task failed");
-        }
-    });
+    let (client, _connection_task) = connect_sql(config, "validation").await?;
 
     let source = validate_source_client(&client, config).await?;
     let publication = validate_publication_alignment(&client, config, capture_plan).await?;
@@ -540,6 +533,84 @@ pub async fn validate_source_config_with_plan(
         restart_lsn: source.restart_lsn,
         publication,
     })
+}
+
+/// Opens ordinary SQL connections with the same TLS policy as replication.
+async fn connect_sql(
+    source: &SourceConfig,
+    purpose: &'static str,
+) -> Result<(Client, JoinHandle<()>), PostgresError> {
+    let config: tokio_postgres::Config = source.connection_string().parse()?;
+    match source.tls_mode {
+        PostgresTlsMode::Disable => {
+            let (client, connection) = config.connect(NoTls).await?;
+            let task = tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::warn!(%error, %purpose, "PostgreSQL connection stopped");
+                }
+            });
+            Ok((client, task))
+        }
+        PostgresTlsMode::VerifyFull => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let connector = sql_tls_connector(source)?;
+            let (client, connection) = config.connect(connector).await?;
+            let task = tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::warn!(%error, %purpose, "PostgreSQL TLS connection stopped");
+                }
+            });
+            Ok((client, task))
+        }
+    }
+}
+
+fn sql_tls_connector(source: &SourceConfig) -> Result<MakeRustlsConnect, PostgresError> {
+    if let Some(path) = &source.tls_ca_file {
+        let file = File::open(path).map_err(|error| {
+            PostgresError::Configuration(format!(
+                "failed to open PostgreSQL CA file {path:?}: {error}"
+            ))
+        })?;
+        let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                PostgresError::Configuration(format!(
+                    "failed to parse PostgreSQL CA file {path:?}: {error}"
+                ))
+            })?;
+        if certificates.is_empty() {
+            return Err(PostgresError::Configuration(format!(
+                "PostgreSQL CA file {path:?} contains no certificates"
+            )));
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in certificates {
+            roots.add(certificate).map_err(|error| {
+                PostgresError::Configuration(format!(
+                    "invalid certificate in PostgreSQL CA file {path:?}: {error}"
+                ))
+            })?;
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        return Ok(MakeRustlsConnect::new(config));
+    }
+
+    let (connector, errors) = MakeRustlsConnect::with_native_certs().map_err(|errors| {
+        PostgresError::Configuration(format!(
+            "could not load platform CA certificates: {} errors",
+            errors.len()
+        ))
+    })?;
+    if !errors.is_empty() {
+        tracing::warn!(
+            errors = errors.len(),
+            "some platform CA certificates could not be loaded"
+        );
+    }
+    Ok(connector)
 }
 
 /// Checks server settings, role privileges, publication presence, and slot identity.
@@ -804,10 +875,13 @@ fn replication_server_sqlstate(message: &str) -> Option<&str> {
 mod tests {
     use std::io;
 
+    use lightcdc_core::{PostgresTlsMode, SourceConfig};
     use pgwire_replication::error::PgWireError;
+    use tempfile::TempDir;
 
     use super::{
-        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, validate_resume_lsn,
+        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, sql_tls_connector,
+        validate_resume_lsn,
     };
 
     #[test]
@@ -883,5 +957,34 @@ mod tests {
             .expect_err("slot acknowledged beyond local durability");
         assert!(matches!(error, PostgresError::Configuration(_)));
         assert!(error.to_string().contains("can no longer replay"));
+    }
+
+    #[test]
+    fn rejects_a_custom_ca_file_without_certificates() {
+        let temp = TempDir::new().expect("temp dir");
+        let ca_path = temp.path().join("empty-ca.pem");
+        std::fs::write(&ca_path, "# no certificates\n").expect("write CA fixture");
+        let source = SourceConfig {
+            name: "default".to_owned(),
+            host: "postgres.internal".to_owned(),
+            port: 5432,
+            database: "lightcdc".to_owned(),
+            user: "lightcdc".to_owned(),
+            password: "secret".to_owned(),
+            password_env: None,
+            password_file: None,
+            tls_mode: PostgresTlsMode::VerifyFull,
+            tls_ca_file: Some(ca_path.display().to_string()),
+            publication: "lightcdc_publication".to_owned(),
+            slot: "lightcdc_slot".to_owned(),
+        };
+
+        let error = match sql_tls_connector(&source) {
+            Ok(_) => panic!("empty CA must fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PostgresError::Configuration(_)));
+        assert!(error.to_string().contains("contains no certificates"));
     }
 }

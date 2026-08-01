@@ -100,12 +100,16 @@ them has optional work remaining.
 ### Security and API Safety
 
 - Add PostgreSQL TLS with certificate verification and gRPC TLS, with secure
-  production defaults and an explicit local-development opt-out.
+  production defaults and an explicit local-development opt-out. DONE:
+  PostgreSQL defaults to verify-full using platform or configured CA roots;
+  plaintext PostgreSQL and gRPC require explicit local configuration.
 - Add gRPC authentication and per-stream authorization before binding beyond
   localhost. Protect administrative operations such as seek separately from
-  ordinary subscribe and ACK access.
+  ordinary subscribe and ACK access. DONE with bearer principals, stream
+  allowlists, constant-time token checks, and separate seek permission.
 - Load passwords, keys, and tokens from environment variables or secret files;
-  avoid requiring plaintext secrets in the main TOML file.
+  avoid requiring plaintext secrets in the main TOML file. DONE for PostgreSQL,
+  the gRPC API, and the Redis connector.
 - Sanitize external gRPC errors so storage paths, database details, and internal
   failures are logged server-side without being returned to untrusted clients.
   DONE for internal storage failures.
@@ -336,9 +340,9 @@ observable behavior.
 
 ## Milestone 7: Security and Production Configuration
 
-- Add PostgreSQL and gRPC TLS.
-- Add consumer authentication and per-stream authorization.
-- Load secrets from environment variables or secret files.
+- Add PostgreSQL and gRPC TLS. DONE.
+- Add consumer authentication and per-stream authorization. DONE.
+- Load secrets from environment variables or secret files. DONE.
 - Enforce event, request, subscription, and connection limits.
 - Sanitize public API errors and default to not logging captured row payloads.
 - Validate publications, slots, and configured tables at startup. PARTIAL:

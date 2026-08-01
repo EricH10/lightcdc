@@ -5,6 +5,7 @@ port = 5432
 database = "lightcdc"
 user = "lightcdc"
 password = "lightcdc"
+tls_mode = "disable"
 publication = "lightcdc_publication"
 slot = "lightcdc_benchmark_slot"
 
@@ -33,6 +34,9 @@ retention_delete_batch_size = 10000
 
 [logging]
 level = "info"
+
+[api]
+allow_insecure_localhost = true
 
 [[streams]]
 name = "benchmark"

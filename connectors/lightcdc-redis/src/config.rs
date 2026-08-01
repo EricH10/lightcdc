@@ -23,6 +23,12 @@ pub(crate) struct LightCdcConfig {
     pub(crate) endpoint: String,
     pub(crate) stream: String,
     pub(crate) consumer: String,
+    /// Environment variable containing the LightCDC bearer token.
+    pub(crate) token_env: Option<String>,
+    /// File containing the LightCDC bearer token.
+    pub(crate) token_file: Option<String>,
+    /// Optional PEM CA bundle for a private LightCDC gRPC certificate.
+    pub(crate) tls_ca_file: Option<String>,
     #[serde(default = "default_reconnect_initial_ms")]
     pub(crate) reconnect_initial_ms: u64,
     #[serde(default = "default_reconnect_max_ms")]
@@ -36,6 +42,8 @@ pub(crate) struct RedisConfig {
     pub(crate) url: Option<String>,
     /// Environment variable containing the Redis URL in production.
     pub(crate) url_env: Option<String>,
+    /// File containing the Redis URL, including credentials when required.
+    pub(crate) url_file: Option<String>,
     /// Redis key storing the last atomically applied LightCDC sequence.
     pub(crate) progress_key: Option<String>,
 }
@@ -73,12 +81,32 @@ impl ConnectorConfig {
     }
 
     pub(crate) fn redis_url(&self) -> anyhow::Result<String> {
-        match (&self.redis.url, &self.redis.url_env) {
-            (Some(url), None) => Ok(url.clone()),
-            (None, Some(variable)) => env::var(variable)
+        match (&self.redis.url, &self.redis.url_env, &self.redis.url_file) {
+            (Some(url), None, None) => Ok(url.clone()),
+            (None, Some(variable), None) => env::var(variable)
                 .with_context(|| format!("Redis URL environment variable {variable:?} is unset")),
+            (None, None, Some(path)) => fs::read_to_string(path)
+                .with_context(|| format!("read Redis URL file {path:?}"))
+                .map(|value| value.trim_end_matches(['\r', '\n']).to_owned()),
             _ => Err(anyhow!(
-                "configure exactly one of redis.url or redis.url_env"
+                "configure exactly one of redis.url, redis.url_env, or redis.url_file"
+            )),
+        }
+    }
+
+    pub(crate) fn bearer_token(&self) -> anyhow::Result<Option<String>> {
+        match (&self.lightcdc.token_env, &self.lightcdc.token_file) {
+            (None, None) => Ok(None),
+            (Some(variable), None) => env::var(variable)
+                .with_context(|| {
+                    format!("LightCDC token environment variable {variable:?} is unset")
+                })
+                .map(Some),
+            (None, Some(path)) => fs::read_to_string(path)
+                .with_context(|| format!("read LightCDC token file {path:?}"))
+                .map(|value| Some(value.trim_end_matches(['\r', '\n']).to_owned())),
+            (Some(_), Some(_)) => Err(anyhow!(
+                "configure at most one of lightcdc.token_env or lightcdc.token_file"
             )),
         }
     }
@@ -120,6 +148,9 @@ impl ConnectorConfig {
             return Err(anyhow!("at least one Redis cache rule is required"));
         }
         let _ = self.redis_url()?;
+        if self.bearer_token()?.as_deref() == Some("") {
+            return Err(anyhow!("LightCDC bearer token must not be empty"));
+        }
         let progress_key = self.progress_key();
         if progress_key.is_empty() {
             return Err(anyhow!("redis.progress_key must not be empty"));
@@ -167,6 +198,8 @@ fn default_reconnect_max_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -193,6 +226,45 @@ mod tests {
         assert_eq!(
             config.progress_key(),
             "lightcdc:redis:orders:redis-cache:offset"
+        );
+    }
+
+    #[test]
+    fn loads_connector_secrets_from_files() {
+        let temp = TempDir::new().expect("temp dir");
+        let token_path = temp.path().join("lightcdc-token");
+        let redis_path = temp.path().join("redis-url");
+        fs::write(&token_path, "secret-token\n").expect("write token");
+        fs::write(&redis_path, "rediss://redis.internal:6379\n").expect("write Redis URL");
+        let config: ConnectorConfig = toml::from_str(&format!(
+            r#"
+            [lightcdc]
+            endpoint = "https://lightcdc.internal:50051"
+            stream = "orders"
+            consumer = "redis-cache"
+            token_file = {token_path:?}
+
+            [redis]
+            url_file = {redis_path:?}
+
+            [[rules]]
+            table = "public.orders"
+            key = "order:{{id}}"
+            action = "invalidate"
+            "#,
+            token_path = token_path.display().to_string(),
+            redis_path = redis_path.display().to_string(),
+        ))
+        .expect("config");
+
+        config.validate().expect("valid config");
+        assert_eq!(
+            config.bearer_token().expect("token").as_deref(),
+            Some("secret-token")
+        );
+        assert_eq!(
+            config.redis_url().expect("Redis URL"),
+            "rediss://redis.internal:6379"
         );
     }
 }

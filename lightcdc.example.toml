@@ -5,6 +5,8 @@ port = 5432
 database = "lightcdc"
 user = "lightcdc"
 password = "lightcdc"
+# Local Docker PostgreSQL has TLS disabled. Production defaults to verify_full.
+tls_mode = "disable"
 publication = "lightcdc_publication"
 slot = "lightcdc_slot"
 
@@ -34,6 +36,10 @@ retention_delete_batch_size = 100000
 
 [logging]
 level = "info"
+
+[api]
+# Plaintext and unauthenticated serving is accepted only on a loopback bind.
+allow_insecure_localhost = true
 
 [[streams]]
 name = "orders"

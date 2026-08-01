@@ -8,7 +8,11 @@ use lightcdc_api::proto::{
 };
 use redis::{AsyncCommands, Script, aio::ConnectionManager};
 use thiserror::Error;
-use tonic::{Code, Status};
+use tonic::{
+    Code, Request, Status,
+    metadata::MetadataValue,
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -54,6 +58,7 @@ pub(crate) enum SessionError {
 /// Reconnects transient Redis and gRPC failures until shutdown is requested.
 pub(crate) async fn run(config: ConnectorConfig) -> anyhow::Result<()> {
     let redis_url = config.redis_url()?;
+    let bearer_token = config.bearer_token()?;
     redis::Client::open(redis_url.as_str()).context("validate Redis URL")?;
     let mut delay = config.initial_reconnect_delay();
 
@@ -64,7 +69,7 @@ pub(crate) async fn run(config: ConnectorConfig) -> anyhow::Result<()> {
                 info!("Redis connector received shutdown signal");
                 return Ok(());
             }
-            result = run_session(&config, &redis_url) => {
+            result = run_session(&config, &redis_url, bearer_token.as_deref()) => {
                 match result {
                     Ok(()) => return Err(anyhow!("LightCDC subscription ended unexpectedly")),
                     Err(SessionError::Terminal(error)) => return Err(error),
@@ -86,7 +91,11 @@ pub(crate) async fn run(config: ConnectorConfig) -> anyhow::Result<()> {
     }
 }
 
-async fn run_session(config: &ConnectorConfig, redis_url: &str) -> Result<(), SessionError> {
+async fn run_session(
+    config: &ConnectorConfig,
+    redis_url: &str,
+    bearer_token: Option<&str>,
+) -> Result<(), SessionError> {
     let redis_client = redis::Client::open(redis_url)
         .map_err(|error| SessionError::Terminal(anyhow!(error).context("invalid Redis URL")))?;
     let mut redis = redis_client
@@ -96,25 +105,30 @@ async fn run_session(config: &ConnectorConfig, redis_url: &str) -> Result<(), Se
     let progress_key = config.progress_key();
     let redis_offset = read_progress(&mut redis, &progress_key).await?;
 
-    let mut client = LightCdcClient::connect(config.lightcdc.endpoint.clone())
-        .await
-        .map_err(|error| SessionError::Transient(anyhow!(error).context("connect to LightCDC")))?;
+    let channel = connect_lightcdc(config).await?;
+    let mut client = LightCdcClient::new(channel);
     let mut ack_client = client.clone();
     client
-        .seek(SeekRequest {
-            stream: config.lightcdc.stream.clone(),
-            consumer: config.lightcdc.consumer.clone(),
-            position: SeekPosition::Absolute as i32,
-            sequence: redis_offset,
-        })
+        .seek(authenticated_request(
+            SeekRequest {
+                stream: config.lightcdc.stream.clone(),
+                consumer: config.lightcdc.consumer.clone(),
+                position: SeekPosition::Absolute as i32,
+                sequence: redis_offset,
+            },
+            bearer_token,
+        )?)
         .await
         .map_err(|status| classify_status(status, "reconcile LightCDC with Redis progress"))?;
     let mut events = client
-        .subscribe(SubscribeRequest {
-            stream: config.lightcdc.stream.clone(),
-            consumer: config.lightcdc.consumer.clone(),
-            limit: 0,
-        })
+        .subscribe(authenticated_request(
+            SubscribeRequest {
+                stream: config.lightcdc.stream.clone(),
+                consumer: config.lightcdc.consumer.clone(),
+                limit: 0,
+            },
+            bearer_token,
+        )?)
         .await
         .map_err(|status| classify_status(status, "subscribe to LightCDC"))?
         .into_inner();
@@ -136,11 +150,14 @@ async fn run_session(config: &ConnectorConfig, redis_url: &str) -> Result<(), Se
             .map_err(|error| SessionError::Terminal(error.context("map Redis cache mutation")))?;
         apply_event(&mut redis, &progress_key, event.sequence, &mutations).await?;
         ack_client
-            .ack(AckRequest {
-                stream: config.lightcdc.stream.clone(),
-                consumer: config.lightcdc.consumer.clone(),
-                sequence: event.sequence,
-            })
+            .ack(authenticated_request(
+                AckRequest {
+                    stream: config.lightcdc.stream.clone(),
+                    consumer: config.lightcdc.consumer.clone(),
+                    sequence: event.sequence,
+                },
+                bearer_token,
+            )?)
             .await
             .map_err(|status| classify_status(status, "acknowledge LightCDC event"))?;
     }
@@ -148,6 +165,49 @@ async fn run_session(config: &ConnectorConfig, redis_url: &str) -> Result<(), Se
     Err(SessionError::Transient(anyhow!(
         "LightCDC closed the subscription stream"
     )))
+}
+
+async fn connect_lightcdc(config: &ConnectorConfig) -> Result<Channel, SessionError> {
+    let mut endpoint =
+        Endpoint::from_shared(config.lightcdc.endpoint.clone()).map_err(|error| {
+            SessionError::Terminal(anyhow!(error).context("invalid LightCDC endpoint"))
+        })?;
+    if config.lightcdc.endpoint.starts_with("https://") {
+        let mut tls = ClientTlsConfig::new().with_enabled_roots();
+        if let Some(path) = &config.lightcdc.tls_ca_file {
+            let certificate = std::fs::read(path).map_err(|error| {
+                SessionError::Terminal(
+                    anyhow!(error).context(format!("read LightCDC CA file {path:?}")),
+                )
+            })?;
+            tls = tls.ca_certificate(Certificate::from_pem(certificate));
+        }
+        endpoint = endpoint.tls_config(tls).map_err(|error| {
+            SessionError::Terminal(anyhow!(error).context("configure LightCDC TLS"))
+        })?;
+    } else if config.lightcdc.tls_ca_file.is_some() {
+        return Err(SessionError::Terminal(anyhow!(
+            "lightcdc.tls_ca_file requires an https:// endpoint"
+        )));
+    }
+    endpoint
+        .connect()
+        .await
+        .map_err(|error| SessionError::Transient(anyhow!(error).context("connect to LightCDC")))
+}
+
+fn authenticated_request<T>(
+    message: T,
+    bearer_token: Option<&str>,
+) -> Result<Request<T>, SessionError> {
+    let mut request = Request::new(message);
+    if let Some(token) = bearer_token {
+        let value = MetadataValue::try_from(format!("Bearer {token}")).map_err(|error| {
+            SessionError::Terminal(anyhow!(error).context("encode bearer token"))
+        })?;
+        request.metadata_mut().insert("authorization", value);
+    }
+    Ok(request)
 }
 
 async fn read_progress(
@@ -245,6 +305,29 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn adds_bearer_authorization_metadata() {
+        let request = authenticated_request((), Some("connector-secret")).expect("request");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .expect("authorization")
+                .to_str()
+                .expect("ASCII metadata"),
+            "Bearer connector-secret"
+        );
+    }
+
+    #[test]
+    fn rejects_tokens_that_cannot_be_encoded_as_metadata() {
+        let error = authenticated_request((), Some("line-one\nline-two"))
+            .expect_err("newline is invalid metadata");
+
+        assert!(matches!(error, SessionError::Terminal(_)));
+    }
 
     #[tokio::test]
     #[ignore = "requires Redis on LIGHTCDC_TEST_REDIS_URL or redis://127.0.0.1:6379"]

@@ -2,6 +2,9 @@
 endpoint = "http://127.0.0.1:50051"
 stream = "orders"
 consumer = "redis-orders-cache"
+# token_env = "LIGHTCDC_API_TOKEN"
+# token_file = "/run/secrets/lightcdc-api-token"
+# tls_ca_file = "/run/secrets/lightcdc-ca.pem"
 reconnect_initial_ms = 250
 reconnect_max_ms = 15000
 
@@ -9,6 +12,7 @@ reconnect_max_ms = 15000
 # Use url_env in production so credentials are not stored in this file.
 url = "redis://127.0.0.1:6379"
 # url_env = "LIGHTCDC_REDIS_URL"
+# url_file = "/run/secrets/redis-url"
 # progress_key = "lightcdc:redis:orders:redis-orders-cache:offset"
 
 [[rules]]

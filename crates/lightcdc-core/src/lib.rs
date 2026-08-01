@@ -8,7 +8,8 @@ pub mod error;
 pub mod event;
 
 pub use config::{
-    CapturePlan, CapturePlanError, Config, LoggingConfig, RuntimeConfig, SourceConfig, StreamConfig,
+    ApiConfig, ApiTokenConfig, CapturePlan, CapturePlanError, Config, LoggingConfig,
+    PostgresTlsMode, RuntimeConfig, SourceConfig, StreamConfig,
 };
 pub use error::{Error, Result};
 pub use event::{ChangeEvent, Operation, SourceMetadata, TransactionMetadata};

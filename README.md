@@ -164,6 +164,36 @@ Run capture and the gRPC API together:
 cargo run -p lightcdc-cli -- run --config lightcdc.example.toml --addr 127.0.0.1:50051
 ```
 
+Production PostgreSQL connections default to certificate and hostname
+verification. Load the password from a mounted secret and configure a private
+CA only when platform trust roots do not contain it:
+
+```toml
+[source]
+password_file = "/run/secrets/postgres-password"
+tls_mode = "verify_full"
+# tls_ca_file = "/run/secrets/postgres-ca.pem"
+```
+
+A non-loopback gRPC bind requires TLS and at least one bearer principal:
+
+```toml
+[api]
+tls_cert_file = "/run/secrets/lightcdc-server.pem"
+tls_key_file = "/run/secrets/lightcdc-server-key.pem"
+
+[[api.tokens]]
+name = "orders-reader"
+token_file = "/run/secrets/orders-reader-token"
+streams = ["orders"]
+allow_seek = false
+```
+
+Bearer tokens authorize `Subscribe` and `Ack` for their configured streams;
+`Seek` additionally requires `allow_seek = true`. Plaintext unauthenticated
+serving is restricted to loopback and must be explicitly enabled with
+`api.allow_insecure_localhost = true` for local development.
+
 Replay captured events from the local redb store:
 
 ```bash
