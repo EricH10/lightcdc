@@ -1,0 +1,9 @@
+.git
+.github
+.idea
+.vscode
+bench
+data
+target
+*.log
+*.redb

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 fs2.workspace = true
-lightcdc-core = { path = "../lightcdc-core" }
+lightcdc-core = { path = "../lightcdc-core", version = "0.1.0" }
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true

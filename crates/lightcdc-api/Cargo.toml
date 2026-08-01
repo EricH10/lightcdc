@@ -8,9 +8,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-lightcdc-core = { path = "../lightcdc-core" }
-lightcdc-runtime = { path = "../lightcdc-runtime" }
-lightcdc-storage = { path = "../lightcdc-storage" }
+lightcdc-core = { path = "../lightcdc-core", version = "0.1.0" }
+lightcdc-runtime = { path = "../lightcdc-runtime", version = "0.1.0" }
+lightcdc-storage = { path = "../lightcdc-storage", version = "0.1.0" }
 prost = "0.14"
 tokio.workspace = true
 tokio-stream.workspace = true

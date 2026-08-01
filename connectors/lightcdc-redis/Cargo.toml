@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-lightcdc-api = { path = "../../crates/lightcdc-api" }
+lightcdc-api = { path = "../../crates/lightcdc-api", version = "0.1.0" }
 redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 /// Parses the top-level lightcdc command line.
 #[derive(Debug, Parser)]
-#[command(name = "lightcdc")]
+#[command(name = "lightcdc", version)]
 #[command(about = "Lightweight PostgreSQL CDC runtime")]
 pub(crate) struct Cli {
     #[command(subcommand)]

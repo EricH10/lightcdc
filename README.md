@@ -20,6 +20,9 @@ crash-safe Redis cache invalidation and update connector.
 See [`docs/postgres-support.md`](docs/postgres-support.md) for the PostgreSQL 17
 feature matrix, change-only bootstrap boundary, and least-privilege role.
 
+See [`docs/operations.md`](docs/operations.md) for production deployment,
+health probes, backup, recovery, and upgrade procedures.
+
 ## Prerequisites
 
 - Rust 1.89 or newer
@@ -38,6 +41,22 @@ Run the CLI:
 ```bash
 cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
 ```
+
+## Production Image
+
+Build the pinned Debian Bookworm image and verify its CLI:
+
+```bash
+docker build -t lightcdc:0.1.0 .
+docker run --rm lightcdc:0.1.0 --version
+```
+
+The image runs as UID/GID 10001 and contains both `lightcdc` and the optional
+`lightcdc-redis` connector. Production deployment requires a read-only config
+mount, mounted secrets, and a persistent `/var/lib/lightcdc` volume. Set
+`storage.data_dir = "/var/lib/lightcdc"` in the mounted configuration. The
+complete command, signal, health, and supported-platform contract is in the
+operations runbook.
 
 Capture does not print row payloads by default. Add `--output json` only for
 local debugging when stdout is approved to contain source data.

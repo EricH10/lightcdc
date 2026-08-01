@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::BufReader;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -20,6 +19,7 @@ use pgwire_replication::{
     error::PgWireError,
     lsn::Lsn,
 };
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
@@ -591,7 +591,7 @@ fn sql_tls_connector(source: &SourceConfig) -> Result<MakeRustlsConnect, Postgre
                 "failed to open PostgreSQL CA file {path:?}: {error}"
             ))
         })?;
-        let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
+        let certificates = CertificateDer::pem_reader_iter(file)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 PostgresError::Configuration(format!(

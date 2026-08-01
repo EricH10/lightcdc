@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r \
+            '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end')"
+          test "$version" = "$package_version"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - run: cargo test --workspace --release --locked
+      - run: docker compose up --detach --wait postgres redis
+      - run: cargo test -p lightcdc-cli --test capture_integration --locked -- --ignored --test-threads=1
+      - run: cargo test -p lightcdc-redis --locked redis_progress_and_cache_mutation_are_atomic_and_idempotent -- --ignored
+      - if: always()
+        run: docker compose down --volumes
+      - run: cargo build --locked --release --bin lightcdc --bin lightcdc-redis
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="lightcdc-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${archive}"
+          install -m 0755 target/release/lightcdc "dist/${archive}/lightcdc"
+          install -m 0755 target/release/lightcdc-redis "dist/${archive}/lightcdc-redis"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${archive}/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
+          pushd dist
+          sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          popd
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

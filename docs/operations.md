@@ -5,6 +5,63 @@ process, one PostgreSQL source and logical slot, one local persistent volume,
 and ordered named consumers. It is a single-node service; restart and restore,
 not automatic failover, are the current availability mechanism.
 
+## Supported Deployment
+
+The first release supports PostgreSQL 17.x with the feature boundaries in
+`docs/postgres-support.md`, redb 4.1, and one Linux x86_64 LightCDC process.
+Release archives target `x86_64-unknown-linux-gnu`. The production image builds
+with Rust 1.89.0 and runs on Debian 12 Bookworm as the non-root UID/GID 10001.
+The lockfile is part of the release input; do not rebuild a release after
+changing it.
+
+Build and inspect the image:
+
+```bash
+docker build -t lightcdc:0.1.0 .
+docker run --rm lightcdc:0.1.0 --version
+docker run --rm --entrypoint id lightcdc:0.1.0
+```
+
+Set `storage.data_dir = "/var/lib/lightcdc"` in the production config, then
+mount that path from persistent storage. Mount config and secrets read-only;
+the example below assumes the configured TLS and password files live under
+`/run/secrets`:
+
+```bash
+docker run --name lightcdc --init \
+  --stop-timeout 30 \
+  --publish 50051:50051 \
+  --mount type=volume,source=lightcdc-data,target=/var/lib/lightcdc \
+  --mount type=bind,source=/etc/lightcdc,target=/etc/lightcdc,readonly \
+  --mount type=bind,source=/run/secrets/lightcdc,target=/run/secrets,readonly \
+  lightcdc:0.1.0 run \
+  --config /etc/lightcdc/lightcdc.toml \
+  --addr 0.0.0.0:50051
+```
+
+Use a Docker stop timeout longer than `runtime.shutdown_timeout_ms`. The binary
+is PID 1 under the image's exec-form entrypoint and handles SIGINT/SIGTERM;
+`--init` additionally reaps unexpected child processes.
+
+The gRPC port implements the standard health protocol. Probe
+`lightcdc.liveness` to decide whether to restart the process and
+`lightcdc.readiness` before routing consumers. Readiness is intentionally false
+while capture is starting, reconnecting, degraded, draining, or failed. The
+probe client must use the same TLS trust policy as other clients; health is not
+a separate plaintext endpoint.
+
+Tagged releases build and test the workspace on Ubuntu 24.04, publish both
+binaries with the README, changelog, and licenses, and attach a SHA-256 file.
+Verify an archive before installation:
+
+```bash
+sha256sum --check lightcdc-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+The supported deployment is single-node. Two processes must never open the
+same redb volume concurrently, and an orchestrator must not start a replacement
+until the previous process has stopped or the volume is fenced.
+
 ## Normal Shutdown
 
 Send `SIGTERM` and allow at least `runtime.shutdown_timeout_ms`. Capture stops at
@@ -102,6 +159,25 @@ missing WAL, the current change-only release cannot reconstruct historical
 state. Create a new slot and rebuild downstream state from an externally
 consistent snapshot before resuming change delivery.
 
+## Source Outage, Failover, And Slot Loss
+
+During a network or PostgreSQL outage, leave the local store and slot intact.
+LightCDC enters reconnecting state and resumes from its durable LSN after the
+source returns. Alert on retained WAL growth while it is disconnected.
+
+LightCDC binds each configured source name to PostgreSQL's cluster system
+identifier and database OID. A promotion that preserves those identifiers and
+the logical slot's required WAL can resume after the normal startup gap check.
+A replacement cluster, logical restore, or database recreation is a different
+source and startup is deliberately rejected. Do not edit the local identity.
+
+If the slot is missing, invalidated, or has advanced past LightCDC's durable
+LSN, stop consumers and determine whether a coordinated database/LightCDC
+recovery point can restore the exact required WAL range. If it cannot, create a
+new source name and slot, rebuild every downstream target from an externally
+consistent snapshot, and begin a new change-only history. Recreating a slot and
+reusing the old local log is not a no-loss recovery.
+
 ## Disk Pressure And WAL Growth
 
 `runtime.max_storage_bytes` and `runtime.min_free_disk_bytes` stop capture before
@@ -114,6 +190,12 @@ the capacity problem upstream into PostgreSQL WAL storage.
 Retention I/O failure also stops capture. A consumer older than the retained
 prefix receives an explicit expired-offset error and must be rebuilt or seeked
 deliberately.
+
+For an abandoned durable consumer, either keep its offset and size retention
+for the outage, or deliberately expire/rebuild it according to the downstream
+system's recovery procedure. Never move an offset merely to silence a lag
+alert. A seek to `latest` explicitly accepts a gap; a seek to `earliest`
+replays only the retained prefix.
 
 ## Redis Recovery
 
@@ -129,3 +211,16 @@ Collect health status, sanitized logs, configuration with secret values removed,
 `lightcdc inspect` output without `--sequence`, `lightcdc check` output, disk
 usage, and PostgreSQL slot metrics. Do not enable JSON capture output or attach
 event payloads unless the incident process explicitly permits source row data.
+
+## Release Procedure
+
+1. Update the workspace package version and every internal path dependency
+   version together.
+2. Move changelog entries from `Unreleased` into that version and document any
+   durable-format or configuration change in the upgrade section.
+3. Run formatting, clippy, workspace tests, Docker-backed integration tests,
+   `cargo deny check`, the MSRV check, and the production image check.
+4. Take and restore a production-sized backup with the candidate binary.
+5. Create a signed `vMAJOR.MINOR.PATCH` tag whose version exactly matches every
+   workspace package, then push it. The release workflow creates the archive
+   and checksum; never replace an artifact for an existing tag.

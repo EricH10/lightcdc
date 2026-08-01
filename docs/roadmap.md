@@ -155,19 +155,24 @@ them has optional work remaining.
   and clean/terminal exits; production metrics still need state transitions.
 - Provide a production container or release binaries that run as a non-root
   user, use a persistent volume, handle signals, expose health checks, and pin
-  supported Rust, OS, architecture, PostgreSQL, and redb versions.
+  supported Rust, OS, architecture, PostgreSQL, and redb versions. DONE for a
+  Debian 12 non-root image and checksummed Linux x86_64 release archive; gRPC
+  liveness/readiness are the container probe surface.
 - Add required CI for formatting, clippy, unit tests, Docker-backed PostgreSQL
   tests, release builds, durable-format migration fixtures, and the minimum
-  supported Rust version.
+  supported Rust version. DONE.
 - Add dependency vulnerability and license checks, automated dependency updates,
   release versioning, changelog and upgrade notes, and checksums or provenance
-  for distributed artifacts.
+  for distributed artifacts. DONE with cargo-deny, Dependabot, tag/version
+  validation, a changelog/security policy, and SHA-256 release assets.
 - Write an operator runbook for installation, upgrades, rollback, backup,
   restore, slot loss, source failover, WAL growth, disk pressure, stale
   consumers, corruption, and collecting diagnostics without exposing row data.
+  DONE.
 - Declare the single-node availability boundary. A first release may require
   restart or restore after host loss; active-passive failover and shared storage
   do not block release if that limitation and recovery procedure are explicit.
+  DONE, including the single-writer volume-fencing requirement.
 
 ### Capacity Sign-Off
 

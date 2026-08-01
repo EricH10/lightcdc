@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/hendy/lightcdc"
+repository = "https://github.com/EricH10/lightcdc"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -26,7 +26,6 @@ sha2 = "0.10"
 redb = "4.1"
 redis = { version = "1.5", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 hdrhistogram = "7"
 fs2 = "0.4"
 flume = { version = "0.11", default-features = false, features = ["async"] }
@@ -41,3 +40,8 @@ tonic-health = "0.14"
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
