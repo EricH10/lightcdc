@@ -70,6 +70,20 @@ lightcdc check --config /etc/lightcdc/lightcdc.toml
 Restore verifies every checksum and opens the copied store in a temporary
 directory before atomically publishing it. It refuses a nonempty target.
 
+## Upgrade And Rollback
+
+Take a verified offline backup before upgrading. On startup, LightCDC first
+checks durable sidecar markers and rejects formats newer than the binary before
+opening redb. It then applies supported control and event-payload migrations in
+atomic redb transactions. Run `lightcdc check` after the upgrade and before
+serving normal traffic.
+
+A binary that does not support the resulting format refuses to start; it never
+attempts a downgrade. Roll back by restoring the pre-upgrade backup together
+with a PostgreSQL slot/WAL position that can replay from that backup's durable
+source LSN. Staging files are versioned scratch data, excluded from backups, and
+removed after an unclean restart rather than migrated.
+
 ## No-Loss Boundary
 
 LightCDC never accepts a silent gap. On startup it compares the local durable

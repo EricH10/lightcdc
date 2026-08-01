@@ -14,9 +14,10 @@
 - Use config-defined streams as the named feeds external consumers connect to.
 - Use gRPC as the first service-to-service streaming API.
 - Scope consumer offsets by stream name and consumer name.
+- Store events in a versioned JSON envelope and use versioned, length-prefixed
+  JSON records for disposable transaction staging.
 
 ## Pending
 
-- Choose the durable event payload serialization format.
 - Decide whether to keep Docker Compose integration tests or move to Testcontainers.
 - Broaden automated integration coverage beyond the happy-path capture and resume cases.

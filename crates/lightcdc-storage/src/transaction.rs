@@ -13,6 +13,9 @@ use lightcdc_core::ChangeEvent;
 use thiserror::Error;
 
 const STAGING_FILE_EXTENSION: &str = "lightcdc-stage";
+const STAGING_MAGIC: &[u8; 8] = b"LCDCSTG\0";
+const STAGING_FORMAT_VERSION: u32 = 1;
+const STAGING_HEADER_BYTES: u64 = (STAGING_MAGIC.len() + size_of::<u32>()) as u64;
 const RECORD_LENGTH_BYTES: u64 = size_of::<u64>() as u64;
 static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -177,8 +180,18 @@ impl TransactionBuffer {
             .ok_or(TransactionBufferError::NoActiveTransaction)?;
         let decoded_bytes = estimated_decoded_bytes(&event);
         let encoded = serde_json::to_vec(&event)?;
-        let staged_bytes = RECORD_LENGTH_BYTES
+        let record_bytes = RECORD_LENGTH_BYTES
             .checked_add(encoded.len() as u64)
+            .ok_or(TransactionBufferError::AccountingOverflow)?;
+        let staged_bytes = self
+            .stats
+            .staged_bytes
+            .checked_add(if self.stats.event_count == 0 {
+                STAGING_HEADER_BYTES
+            } else {
+                0
+            })
+            .and_then(|bytes| bytes.checked_add(record_bytes))
             .ok_or(TransactionBufferError::AccountingOverflow)?;
         let next_stats = TransactionStats {
             event_count: self
@@ -191,11 +204,7 @@ impl TransactionBuffer {
                 .decoded_bytes
                 .checked_add(decoded_bytes)
                 .ok_or(TransactionBufferError::AccountingOverflow)?,
-            staged_bytes: self
-                .stats
-                .staged_bytes
-                .checked_add(staged_bytes)
-                .ok_or(TransactionBufferError::AccountingOverflow)?,
+            staged_bytes,
         };
         self.check_limits(next_stats)?;
 
@@ -316,10 +325,14 @@ impl TransactionEvents {
     pub fn iter(&self) -> Result<TransactionEventIter<'_>, TransactionBufferError> {
         match self {
             Self::InMemory { events, .. } => Ok(TransactionEventIter::InMemory(events.iter())),
-            Self::Staged(staged) => Ok(TransactionEventIter::Staged(StagedEventReader {
-                reader: BufReader::new(File::open(&staged.path)?),
-                remaining: staged.stats.event_count,
-            })),
+            Self::Staged(staged) => {
+                let mut reader = BufReader::new(File::open(&staged.path)?);
+                read_staging_header(&mut reader)?;
+                Ok(TransactionEventIter::Staged(StagedEventReader {
+                    reader,
+                    remaining: staged.stats.event_count,
+                }))
+            }
         }
     }
 
@@ -389,17 +402,41 @@ impl StagingWriter {
             .write(true)
             .open(&path)?;
 
-        Ok(Self {
+        let mut staging = Self {
             path,
             writer: Some(BufWriter::new(file)),
             remove_on_drop: true,
             min_free_disk_bytes,
-        })
+        };
+        staging.write_header()?;
+        Ok(staging)
+    }
+
+    fn write_header(&mut self) -> Result<(), TransactionBufferError> {
+        self.ensure_available_space(STAGING_HEADER_BYTES)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or(TransactionBufferError::ClosedStagingFile)?;
+        writer.write_all(STAGING_MAGIC)?;
+        writer.write_all(&STAGING_FORMAT_VERSION.to_be_bytes())?;
+        Ok(())
     }
 
     /// Appends one length-prefixed serialized event.
     fn write_record(&mut self, payload: &[u8]) -> Result<(), TransactionBufferError> {
         let required_bytes = RECORD_LENGTH_BYTES.saturating_add(payload.len() as u64);
+        self.ensure_available_space(required_bytes)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or(TransactionBufferError::ClosedStagingFile)?;
+        writer.write_all(&(payload.len() as u64).to_be_bytes())?;
+        writer.write_all(payload)?;
+        Ok(())
+    }
+
+    fn ensure_available_space(&self, required_bytes: u64) -> Result<(), TransactionBufferError> {
         let staging_dir = self.path.parent().ok_or_else(|| {
             TransactionBufferError::InvalidOptions(
                 "staging file has no parent directory".to_owned(),
@@ -413,12 +450,6 @@ impl StagingWriter {
                 reserved: self.min_free_disk_bytes,
             });
         }
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or(TransactionBufferError::ClosedStagingFile)?;
-        writer.write_all(&(payload.len() as u64).to_be_bytes())?;
-        writer.write_all(payload)?;
         Ok(())
     }
 
@@ -476,6 +507,24 @@ impl Iterator for StagedEventReader {
     }
 }
 
+fn read_staging_header(reader: &mut impl Read) -> Result<(), TransactionBufferError> {
+    let mut magic = [0_u8; STAGING_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if &magic != STAGING_MAGIC {
+        return Err(TransactionBufferError::InvalidStagingHeader);
+    }
+    let mut version = [0_u8; size_of::<u32>()];
+    reader.read_exact(&mut version)?;
+    let found = u32::from_be_bytes(version);
+    if found != STAGING_FORMAT_VERSION {
+        return Err(TransactionBufferError::UnsupportedStagingFormat {
+            found,
+            supported: STAGING_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Represents transaction accounting, staging, and staged-read failures.
 #[derive(Debug, Error)]
 pub enum TransactionBufferError {
@@ -518,6 +567,12 @@ pub enum TransactionBufferError {
 
     #[error("staging file contains an invalid record length")]
     InvalidRecordLength,
+
+    #[error("staging file header is invalid")]
+    InvalidStagingHeader,
+
+    #[error("staging format {found} is unsupported; this binary supports format {supported}")]
+    UnsupportedStagingFormat { found: u32, supported: u32 },
 
     #[error("staging I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -656,6 +711,36 @@ mod tests {
         drop(events);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn newer_staging_format_is_rejected() {
+        let temp = TempDir::new().expect("temp dir");
+        let options = TransactionBufferOptions::bounded(temp.path(), "source", 1, 1_000_000, 10);
+        let mut buffer = TransactionBuffer::new(options).expect("buffer");
+        buffer.begin(42).expect("begin");
+        buffer.push(event(1)).expect("event");
+        let events = buffer.finish().expect("finish");
+        let TransactionEvents::Staged(staged) = &events else {
+            panic!("expected staged events");
+        };
+        let mut bytes = fs::read(staged.path()).expect("read staging file");
+        bytes[STAGING_MAGIC.len()..STAGING_HEADER_BYTES as usize]
+            .copy_from_slice(&(STAGING_FORMAT_VERSION + 1).to_be_bytes());
+        fs::write(staged.path(), bytes).expect("write future staging format");
+
+        let error = match events.iter() {
+            Ok(_) => panic!("future staging format must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            TransactionBufferError::UnsupportedStagingFormat {
+                found,
+                supported
+            } if found == STAGING_FORMAT_VERSION + 1 && supported == STAGING_FORMAT_VERSION
+        ));
     }
 
     #[test]

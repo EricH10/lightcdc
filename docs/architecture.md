@@ -146,8 +146,9 @@ transaction tracks its event count, estimated decoded bytes, and serialized
 staging bytes.
 
 - Events remain in memory through `transaction_memory_threshold_bytes`.
-- Crossing that threshold writes length-prefixed JSON records below the
-  source-scoped `data_dir/staging/` directory.
+- Crossing that threshold writes a versioned staging header followed by
+  length-prefixed JSON records below the source-scoped `data_dir/staging/`
+  directory.
 - `max_transaction_bytes` and `max_transaction_events` are hard bounds. Crossing
   either stops capture without persisting or acknowledging the transaction.
 - redb reads staged files one event at a time while writing events,
@@ -222,12 +223,15 @@ its newest event has expired. Segment boundaries should therefore be
 comfortably smaller than their corresponding retention windows. Deleting the
 whole file releases disk space without rewriting retained events.
 
-Startup reconstructs the catalog from versioned segment headers. Interrupted
+Startup reconstructs the catalog from versioned segment headers. Each event is
+stored in a versioned JSON envelope so its encoding can evolve independently
+from the Rust type. Segment v1 bare events are atomically migrated to the v2
+segment/current event envelope before normal access. Interrupted
 temporary files are discarded, while a segment renamed for deletion is either
 restored or finished according to the durable control retention floor. A
 legacy single-file store is migrated into the first segment. A sidecar format
-marker is checked before redb opens any file, allowing a newer unsupported
-format to be rejected without mutating it.
+markers for the control and segment/event formats reject newer unsupported
+formats before redb opens or mutates durable files.
 
 ## Failure Classification
 

@@ -112,14 +112,15 @@ fn create_backup(
         .with_context(|| format!("create backup parent {}", parent.display()))?;
     let mut partial = PartialDirectory::create(parent, "lightcdc-backup")?;
 
-    // Keeping the store open holds redb's exclusive process lock throughout
-    // copying, while no command in this process performs writes.
     let store = open_store(options, segment_options)?;
     let integrity = store
         .verify_integrity()
         .context("source store integrity check failed")?;
     let source_offset = store.source_offset(source_name)?;
     let source_identity = store.source_identity(source_name)?;
+    // redb may mark an open writable file as needing recovery. Close every
+    // handle before copying so the offline backup contains clean database files.
+    drop(store);
     let source_files = durable_store_files(options)?;
     let mut files = Vec::with_capacity(source_files.len());
     for source in source_files {
@@ -147,7 +148,6 @@ fn create_backup(
     };
     write_json_sync(&partial.path().join(MANIFEST_FILE), &manifest)?;
     sync_directory(partial.path())?;
-    drop(store);
     partial.publish(output)?;
     sync_directory(parent)?;
     Ok(())
@@ -200,11 +200,25 @@ fn restore_backup(
     let report = restored
         .verify_integrity()
         .context("restored store failed deep integrity verification")?;
-    if report != manifest.integrity
-        || restored.source_offset(source_name)? != manifest.source_offset
+    // Opening a redb file can reclaim allocator pages and change its physical
+    // length. Exact backup bytes were already checksum-verified above; compare
+    // the logical integrity fields after opening the restored store.
+    if report.segment_count != manifest.integrity.segment_count
+        || report.event_count != manifest.integrity.event_count
+        || report.replay_id_count != manifest.integrity.replay_id_count
+        || report.first_sequence != manifest.integrity.first_sequence
+        || report.high_watermark != manifest.integrity.high_watermark
+    {
+        anyhow::bail!(
+            "restored integrity report does not match the backup manifest: expected {:?}, got {:?}",
+            manifest.integrity,
+            report
+        );
+    }
+    if restored.source_offset(source_name)? != manifest.source_offset
         || restored.source_identity(source_name)? != manifest.source_identity
     {
-        anyhow::bail!("restored store metadata does not match the backup manifest");
+        anyhow::bail!("restored source metadata does not match the backup manifest");
     }
     drop(restored);
 
@@ -250,10 +264,11 @@ fn durable_store_files(options: &LogOpenOptions) -> anyhow::Result<Vec<PathBuf>>
         .with_context(|| format!("read segment directory {}", segments.display()))?
     {
         let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "redb")
-        {
+        let durable = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".redb") || name.ends_with(".redb.format"));
+        if durable {
             files.push(path);
         }
     }

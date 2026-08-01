@@ -18,6 +18,7 @@ use lightcdc_core::ChangeEvent;
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::log::{
     ConsumerOffset, IntegrityReport, PersistTransactionOutcome, RetentionOutcome, RetentionPolicy,
@@ -34,9 +35,11 @@ const SOURCE_IDENTITIES: TableDefinition<&str, &[u8]> = TableDefinition::new("so
 const METADATA: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 
 const CONTROL_FORMAT_VERSION: u64 = 2;
-const SEGMENT_FORMAT_VERSION: u64 = 1;
+const SEGMENT_FORMAT_VERSION: u64 = 2;
+const EVENT_PAYLOAD_FORMAT_VERSION: u64 = 1;
 const CONTROL_FORMAT_KEY: &str = "control_format_version";
 const SEGMENT_FORMAT_KEY: &str = "segment_format_version";
+const EVENT_PAYLOAD_FORMAT_KEY: &str = "event_payload_format_version";
 const SEGMENT_ID_KEY: &str = "segment_id";
 const SEGMENT_SEALED_KEY: &str = "segment_sealed";
 const SEGMENT_CREATED_AT_MS_KEY: &str = "segment_created_at_ms";
@@ -54,6 +57,8 @@ const SEGMENT_TEMP_SUFFIX: &str = ".redb.tmp";
 const SEGMENT_DELETING_SUFFIX: &str = ".redb.deleting";
 const CONTROL_FORMAT_MARKER_SUFFIX: &str = ".format";
 const CONTROL_FORMAT_MARKER_PREFIX: &str = "lightcdc-control-format=";
+const SEGMENT_FORMAT_MARKER_PREFIX: &str = "lightcdc-segment-format=";
+const EVENT_FORMAT_MARKER_PREFIX: &str = "event-payload-format=";
 const TRANSACTION_REPLAY_PREFIX: &str = "lightcdc-tx-v1";
 const CONTROL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -130,6 +135,24 @@ struct ReplayDuplicateCounts {
     events: usize,
 }
 
+#[derive(Serialize)]
+struct StoredEventRef<'a> {
+    version: u64,
+    event: &'a ChangeEvent,
+}
+
+#[derive(Deserialize)]
+struct StoredEvent {
+    version: u64,
+    event: ChangeEvent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SegmentFormatMarker {
+    segment: u64,
+    event: u64,
+}
+
 impl SegmentStore {
     pub(crate) fn open(
         control_path: PathBuf,
@@ -154,6 +177,7 @@ impl SegmentStore {
                 supported: CONTROL_FORMAT_VERSION,
             });
         }
+        preflight_segment_formats(&segments_dir)?;
 
         let mut control = open_database(&control_path, CONTROL_CACHE_BYTES, true)?;
         initialize_or_migrate_control(&mut control, &segments_dir, options)?;
@@ -161,6 +185,7 @@ impl SegmentStore {
             write_control_format_marker(&control_path, CONTROL_FORMAT_VERSION)?;
         }
         fs::create_dir_all(&segments_dir)?;
+        migrate_segment_formats(&segments_dir, options)?;
         cleanup_interrupted_segment_files(&segments_dir, &control, options)?;
         let control = Arc::new(control);
 
@@ -229,7 +254,7 @@ impl SegmentStore {
             return Err(StorageError::DuplicateSequence(event.sequence));
         }
 
-        let payload = serde_json::to_vec(event)?;
+        let payload = encode_event(event)?;
         self.rotate_before_write(1, payload.len() as u64, unix_timestamp_ms())?;
         let (active, mut descriptor) = self.active_segment()?;
         let write = active.begin_write().map_err(redb_error)?;
@@ -330,7 +355,7 @@ impl SegmentStore {
                         return Err(StorageError::DuplicateSequence(event.sequence));
                     }
 
-                    let payload = serde_json::to_vec(&event)?;
+                    let payload = encode_event(&event)?;
                     events
                         .insert(event.sequence, payload.as_slice())
                         .map_err(redb_error)?;
@@ -430,7 +455,7 @@ impl SegmentStore {
                 if !output.is_empty() && output_bytes.saturating_add(payload_bytes) > max_bytes {
                     return Ok(output);
                 }
-                let event: ChangeEvent = serde_json::from_slice(payload.value())?;
+                let event = decode_event(payload.value())?;
                 next_sequence = stored_sequence.value().saturating_add(1);
                 output_bytes = output_bytes.saturating_add(payload_bytes);
                 output.push(event);
@@ -622,7 +647,7 @@ impl SegmentStore {
             for entry in events.iter().map_err(redb_error)? {
                 let (stored_sequence, payload) = entry.map_err(redb_error)?;
                 let stored_sequence = stored_sequence.value();
-                let event: ChangeEvent = serde_json::from_slice(payload.value())?;
+                let event = decode_event(payload.value())?;
                 if event.sequence != stored_sequence {
                     return Err(StorageError::Integrity(format!(
                         "segment {} key sequence {stored_sequence} does not match payload sequence {}",
@@ -1248,6 +1273,11 @@ impl SegmentStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        match fs::remove_file(segment_format_marker_path(&descriptor.path)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         sync_directory(&self.segments_dir)?;
         Ok(())
     }
@@ -1570,10 +1600,11 @@ fn copy_legacy_segment(
         for entry in legacy_events.iter().map_err(redb_error)? {
             let (sequence, payload) = entry.map_err(redb_error)?;
             let event: ChangeEvent = serde_json::from_slice(payload.value())?;
+            let encoded = encode_event(&event)?;
             events
-                .insert(sequence.value(), payload.value())
+                .insert(sequence.value(), encoded.as_slice())
                 .map_err(redb_error)?;
-            descriptor.record_event(&event, payload.value().len() as u64);
+            descriptor.record_event(&event, encoded.len() as u64);
         }
         for entry in legacy_event_ids.iter().map_err(redb_error)? {
             let (event_id, sequence) = entry.map_err(redb_error)?;
@@ -1659,6 +1690,11 @@ fn create_segment(
     drop(database);
     fs::rename(temp, path)?;
     sync_directory(segments_dir)?;
+    write_segment_format_marker(
+        &descriptor.path,
+        SEGMENT_FORMAT_VERSION,
+        EVENT_PAYLOAD_FORMAT_VERSION,
+    )?;
     Ok(descriptor)
 }
 
@@ -1668,6 +1704,9 @@ fn initialize_segment_metadata(
 ) -> Result<(), StorageError> {
     metadata
         .insert(SEGMENT_FORMAT_KEY, SEGMENT_FORMAT_VERSION)
+        .map_err(redb_error)?;
+    metadata
+        .insert(EVENT_PAYLOAD_FORMAT_KEY, EVENT_PAYLOAD_FORMAT_VERSION)
         .map_err(redb_error)?;
     metadata
         .insert(SEGMENT_ID_KEY, descriptor.id)
@@ -1731,17 +1770,138 @@ fn insert_optional_metadata(
     Ok(())
 }
 
+/// Rejects unknown segment and event formats before opening any redb file.
+fn preflight_segment_formats(segments_dir: &Path) -> Result<(), StorageError> {
+    if !segments_dir.exists() {
+        return Ok(());
+    }
+    for path in segment_paths(segments_dir)? {
+        if let Some(marker) = read_segment_format_marker(&path)? {
+            if !matches!(marker.segment, SEGMENT_FORMAT_VERSION | 1) {
+                return Err(StorageError::UnsupportedSegmentFormat {
+                    path,
+                    found: marker.segment,
+                    supported: SEGMENT_FORMAT_VERSION,
+                });
+            }
+            if marker.segment == SEGMENT_FORMAT_VERSION
+                && marker.event != EVENT_PAYLOAD_FORMAT_VERSION
+            {
+                return Err(StorageError::UnsupportedEventPayloadFormat {
+                    found: marker.event,
+                    supported: EVENT_PAYLOAD_FORMAT_VERSION,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically wraps legacy bare event JSON in the current payload envelope.
+fn migrate_segment_formats(
+    segments_dir: &Path,
+    options: SegmentOptions,
+) -> Result<(), StorageError> {
+    let current = SegmentFormatMarker {
+        segment: SEGMENT_FORMAT_VERSION,
+        event: EVENT_PAYLOAD_FORMAT_VERSION,
+    };
+    for path in segment_paths(segments_dir)? {
+        let marker = read_segment_format_marker(&path)?;
+        let database = open_database(&path, options.active_cache_bytes, false)?;
+        match read_metadata_value(&database, SEGMENT_FORMAT_KEY)? {
+            Some(1) => migrate_segment_v1_to_v2(&database)?,
+            Some(SEGMENT_FORMAT_VERSION) => {
+                let payload_format = read_metadata_value(&database, EVENT_PAYLOAD_FORMAT_KEY)?
+                    .ok_or_else(|| {
+                        StorageError::InvalidSegmentCatalog(format!(
+                            "segment {} has no event payload format",
+                            path.display()
+                        ))
+                    })?;
+                if payload_format != EVENT_PAYLOAD_FORMAT_VERSION {
+                    return Err(StorageError::UnsupportedEventPayloadFormat {
+                        found: payload_format,
+                        supported: EVENT_PAYLOAD_FORMAT_VERSION,
+                    });
+                }
+            }
+            Some(found) => {
+                return Err(StorageError::UnsupportedSegmentFormat {
+                    path,
+                    found,
+                    supported: SEGMENT_FORMAT_VERSION,
+                });
+            }
+            None => {
+                return Err(StorageError::InvalidSegmentCatalog(format!(
+                    "segment {} has no format version",
+                    path.display()
+                )));
+            }
+        }
+        drop(database);
+        if marker != Some(current) {
+            write_segment_format_marker(
+                &path,
+                SEGMENT_FORMAT_VERSION,
+                EVENT_PAYLOAD_FORMAT_VERSION,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_segment_v1_to_v2(database: &Database) -> Result<(), StorageError> {
+    let read = database.begin_read().map_err(redb_error)?;
+    let legacy_events = read.open_table(EVENTS).map_err(redb_error)?;
+    let write = database.begin_write().map_err(redb_error)?;
+    let mut stored_bytes = 0u64;
+    {
+        let mut events = write.open_table(EVENTS).map_err(redb_error)?;
+        for entry in legacy_events.iter().map_err(redb_error)? {
+            let (sequence, payload) = entry.map_err(redb_error)?;
+            let event: ChangeEvent = serde_json::from_slice(payload.value())?;
+            let encoded = encode_event(&event)?;
+            stored_bytes = stored_bytes.saturating_add(encoded.len() as u64);
+            events
+                .insert(sequence.value(), encoded.as_slice())
+                .map_err(redb_error)?;
+        }
+        let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
+        metadata
+            .insert(SEGMENT_FORMAT_KEY, SEGMENT_FORMAT_VERSION)
+            .map_err(redb_error)?;
+        metadata
+            .insert(EVENT_PAYLOAD_FORMAT_KEY, EVENT_PAYLOAD_FORMAT_VERSION)
+            .map_err(redb_error)?;
+        metadata
+            .insert(SEGMENT_STORED_BYTES_KEY, stored_bytes)
+            .map_err(redb_error)?;
+    }
+    write.commit().map_err(redb_error)?;
+    Ok(())
+}
+
+fn segment_paths(segments_dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(segments_dir)? {
+        let path = entry?.path();
+        if path.is_file() && parse_segment_id(&path).is_some() {
+            paths.push(path);
+        }
+    }
+    paths.sort_by_key(|path| parse_segment_id(path));
+    Ok(paths)
+}
+
 fn load_segment_descriptors(
     segments_dir: &Path,
     options: SegmentOptions,
 ) -> Result<Vec<SegmentDescriptor>, StorageError> {
     let mut descriptors = Vec::new();
-    for entry in fs::read_dir(segments_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && parse_segment_id(&path).is_some() {
-            descriptors.push(load_segment_descriptor(&path, options.sealed_cache_bytes)?);
-        }
+    for path in segment_paths(segments_dir)? {
+        descriptors.push(load_segment_descriptor(&path, options.sealed_cache_bytes)?);
     }
     descriptors.sort_by_key(|segment| segment.id);
     Ok(descriptors)
@@ -1762,6 +1922,13 @@ fn load_segment_descriptor(
             path: path.to_path_buf(),
             found: format,
             supported: SEGMENT_FORMAT_VERSION,
+        });
+    }
+    let event_payload_format = required_metadata(&metadata, EVENT_PAYLOAD_FORMAT_KEY)?;
+    if event_payload_format != EVENT_PAYLOAD_FORMAT_VERSION {
+        return Err(StorageError::UnsupportedEventPayloadFormat {
+            found: event_payload_format,
+            supported: EVENT_PAYLOAD_FORMAT_VERSION,
         });
     }
     let id = required_metadata(&metadata, SEGMENT_ID_KEY)?;
@@ -1846,6 +2013,24 @@ fn read_source_offsets(database: &Database) -> Result<Vec<SourceOffset>, Storage
     Ok(output)
 }
 
+fn encode_event(event: &ChangeEvent) -> Result<Vec<u8>, StorageError> {
+    Ok(serde_json::to_vec(&StoredEventRef {
+        version: EVENT_PAYLOAD_FORMAT_VERSION,
+        event,
+    })?)
+}
+
+fn decode_event(payload: &[u8]) -> Result<ChangeEvent, StorageError> {
+    let stored: StoredEvent = serde_json::from_slice(payload)?;
+    if stored.version != EVENT_PAYLOAD_FORMAT_VERSION {
+        return Err(StorageError::UnsupportedEventPayloadFormat {
+            found: stored.version,
+            supported: EVENT_PAYLOAD_FORMAT_VERSION,
+        });
+    }
+    Ok(stored.event)
+}
+
 fn open_database(path: &Path, cache_bytes: usize, create: bool) -> Result<Database, StorageError> {
     let mut builder = Database::builder();
     builder.set_cache_size(cache_bytes);
@@ -1925,6 +2110,12 @@ fn cleanup_interrupted_segment_files(
                 last_sequence.is_none_or(|last_sequence| last_sequence < floor)
             }) {
                 fs::remove_file(path)?;
+                let original = segment_path(segments_dir, id);
+                match fs::remove_file(segment_format_marker_path(&original)?) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             } else {
                 let restored = segment_path(segments_dir, id);
                 if restored.exists() {
@@ -1992,6 +2183,74 @@ fn write_control_format_marker(control_path: &Path, version: u64) -> Result<(), 
     drop(file);
     fs::rename(temporary, marker)?;
     if let Some(parent) = control_path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn segment_format_marker_path(segment_path: &Path) -> Result<PathBuf, StorageError> {
+    let name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StorageError::InvalidSegmentCatalog(format!(
+                "segment path has no UTF-8 filename: {}",
+                segment_path.display()
+            ))
+        })?;
+    Ok(segment_path.with_file_name(format!("{name}.format")))
+}
+
+fn read_segment_format_marker(
+    segment_path: &Path,
+) -> Result<Option<SegmentFormatMarker>, StorageError> {
+    let marker = segment_format_marker_path(segment_path)?;
+    let raw = match fs::read_to_string(&marker) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut fields = raw.trim().split(',');
+    let segment = fields
+        .next()
+        .and_then(|field| field.strip_prefix(SEGMENT_FORMAT_MARKER_PREFIX))
+        .and_then(|version| version.parse::<u64>().ok());
+    let event = fields
+        .next()
+        .and_then(|field| field.strip_prefix(EVENT_FORMAT_MARKER_PREFIX))
+        .and_then(|version| version.parse::<u64>().ok());
+    if fields.next().is_some() || segment.is_none() || event.is_none() {
+        return Err(StorageError::InvalidFormatMarker(marker));
+    }
+    Ok(Some(SegmentFormatMarker {
+        segment: segment.expect("segment marker was validated"),
+        event: event.expect("event marker was validated"),
+    }))
+}
+
+fn write_segment_format_marker(
+    segment_path: &Path,
+    segment_version: u64,
+    event_version: u64,
+) -> Result<(), StorageError> {
+    let marker = segment_format_marker_path(segment_path)?;
+    let temporary = marker.with_extension("format.tmp");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(
+        format!(
+            "{SEGMENT_FORMAT_MARKER_PREFIX}{segment_version},\
+             {EVENT_FORMAT_MARKER_PREFIX}{event_version}\n"
+        )
+        .as_bytes(),
+    )?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, marker)?;
+    if let Some(parent) = segment_path.parent() {
         sync_directory(parent)?;
     }
     Ok(())
@@ -2330,6 +2589,122 @@ mod tests {
             !segment_directory(&control_path)
                 .expect("segment directory")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn version_one_segment_migrates_bare_event_payloads() {
+        let temp = TempDir::new().expect("temp dir");
+        let control_path = temp.path().join("events.redb");
+        let options = test_segment_options(10);
+        let stored_event = event(1);
+        let store = SegmentStore::open(control_path.clone(), options).expect("open store");
+        store.append_event(&stored_event).expect("append event");
+        drop(store);
+
+        let path = segment_path(
+            &segment_directory(&control_path).expect("segment directory"),
+            1,
+        );
+        let legacy_payload = serde_json::to_vec(&stored_event).expect("legacy payload");
+        let database = Database::open(&path).expect("open segment");
+        let write = database.begin_write().expect("begin downgrade");
+        {
+            let mut events = write.open_table(EVENTS).expect("events");
+            events
+                .insert(stored_event.sequence, legacy_payload.as_slice())
+                .expect("legacy event");
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            metadata.insert(SEGMENT_FORMAT_KEY, 1).expect("v1 format");
+            metadata
+                .remove(EVENT_PAYLOAD_FORMAT_KEY)
+                .expect("remove payload format");
+            metadata
+                .insert(SEGMENT_STORED_BYTES_KEY, legacy_payload.len() as u64)
+                .expect("legacy byte count");
+        }
+        write.commit().expect("commit downgrade");
+        drop(database);
+        write_segment_format_marker(&path, 1, 0).expect("v1 format marker");
+
+        let migrated = SegmentStore::open(control_path, options).expect("migrate segment");
+        assert_eq!(
+            migrated.replay_from(1, 10, u64::MAX).expect("replay"),
+            [stored_event]
+        );
+        drop(migrated);
+
+        let database = Database::open(path).expect("open migrated segment");
+        let read = database.begin_read().expect("read migrated segment");
+        let metadata = read.open_table(METADATA).expect("metadata");
+        assert_eq!(
+            metadata
+                .get(SEGMENT_FORMAT_KEY)
+                .expect("segment format")
+                .expect("segment format value")
+                .value(),
+            SEGMENT_FORMAT_VERSION
+        );
+        assert_eq!(
+            metadata
+                .get(EVENT_PAYLOAD_FORMAT_KEY)
+                .expect("payload format")
+                .expect("payload format value")
+                .value(),
+            EVENT_PAYLOAD_FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn newer_segment_format_is_rejected_without_mutation() {
+        let temp = TempDir::new().expect("temp dir");
+        let control_path = temp.path().join("events.redb");
+        let options = test_segment_options(10);
+        let store = SegmentStore::open(control_path.clone(), options).expect("open store");
+        store.append_event(&event(1)).expect("append event");
+        drop(store);
+
+        let path = segment_path(
+            &segment_directory(&control_path).expect("segment directory"),
+            1,
+        );
+        let database = Database::open(&path).expect("open segment");
+        let write = database.begin_write().expect("begin future format");
+        {
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            metadata
+                .insert(SEGMENT_FORMAT_KEY, SEGMENT_FORMAT_VERSION + 1)
+                .expect("future format");
+        }
+        write.commit().expect("commit future format");
+        drop(database);
+        write_segment_format_marker(
+            &path,
+            SEGMENT_FORMAT_VERSION + 1,
+            EVENT_PAYLOAD_FORMAT_VERSION,
+        )
+        .expect("future format marker");
+        let before = fs::read(&path).expect("segment before rejection");
+        let marker = segment_format_marker_path(&path).expect("marker path");
+        let marker_before = fs::read(&marker).expect("marker before rejection");
+
+        let error = match SegmentStore::open(control_path, options) {
+            Ok(_) => panic!("future segment must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            StorageError::UnsupportedSegmentFormat {
+                found,
+                supported,
+                ..
+            } if found == SEGMENT_FORMAT_VERSION + 1 && supported == SEGMENT_FORMAT_VERSION
+        ));
+        assert_eq!(fs::read(path).expect("segment after rejection"), before);
+        assert_eq!(
+            fs::read(marker).expect("marker after rejection"),
+            marker_before
         );
     }
 

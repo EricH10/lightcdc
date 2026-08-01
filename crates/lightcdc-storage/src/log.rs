@@ -572,6 +572,9 @@ pub enum StorageError {
         found: u64,
         supported: u64,
     },
+
+    #[error("event payload format {found} is unsupported; this binary supports format {supported}")]
+    UnsupportedEventPayloadFormat { found: u64, supported: u64 },
 }
 
 impl StorageError {

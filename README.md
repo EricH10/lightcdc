@@ -360,6 +360,5 @@ Implemented basics:
 Not implemented yet:
 
 - Complete `pgoutput` coverage
-- Complete durable event and staging format migration coverage
 - WASM transform runtime
 - Webhook destinations

@@ -55,10 +55,11 @@ them has optional work remaining.
   release must say so prominently.
 - Version the durable event, metadata, consumer-offset, and staging formats.
   Test forward migrations and reject unsupported downgrade or newer formats
-  without mutating the store. PARTIAL: the control database and segment headers
-  are versioned; legacy single-file migration and mutation-free rejection of a
-  newer control format are tested. Control format v2 adds source identity with
-  a tested v1 forward migration. Event payload and staging migrations remain.
+  without mutating the store. DONE: control v2 and segment v2 have tested v1
+  forward migrations; segment events use a versioned payload envelope; staging
+  files use a magic/version header; and newer control, segment, event, or
+  staging formats are rejected. Durable sidecar markers let startup reject a
+  newer file byte-for-byte unchanged before opening redb or running migrations.
 - Test the no-loss boundary across process kill, host restart, PostgreSQL
   restart, network interruption, storage failure, retention, and supported
   schema changes. PARTIAL: process, reconnect, transaction, retention, and
@@ -233,13 +234,14 @@ production-stability claim:
   and cleanup failures.
 - Extend `pgoutput` coverage and schema-evolution tests beyond the currently
   supported messages and add-column case.
-- Version the durable event and staging formats and define their migration policy
-  before promising compatibility across releases.
+- Keep durable-format migration fixtures for every future format change. DONE
+  for the first control, segment-event, and staging versions.
 - Test the configured byte and event limits at their exact boundary values.
 - Persist PostgreSQL source identity and reject source replacement, stale local
   restore, or a slot checkpoint ahead of the durable local source LSN.
-- Add restart and restore fixtures that exercise compatible migrations,
-  incompatible formats, corruption, and local/source checkpoint divergence.
+- Add broader restart fixtures for migrations and local/source checkpoint
+  divergence. Offline restore, compatible migration, incompatible-format, and
+  corrupt-payload fixtures now exist.
 
 ## Planned Migrations and Backfills
 
