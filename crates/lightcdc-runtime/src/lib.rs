@@ -8,6 +8,8 @@ pub use state::{
 };
 
 use std::{
+    fs,
+    path::{Path, PathBuf},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -22,6 +24,18 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 const STORAGE_COMMAND_CAPACITY: usize = 1;
+const REDB_WRITE_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bounds durable storage growth while reserving room for recovery operations.
+#[derive(Clone, Debug)]
+pub struct StorageResourceLimits {
+    /// Directory containing the control database, segments, and staging files.
+    pub data_dir: PathBuf,
+    /// Maximum logical bytes allowed below `data_dir` before another batch.
+    pub max_storage_bytes: u64,
+    /// Filesystem bytes that capture must leave unused.
+    pub min_free_disk_bytes: u64,
+}
 
 /// Bounds how many complete source transactions share one redb commit.
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +179,15 @@ enum StorageCommand {
 impl CaptureStorageWriter {
     /// Starts the long-lived OS thread that owns synchronous storage work.
     pub fn start(store: RedbEventStore, source_name: String) -> anyhow::Result<Self> {
+        Self::start_with_limits(store, source_name, None)
+    }
+
+    /// Starts the writer with hard data-directory and free-space limits.
+    pub fn start_with_limits(
+        store: RedbEventStore,
+        source_name: String,
+        resource_limits: Option<StorageResourceLimits>,
+    ) -> anyhow::Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<StorageCommand>(STORAGE_COMMAND_CAPACITY);
         let thread = thread::Builder::new()
             .name("lightcdc-redb-writer".to_owned())
@@ -174,7 +197,12 @@ impl CaptureStorageWriter {
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
                         StorageCommand::Persist(command) => {
-                            persist_capture_batch(&store, &source_name, command);
+                            persist_capture_batch(
+                                &store,
+                                &source_name,
+                                resource_limits.as_ref(),
+                                command,
+                            );
                         }
                         StorageCommand::Prune {
                             policy,
@@ -368,7 +396,12 @@ impl CaptureStorageHandle {
 }
 
 /// Persists a batch and sends its ownership and result back to the async caller.
-fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: PersistCommand) {
+fn persist_capture_batch(
+    store: &RedbEventStore,
+    source_name: &str,
+    resource_limits: Option<&StorageResourceLimits>,
+    command: PersistCommand,
+) {
     #[cfg(test)]
     if let Some(delay) = command.delay_before_persist {
         thread::sleep(delay);
@@ -390,17 +423,62 @@ fn persist_capture_batch(store: &RedbEventStore, source_name: &str, command: Per
         })
         .collect::<Vec<_>>();
     let persist_started = command.measure_latency.then(Instant::now);
-    let result = if command.check_replay {
-        store.persist_transaction_batch(&transactions, source_name)
-    } else {
-        store.persist_reconciled_transaction_batch(&transactions, source_name)
-    };
+    let result = ensure_storage_capacity(resource_limits, &command.batch).and_then(|()| {
+        if command.check_replay {
+            store.persist_transaction_batch(&transactions, source_name)
+        } else {
+            store.persist_reconciled_transaction_batch(&transactions, source_name)
+        }
+    });
     let persist_latency = persist_started.map(|persist_started| persist_started.elapsed());
     let _ = command.response.send(StorageCompletion {
         batch: command.batch,
         result,
         persist_latency,
     });
+}
+
+fn ensure_storage_capacity(
+    limits: Option<&StorageResourceLimits>,
+    batch: &CaptureBatch,
+) -> Result<(), StorageError> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let current_bytes = directory_size(&limits.data_dir)?;
+    // redb uses copy-on-write pages. Reserve the encoded payload plus fixed
+    // transaction headroom so the check does not assume payload bytes are the
+    // only temporary space needed by a commit.
+    let required_bytes = batch.staged_bytes.saturating_add(REDB_WRITE_HEADROOM_BYTES);
+    if current_bytes.saturating_add(required_bytes) > limits.max_storage_bytes {
+        return Err(StorageError::ResourceLimit(format!(
+            "data directory uses {current_bytes} bytes and the next batch reserves {required_bytes}, exceeding max_storage_bytes {}",
+            limits.max_storage_bytes
+        )));
+    }
+
+    let available_bytes = fs2::available_space(&limits.data_dir)?;
+    if available_bytes < limits.min_free_disk_bytes.saturating_add(required_bytes) {
+        return Err(StorageError::ResourceLimit(format!(
+            "filesystem has {available_bytes} bytes available; the next batch needs {required_bytes} bytes while preserving min_free_disk_bytes {}",
+            limits.min_free_disk_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn directory_size(path: &Path) -> Result<u64, StorageError> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 impl Drop for CaptureStorageWriter {
@@ -485,6 +563,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_writer_rejects_a_batch_before_exceeding_storage_limit() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "writer.redb".to_owned(),
+        })
+        .expect("open store");
+        let writer = CaptureStorageWriter::start_with_limits(
+            store.clone(),
+            "default".to_owned(),
+            Some(StorageResourceLimits {
+                data_dir: temp.path().to_path_buf(),
+                max_storage_bytes: 1,
+                min_free_disk_bytes: 1,
+            }),
+        )
+        .expect("start writer");
+        let mut batch = CaptureBatch::default();
+        batch.push(transaction(1, "0/1"));
+
+        let completion = writer
+            .submit(batch, false, true)
+            .await
+            .expect("submit batch")
+            .response
+            .await
+            .expect("writer response");
+
+        assert!(matches!(
+            completion.result,
+            Err(StorageError::ResourceLimit(_))
+        ));
+        assert_eq!(store.last_sequence().expect("last sequence"), None);
+        assert_eq!(store.source_offset("default").expect("source offset"), None);
+    }
+
+    #[tokio::test]
     async fn dedicated_writer_serializes_retention_after_capture_writes() {
         let temp = TempDir::new().expect("temp dir");
         let store = RedbEventStore::open_with_segment_options(
@@ -529,6 +644,7 @@ mod tests {
             .prune(
                 RetentionPolicy {
                     max_events: Some(1),
+                    max_bytes: None,
                     max_age: None,
                     delete_batch_size: 10,
                 },

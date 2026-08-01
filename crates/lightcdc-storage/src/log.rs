@@ -98,6 +98,8 @@ pub struct ConsumerOffset {
 pub struct RetentionPolicy {
     /// Maximum retained event payload count.
     pub max_events: Option<u64>,
+    /// Maximum logical bytes across event segment files.
+    pub max_bytes: Option<u64>,
     /// Maximum retained event payload age.
     pub max_age: Option<Duration>,
     /// Target maximum events retired per sweep; one whole segment may exceed it.
@@ -107,7 +109,7 @@ pub struct RetentionPolicy {
 impl RetentionPolicy {
     /// Returns true when at least one retention boundary is configured.
     pub fn is_enabled(self) -> bool {
-        self.max_events.is_some() || self.max_age.is_some()
+        self.max_events.is_some() || self.max_bytes.is_some() || self.max_age.is_some()
     }
 }
 
@@ -118,6 +120,8 @@ pub struct RetentionOutcome {
     pub deleted_events: u64,
     /// Deduplication identifiers old enough to remove safely.
     pub deleted_replay_ids: u64,
+    /// Logical segment-file bytes removed by the sweep.
+    pub deleted_bytes: u64,
     /// Oldest sequence whose payload remains after the sweep.
     pub first_retained_sequence: Option<u64>,
     /// Highest sequence ever assigned, which retention never rewinds.
@@ -505,6 +509,9 @@ pub enum StorageError {
 
     #[error("invalid retention policy: {0}")]
     InvalidRetentionPolicy(String),
+
+    #[error("storage resource limit reached: {0}")]
+    ResourceLimit(String),
 
     #[error("invalid segment options: {0}")]
     InvalidSegmentOptions(String),
@@ -1192,6 +1199,7 @@ mod tests {
             .prune_events(
                 RetentionPolicy {
                     max_events: Some(1),
+                    max_bytes: None,
                     max_age: None,
                     delete_batch_size: 10,
                 },
@@ -1223,6 +1231,61 @@ mod tests {
     }
 
     #[test]
+    fn byte_retention_deletes_whole_sealed_segment_files() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: temp.path().to_path_buf(),
+                database_file: "test.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 2,
+                ..SegmentOptions::default()
+            },
+        )
+        .expect("open store");
+        store
+            .persist_transaction(&[event(1, "0/1"), event(2, "0/2")], "default", "0/3")
+            .expect("persist sealed batch");
+        store
+            .persist_transaction(&[event(3, "0/3")], "default", "0/4")
+            .expect("rotate and persist active batch");
+        let segments_dir = temp.path().join("test.redb.segments");
+        let mut segment_paths = std::fs::read_dir(&segments_dir)
+            .expect("segment directory")
+            .map(|entry| entry.expect("segment entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "redb")
+            })
+            .collect::<Vec<_>>();
+        segment_paths.sort();
+        let active_bytes = std::fs::metadata(segment_paths.last().expect("active segment"))
+            .expect("active metadata")
+            .len();
+
+        let outcome = store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: None,
+                    max_bytes: Some(active_bytes),
+                    max_age: None,
+                    delete_batch_size: 10,
+                },
+                0,
+            )
+            .expect("prune by bytes");
+
+        assert_eq!(outcome.deleted_events, 2);
+        assert!(outcome.deleted_bytes > 0);
+        assert_eq!(outcome.first_retained_sequence, Some(3));
+        assert_eq!(
+            store.replay_from(3, 10).expect("active event"),
+            [event(3, "0/3")]
+        );
+    }
+
+    #[test]
     fn age_retention_keeps_latest_checkpoint_safe_for_source_replay() {
         let temp = TempDir::new().expect("temp dir");
         let store = RedbEventStore::open_with_segment_options(
@@ -1245,6 +1308,7 @@ mod tests {
             .prune_events(
                 RetentionPolicy {
                     max_events: None,
+                    max_bytes: None,
                     max_age: Some(Duration::from_secs(1)),
                     delete_batch_size: 10,
                 },

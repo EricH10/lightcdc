@@ -31,30 +31,26 @@ pub(super) struct CaptureRetention {
 pub(super) async fn run_retention_sweeps(
     storage: CaptureStorageHandle,
     retention: CaptureRetention,
-) {
+) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(retention.check_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
 
     loop {
         interval.tick().await;
-        match storage
+        let outcome = storage
             .prune(retention.policy, unix_timestamp_ms_i64())
             .await
-        {
-            Ok(outcome) if outcome.deleted_events > 0 => {
-                info!(
-                    deleted_events = outcome.deleted_events,
-                    deleted_replay_ids = outcome.deleted_replay_ids,
-                    first_retained_sequence = ?outcome.first_retained_sequence,
-                    high_watermark = ?outcome.high_watermark,
-                    "pruned retained events"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(%error, "event retention sweep failed; retrying");
-            }
+            .context("event retention sweep failed")?;
+        if outcome.deleted_events > 0 {
+            info!(
+                deleted_events = outcome.deleted_events,
+                deleted_replay_ids = outcome.deleted_replay_ids,
+                deleted_bytes = outcome.deleted_bytes,
+                first_retained_sequence = ?outcome.first_retained_sequence,
+                high_watermark = ?outcome.high_watermark,
+                "pruned retained events"
+            );
         }
     }
 }
@@ -343,13 +339,19 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
 /// Builds an optional validated retention schedule from runtime settings.
 pub(super) fn capture_retention(config: &Config) -> anyhow::Result<Option<CaptureRetention>> {
     let runtime = &config.runtime;
-    if runtime.retention_max_events.is_none() && runtime.retention_max_age_seconds.is_none() {
+    if runtime.retention_max_events.is_none()
+        && runtime.retention_max_bytes.is_none()
+        && runtime.retention_max_age_seconds.is_none()
+    {
         return Ok(None);
     }
     if runtime.retention_max_events == Some(0) {
         return Err(anyhow!(
             "runtime.retention_max_events must be greater than zero"
         ));
+    }
+    if runtime.retention_max_bytes == Some(0) {
+        anyhow::bail!("runtime.retention_max_bytes must be greater than zero");
     }
     if runtime.retention_max_age_seconds == Some(0) {
         return Err(anyhow!(
@@ -370,6 +372,7 @@ pub(super) fn capture_retention(config: &Config) -> anyhow::Result<Option<Captur
     Ok(Some(CaptureRetention {
         policy: RetentionPolicy {
             max_events: runtime.retention_max_events,
+            max_bytes: runtime.retention_max_bytes,
             max_age: runtime.retention_max_age_seconds.map(Duration::from_secs),
             delete_batch_size: runtime.retention_delete_batch_size,
         },

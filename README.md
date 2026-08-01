@@ -80,6 +80,8 @@ channel_capacity = 1024
 max_active_subscriptions = 1024
 max_consumer_name_bytes = 128
 max_outbound_event_bytes = 16777216
+max_storage_bytes = 107374182400
+min_free_disk_bytes = 1073741824
 shutdown_timeout_ms = 10000
 ```
 
@@ -135,10 +137,11 @@ whole, then seals the segment. The active segment is immediately readable by
 replay and gRPC consumers; consumers do not wait for it to seal.
 
 Event-log retention is optional and targets a maximum retained event count,
-event age, or whichever boundary is reached first:
+logical segment bytes, event age, or whichever boundary is reached first:
 
 ```toml
 retention_max_events = 10000000
+retention_max_bytes = 10737418240
 retention_max_age_seconds = 604800
 retention_check_interval_ms = 1000
 retention_delete_batch_size = 100000
@@ -152,7 +155,16 @@ temporarily exceed a boundary, count retention may then keep up to one segment
 less than the configured maximum, and age retention waits until every event in
 a sealed segment has expired. Keep segment limits comfortably below the
 retention window. `retention_delete_batch_size` is a target work budget measured
-in events; one indivisible segment may exceed it.
+in events; one indivisible segment may exceed it. A retention I/O failure stops
+capture without acknowledging the current PostgreSQL transaction, rather than
+allowing storage to grow while sweeps silently fail.
+
+`max_storage_bytes` is a hard pre-commit ceiling across the data directory.
+`min_free_disk_bytes` reserves filesystem space both while spilling a large
+source transaction and before committing its redb batch. The writer reserves
+additional copy-on-write headroom. Reaching either boundary stops capture
+without advancing PostgreSQL acknowledgement, so an operator can free space or
+raise a deliberately sized limit and resume without losing the transaction.
 
 Retention is a hard log boundary: a durable consumer that falls behind receives
 an explicit expired offset error and must seek to `earliest` or `latest`.

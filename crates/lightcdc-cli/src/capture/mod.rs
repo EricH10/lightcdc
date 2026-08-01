@@ -23,7 +23,7 @@ use self::{
 use crate::{
     cli::CaptureOptions,
     logging::init_logging,
-    store::{open_event_store, storage_options},
+    store::{open_event_store, storage_options, storage_resource_limits},
 };
 
 mod metrics;
@@ -86,7 +86,11 @@ pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> an
 
     let shutdown_timeout = shutdown_timeout(&config)?;
     let store = open_event_store(&config)?;
-    let storage_writer = CaptureStorageWriter::start(store.clone(), config.source.name.clone())?;
+    let storage_writer = CaptureStorageWriter::start_with_limits(
+        store.clone(),
+        config.source.name.clone(),
+        Some(storage_resource_limits(&config)),
+    )?;
     let (state, _state_rx) = runtime_state_channel();
     let outcome = {
         let capture = capture_with_store(config, store, options, None, &storage_writer, &state);
@@ -132,7 +136,11 @@ pub(crate) async fn run(
     let event_notifier = EventNotifier::new();
     let server_notifier = event_notifier.clone();
     let source_name = config.source.name.clone();
-    let storage_writer = CaptureStorageWriter::start(store.clone(), source_name.clone())?;
+    let storage_writer = CaptureStorageWriter::start_with_limits(
+        store.clone(),
+        source_name.clone(),
+        Some(storage_resource_limits(&config)),
+    )?;
     let server_storage = storage_writer.handle();
     let (state, state_rx) = runtime_state_channel();
     let (shutdown, shutdown_rx) = shutdown_channel();
@@ -231,7 +239,8 @@ async fn capture_with_store(
         config.runtime.transaction_memory_threshold_bytes,
         config.runtime.max_transaction_bytes,
         config.runtime.max_transaction_events,
-    );
+    )
+    .with_min_free_disk_bytes(config.runtime.min_free_disk_bytes);
     let metrics = options
         .metrics_file
         .as_deref()
@@ -245,6 +254,8 @@ async fn capture_with_store(
         transaction_memory_threshold_bytes = config.runtime.transaction_memory_threshold_bytes,
         max_transaction_bytes = config.runtime.max_transaction_bytes,
         max_transaction_events = config.runtime.max_transaction_events,
+        max_storage_bytes = config.runtime.max_storage_bytes,
+        min_free_disk_bytes = config.runtime.min_free_disk_bytes,
         capture_batch_max_transactions = batch_limits.max_transactions,
         capture_batch_max_events = batch_limits.max_events,
         capture_batch_max_bytes = batch_limits.max_bytes,
@@ -253,6 +264,7 @@ async fn capture_with_store(
         segment_max_bytes = config.runtime.segment_max_bytes,
         segment_max_age_seconds = config.runtime.segment_max_age_seconds,
         retention_max_events = ?retention.and_then(|retention| retention.policy.max_events),
+        retention_max_bytes = ?retention.and_then(|retention| retention.policy.max_bytes),
         retention_max_age_seconds = ?retention
             .and_then(|retention| retention.policy.max_age)
             .map(|max_age| max_age.as_secs()),
@@ -268,13 +280,7 @@ async fn capture_with_store(
     );
 
     state.transition(RuntimeState::Starting, None);
-    let retention_task = retention.map(|retention| {
-        AbortTask::new(tokio::spawn(run_retention_sweeps(
-            storage_writer.handle(),
-            retention,
-        )))
-    });
-    let capture_result = supervise_capture(CaptureContext {
+    let capture_context = CaptureContext {
         config: &config,
         store: &store,
         storage_writer,
@@ -287,15 +293,21 @@ async fn capture_with_store(
         batch_limits,
         transaction_buffer_options,
         state,
-    })
-    .await;
-    if let Some(retention_task) = retention_task
-        && let Err(error) = retention_task.abort_and_wait().await
-        && !error.is_cancelled()
-    {
-        warn!(%error, "retention task stopped unexpectedly");
+    };
+    if let Some(retention) = retention {
+        let capture = supervise_capture(capture_context);
+        let sweeps = run_retention_sweeps(storage_writer.handle(), retention);
+        tokio::pin!(capture);
+        tokio::pin!(sweeps);
+        tokio::select! {
+            result = &mut capture => result,
+            result = &mut sweeps => result.context(
+                "retention stopped capture before disk growth could continue unchecked"
+            ),
+        }
+    } else {
+        supervise_capture(capture_context).await
     }
-    capture_result
 }
 
 /// Converts the configured graceful shutdown timeout into a validated duration.

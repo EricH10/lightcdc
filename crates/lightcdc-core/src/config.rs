@@ -94,6 +94,12 @@ pub struct RuntimeConfig {
     /// Maximum encoded bytes delivered in one consumer event.
     #[serde(default = "default_max_outbound_event_bytes")]
     pub max_outbound_event_bytes: usize,
+    /// Hard bound across the control database, segments, and staging files.
+    #[serde(default = "default_max_storage_bytes")]
+    pub max_storage_bytes: u64,
+    /// Free filesystem bytes reserved for recovery and PostgreSQL WAL safety.
+    #[serde(default = "default_min_free_disk_bytes")]
+    pub min_free_disk_bytes: u64,
     /// Delay between transactional logical heartbeat messages.
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
@@ -130,6 +136,9 @@ pub struct RuntimeConfig {
     /// Optional maximum number of event payloads retained locally.
     #[serde(default)]
     pub retention_max_events: Option<u64>,
+    /// Optional maximum logical bytes across event segment files.
+    #[serde(default)]
+    pub retention_max_bytes: Option<u64>,
     /// Optional maximum age of event payloads retained locally.
     #[serde(default)]
     pub retention_max_age_seconds: Option<u64>,
@@ -308,6 +317,14 @@ impl Config {
                 runtime.max_outbound_event_bytes as u128,
             ),
             (
+                "runtime.max_storage_bytes",
+                runtime.max_storage_bytes as u128,
+            ),
+            (
+                "runtime.min_free_disk_bytes",
+                runtime.min_free_disk_bytes as u128,
+            ),
+            (
                 "runtime.heartbeat_interval_ms",
                 runtime.heartbeat_interval_ms as u128,
             ),
@@ -378,8 +395,29 @@ impl Config {
                     .to_owned(),
             );
         }
+        if runtime.max_storage_bytes <= runtime.segment_max_bytes {
+            return Err(
+                "runtime.max_storage_bytes must be greater than runtime.segment_max_bytes"
+                    .to_owned(),
+            );
+        }
+        if runtime.max_storage_bytes <= runtime.max_transaction_bytes {
+            return Err(
+                "runtime.max_storage_bytes must be greater than runtime.max_transaction_bytes"
+                    .to_owned(),
+            );
+        }
+        if runtime
+            .retention_max_bytes
+            .is_some_and(|maximum| maximum > runtime.max_storage_bytes)
+        {
+            return Err(
+                "runtime.retention_max_bytes must not exceed runtime.max_storage_bytes".to_owned(),
+            );
+        }
         for (name, limit) in [
             ("runtime.retention_max_events", runtime.retention_max_events),
+            ("runtime.retention_max_bytes", runtime.retention_max_bytes),
             (
                 "runtime.retention_max_age_seconds",
                 runtime.retention_max_age_seconds,
@@ -664,6 +702,14 @@ fn default_max_consumer_name_bytes() -> usize {
 
 fn default_max_outbound_event_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_max_storage_bytes() -> u64 {
+    100 * 1024 * 1024 * 1024
+}
+
+fn default_min_free_disk_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn default_max_transaction_bytes() -> u64 {
@@ -962,6 +1008,8 @@ mod tests {
                 max_active_subscriptions: 1_024,
                 max_consumer_name_bytes: 128,
                 max_outbound_event_bytes: 16 * 1024 * 1024,
+                max_storage_bytes: 100 * 1024 * 1024 * 1024,
+                min_free_disk_bytes: 1024 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,
                 transaction_memory_threshold_bytes: 16 * 1024 * 1024,
                 max_transaction_bytes: 1024 * 1024 * 1024,
@@ -974,6 +1022,7 @@ mod tests {
                 segment_max_bytes: 256 * 1024 * 1024,
                 segment_max_age_seconds: 15 * 60,
                 retention_max_events: None,
+                retention_max_bytes: None,
                 retention_max_age_seconds: None,
                 retention_check_interval_ms: 1_000,
                 retention_delete_batch_size: 100_000,

@@ -81,9 +81,14 @@ them has optional work remaining.
   procedure.
 - Enforce byte-size retention, staging-space limits, minimum free-space
   thresholds, and a reserved emergency margin. Stop or shed work before disk
-  exhaustion and surface the resulting PostgreSQL WAL-retention risk.
+  exhaustion and surface the resulting PostgreSQL WAL-retention risk. DONE for
+  logical segment-byte retention, a hard total data-directory ceiling, and a
+  free-space reserve checked during staging and immediately before commit.
 - Classify storage and retention failures as healthy, degraded, retryable, or
   terminal instead of logging every retention failure and retrying forever.
+  DONE for capture writes and retention: resource/storage failures stop capture
+  without acknowledging PostgreSQL; source reconnect classification remains
+  independent.
 - Move consumer replay, ACK, and seek storage operations off Tokio worker
   threads. PARTIAL: capture, retention, ACK, and seek mutations share the
   dedicated storage thread; replay reads still need a bounded reader pool.
@@ -318,8 +323,8 @@ slow consumer cannot stall capture or unrelated consumers.
 
 ## Milestone 6: Retention and Slow Consumers
 
-- Add maximum event age and storage size policies. PARTIAL: maximum age and
-  retained event count are implemented; byte-size retention remains.
+- Add maximum event age and storage size policies. DONE for maximum age,
+  retained event count, and whole-segment logical byte limits.
 - Track the lowest sequence still required by active consumers. SUPERSEDED for
   the initial hard-retention model: abandoned consumers do not pin disk.
 - Define expiration behavior for abandoned consumers. DONE: an expired offset
@@ -333,7 +338,9 @@ slow consumer cannot stall capture or unrelated consumers.
   100k events/second. Longer sustained retention benchmarks remain. Consider
   encoded event blocks or multiple writable shards only when measured demand
   justifies their added ordering and replay complexity.
-- Warn and shed work safely before disk exhaustion.
+- Warn and shed work safely before disk exhaustion. DONE by refusing the next
+  source commit or staging record while preserving the configured free-space
+  reserve; PostgreSQL WAL acknowledgement does not advance.
 
 Complete when storage growth is bounded and stale consumers have explicit,
 observable behavior.

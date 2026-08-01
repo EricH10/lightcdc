@@ -444,6 +444,7 @@ impl SegmentStore {
             return Ok(RetentionOutcome {
                 deleted_events: 0,
                 deleted_replay_ids: 0,
+                deleted_bytes: 0,
                 first_retained_sequence: self.first_sequence()?,
                 high_watermark: self.last_sequence()?,
             });
@@ -461,11 +462,16 @@ impl SegmentStore {
             .iter()
             .map(|segment| segment.event_count)
             .sum::<u64>();
+        let total_bytes = descriptors.iter().try_fold(0u64, |total, segment| {
+            let bytes = fs::metadata(&segment.path)?.len();
+            Ok::<_, StorageError>(total.saturating_add(bytes))
+        })?;
         let age_cutoff = policy.max_age.map(|max_age| {
             let max_age_ms = max_age.as_millis().min(i64::MAX as u128) as i64;
             now_ms.saturating_sub(max_age_ms)
         });
         let mut remaining_events = total_events;
+        let mut remaining_bytes = total_bytes;
         let mut candidates = Vec::new();
         let mut selected_events = 0u64;
 
@@ -473,16 +479,20 @@ impl SegmentStore {
             let exceeds_count = policy
                 .max_events
                 .is_some_and(|maximum| remaining_events > maximum);
+            let exceeds_bytes = policy
+                .max_bytes
+                .is_some_and(|maximum| remaining_bytes > maximum);
             let exceeds_age = age_cutoff.is_some_and(|cutoff| {
                 descriptor
                     .last_timestamp_ms
                     .is_some_and(|timestamp| timestamp <= cutoff)
             });
-            if !exceeds_count && !exceeds_age {
+            if !exceeds_count && !exceeds_bytes && !exceeds_age {
                 break;
             }
             candidates.push(descriptor.clone());
             remaining_events = remaining_events.saturating_sub(descriptor.event_count);
+            remaining_bytes = remaining_bytes.saturating_sub(fs::metadata(&descriptor.path)?.len());
             selected_events = selected_events.saturating_add(descriptor.event_count);
             if selected_events >= policy.delete_batch_size as u64 {
                 break;
@@ -491,15 +501,19 @@ impl SegmentStore {
 
         let mut deleted_events = 0u64;
         let mut deleted_replay_ids = 0u64;
+        let mut deleted_bytes = 0u64;
         for candidate in candidates {
+            let candidate_bytes = fs::metadata(&candidate.path)?.len();
             self.delete_segment(&candidate)?;
             deleted_events = deleted_events.saturating_add(candidate.event_count);
             deleted_replay_ids = deleted_replay_ids.saturating_add(candidate.replay_id_count);
+            deleted_bytes = deleted_bytes.saturating_add(candidate_bytes);
         }
 
         Ok(RetentionOutcome {
             deleted_events,
             deleted_replay_ids,
+            deleted_bytes,
             first_retained_sequence: self.first_sequence()?,
             high_watermark: self.last_sequence()?,
         })

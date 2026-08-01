@@ -27,6 +27,8 @@ pub struct TransactionBufferOptions {
     pub max_transaction_bytes: u64,
     /// Hard event-count limit for one source transaction.
     pub max_transaction_events: usize,
+    /// Filesystem bytes that staging writes must leave unused.
+    pub min_free_disk_bytes: u64,
 }
 
 impl TransactionBufferOptions {
@@ -47,7 +49,14 @@ impl TransactionBufferOptions {
             memory_threshold_bytes,
             max_transaction_bytes,
             max_transaction_events,
+            min_free_disk_bytes: 0,
         }
+    }
+
+    /// Preserves a filesystem reserve while spilling large transactions.
+    pub fn with_min_free_disk_bytes(mut self, min_free_disk_bytes: u64) -> Self {
+        self.min_free_disk_bytes = min_free_disk_bytes;
+        self
     }
 
     /// Keeps all events in memory for direct connector users and focused tests.
@@ -57,6 +66,7 @@ impl TransactionBufferOptions {
             memory_threshold_bytes: u64::MAX,
             max_transaction_bytes: u64::MAX,
             max_transaction_events: usize::MAX,
+            min_free_disk_bytes: 0,
         }
     }
 
@@ -253,7 +263,11 @@ impl TransactionBuffer {
                 "transaction exceeded memory threshold without a staging directory".to_owned(),
             )
         })?;
-        let mut staging = StagingWriter::create(staging_dir, transaction_id)?;
+        let mut staging = StagingWriter::create(
+            staging_dir,
+            transaction_id,
+            self.options.min_free_disk_bytes,
+        )?;
 
         for event in self.events.drain(..) {
             staging.write_record(&serde_json::to_vec(&event)?)?;
@@ -358,11 +372,16 @@ struct StagingWriter {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
     remove_on_drop: bool,
+    min_free_disk_bytes: u64,
 }
 
 impl StagingWriter {
     /// Creates a collision-resistant file for one active source transaction.
-    fn create(staging_dir: &Path, transaction_id: u64) -> Result<Self, TransactionBufferError> {
+    fn create(
+        staging_dir: &Path,
+        transaction_id: u64,
+        min_free_disk_bytes: u64,
+    ) -> Result<Self, TransactionBufferError> {
         fs::create_dir_all(staging_dir)?;
         let path = unique_staging_path(staging_dir, transaction_id);
         let file = OpenOptions::new()
@@ -374,11 +393,26 @@ impl StagingWriter {
             path,
             writer: Some(BufWriter::new(file)),
             remove_on_drop: true,
+            min_free_disk_bytes,
         })
     }
 
     /// Appends one length-prefixed serialized event.
     fn write_record(&mut self, payload: &[u8]) -> Result<(), TransactionBufferError> {
+        let required_bytes = RECORD_LENGTH_BYTES.saturating_add(payload.len() as u64);
+        let staging_dir = self.path.parent().ok_or_else(|| {
+            TransactionBufferError::InvalidOptions(
+                "staging file has no parent directory".to_owned(),
+            )
+        })?;
+        let available_bytes = fs2::available_space(staging_dir)?;
+        if available_bytes < self.min_free_disk_bytes.saturating_add(required_bytes) {
+            return Err(TransactionBufferError::InsufficientStagingSpace {
+                available: available_bytes,
+                required: required_bytes,
+                reserved: self.min_free_disk_bytes,
+            });
+        }
         let writer = self
             .writer
             .as_mut()
@@ -470,6 +504,15 @@ pub enum TransactionBufferError {
     #[error("transaction byte accounting overflowed")]
     AccountingOverflow,
 
+    #[error(
+        "staging filesystem has {available} bytes available; the next record needs {required} bytes while preserving {reserved} reserved bytes"
+    )]
+    InsufficientStagingSpace {
+        available: u64,
+        required: u64,
+        reserved: u64,
+    },
+
     #[error("staging file is already closed")]
     ClosedStagingFile,
 
@@ -488,7 +531,9 @@ impl TransactionBufferError {
     pub fn is_limit_exceeded(&self) -> bool {
         matches!(
             self,
-            Self::EventLimitExceeded { .. } | Self::ByteLimitExceeded { .. }
+            Self::EventLimitExceeded { .. }
+                | Self::ByteLimitExceeded { .. }
+                | Self::InsufficientStagingSpace { .. }
         )
     }
 }
@@ -656,6 +701,7 @@ mod tests {
             memory_threshold_bytes: u64::MAX,
             max_transaction_bytes: u64::MAX,
             max_transaction_events: 1,
+            min_free_disk_bytes: 0,
         };
         let mut buffer = TransactionBuffer::new(options).expect("buffer");
         buffer.begin(42).expect("begin");
@@ -684,6 +730,22 @@ mod tests {
         assert!(matches!(
             error,
             TransactionBufferError::ByteLimitExceeded { maximum: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn staging_preserves_the_configured_free_space_reserve() {
+        let temp = TempDir::new().expect("temp dir");
+        let options = TransactionBufferOptions::bounded(temp.path(), "source", 1, 1_000_000, 10)
+            .with_min_free_disk_bytes(u64::MAX);
+        let mut buffer = TransactionBuffer::new(options).expect("buffer");
+        buffer.begin(42).expect("begin");
+
+        let error = buffer.push(event(1)).expect_err("reserved space");
+
+        assert!(matches!(
+            error,
+            TransactionBufferError::InsufficientStagingSpace { .. }
         ));
     }
 

@@ -4,6 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use lightcdc_core::Config;
+use lightcdc_runtime::StorageResourceLimits;
 use lightcdc_storage::{LogOpenOptions, RedbEventStore, SegmentOptions};
 
 /// Builds storage open options from the runtime config.
@@ -11,6 +12,15 @@ pub(crate) fn storage_options(config: &Config) -> LogOpenOptions {
     LogOpenOptions {
         data_dir: PathBuf::from(&config.runtime.data_dir),
         database_file: config.runtime.storage_file.clone(),
+    }
+}
+
+/// Builds hard disk-growth limits enforced immediately before capture commits.
+pub(crate) fn storage_resource_limits(config: &Config) -> StorageResourceLimits {
+    StorageResourceLimits {
+        data_dir: PathBuf::from(&config.runtime.data_dir),
+        max_storage_bytes: config.runtime.max_storage_bytes,
+        min_free_disk_bytes: config.runtime.min_free_disk_bytes,
     }
 }
 

@@ -1372,6 +1372,7 @@ mod tests {
             .prune_events(
                 RetentionPolicy {
                     max_events: Some(1),
+                    max_bytes: None,
                     max_age: None,
                     delete_batch_size: 10,
                 },
@@ -1406,6 +1407,7 @@ mod tests {
             .prune_events(
                 RetentionPolicy {
                     max_events: Some(1),
+                    max_bytes: None,
                     max_age: None,
                     delete_batch_size: 10,
                 },
@@ -1603,6 +1605,8 @@ mod tests {
                 max_active_subscriptions: 1_024,
                 max_consumer_name_bytes: 128,
                 max_outbound_event_bytes: 16 * 1024 * 1024,
+                max_storage_bytes: 100 * 1024 * 1024 * 1024,
+                min_free_disk_bytes: 1024 * 1024 * 1024,
                 heartbeat_interval_ms: 10_000,
                 transaction_memory_threshold_bytes: 16 * 1024 * 1024,
                 max_transaction_bytes: 1024 * 1024 * 1024,
@@ -1615,6 +1619,7 @@ mod tests {
                 segment_max_bytes: 256 * 1024 * 1024,
                 segment_max_age_seconds: 15 * 60,
                 retention_max_events: None,
+                retention_max_bytes: None,
                 retention_max_age_seconds: None,
                 retention_check_interval_ms: 1_000,
                 retention_delete_batch_size: 100_000,
