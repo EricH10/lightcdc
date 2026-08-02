@@ -14,7 +14,6 @@ reconnect_max_ms = 15000
 url = "redis://127.0.0.1:6379"
 # url_env = "LIGHTCDC_REDIS_URL"
 # url_file = "/run/secrets/redis-url"
-# progress_key = "lightcdc:redis:orders:redis-orders-cache:offset"
 
 [[rules]]
 table = "public.orders"

@@ -6,33 +6,34 @@ public gRPC API and does not run inside PostgreSQL capture. A Redis outage can
 therefore make this consumer lag without stopping WAL capture or other
 consumers.
 
-The connector handles SIGINT and SIGTERM, stops between atomic event
-applications, and exits successfully. If it is killed after Redis commits but
-before LightCDC records the ACK, the same sequence is safely replayed as
-described below.
+The connector handles SIGINT and SIGTERM and exits successfully. If it is
+killed after Redis applies commands but before LightCDC records the ACK, the
+same event is safely replayed as described below.
 
 ## Delivery Safety
 
-For each event, the connector runs one Redis Lua script that atomically:
+For each event, the connector maps the change to ordinary Redis `SET` and `DEL`
+commands and sends them in one ordered pipeline. It acknowledges LightCDC only
+after Redis reports success. Events are processed serially, and every generated
+command is safe to repeat:
 
-1. compares the event sequence with a connector-specific Redis progress key;
-2. applies every cache mutation only when the sequence is newer; and
-3. stores the newly applied sequence.
+- replaying `DEL` leaves the key deleted;
+- replaying `SET` writes the same row value and restarts its configured TTL; and
+- replaying a key-changing update repeats both the old-key deletion and the
+  new-key write.
 
-Only after that script succeeds does the connector acknowledge the event to
-LightCDC. A crash after Redis commits but before LightCDC receives the ACK
-causes redelivery. The Lua script observes the sequence already in Redis, skips
-the duplicate mutation, and allows the connector to ACK it again. Sequence
-values are stored as zero-padded decimal strings so comparison remains exact
-across the full `u64` range instead of using Lua's floating-point numbers.
-Noncanonical progress values and cache rules that resolve to the reserved
-progress key stop before mutation rather than risking ambiguous ordering.
+A connection failure can leave only part of an event applied, and a crash can
+happen after all commands succeed but before acknowledgement. In either case,
+LightCDC retains the previous consumer offset and redelivers the event. Repeating
+the complete command set converges to the latest ordered value before the offset
+advances. During replay the cache can temporarily show an earlier value or a
+partially applied key change, and a replayed upsert restarts its TTL. The
+connector does not claim a distributed transaction between Redis and LightCDC.
 
-At session startup, the connector seeks its named LightCDC consumer to the
-Redis-side sequence. This makes Redis the authority for whether a cache event
-was actually applied. If Redis is restored to an older point, retained events
-are replayed. Startup fails clearly if the required sequence has expired from
-LightCDC retention.
+At session startup, the connector simply subscribes with its stable consumer
+name. LightCDC's durable consumer offset is the only delivery authority. A new
+consumer starts at the earliest retained event, while an existing consumer
+resumes after its last cumulative acknowledgement.
 
 ## Configuration
 
@@ -84,9 +85,8 @@ ack_every = 100
 url_file = "/run/secrets/redis-url"
 ```
 
-The matching LightCDC API principal must allow this stream and must grant seek.
-Seek is required because the connector reconciles the LightCDC consumer offset
-to its atomically stored Redis progress after every restart:
+The matching LightCDC API principal only needs permission to consume this
+stream. Routine connector startup does not seek the consumer:
 
 ```toml
 [api]
@@ -97,20 +97,19 @@ tls_key_file = "/run/secrets/lightcdc-server-key.pem"
 name = "redis-orders-cache"
 token_file = "/run/secrets/lightcdc-api-token"
 streams = ["orders"]
-allow_seek = true
 ```
 
-`ack_every` controls cumulative LightCDC acknowledgements, not Redis mutation
-durability. Every event is still applied together with its Redis progress before
-the connector handles the next event. A crash can replay up to that many events,
-which the progress comparison skips idempotently. Keep `ack_every` comfortably
-below the LightCDC event-retention window so an outage during a partial batch
-cannot expire the last acknowledged position.
+`ack_every` controls cumulative LightCDC acknowledgements. Every event is still
+applied before the connector handles the next event. A crash can replay up to
+that many already applied events, and their repeated commands converge to the
+same cache state. Keep `ack_every` comfortably below the LightCDC event-retention
+window so an outage during a partial batch cannot expire the last acknowledged
+position.
 
 `redis://` and certificate-verified `rediss://` URLs are supported by the Redis
-client. The initial connector supports one standalone Redis deployment; Redis
-Cluster is not supported because one atomic script may touch cache keys in
-different hash slots.
+client. The initial connector supports one standalone Redis endpoint. Redis
+Cluster and Sentinel topology discovery have not yet been implemented or
+validated.
 
 ## Explicit Limits
 
@@ -119,17 +118,20 @@ different hash slots.
 - An upsert containing an `__unchanged_toast` marker is incomplete and stops
   without ACK. Use invalidation for tables with large TOASTed values unless a
   later enrichment layer can fetch the complete row.
-- Cache changes made outside this connector are outside its delivery guarantee.
+- Cache changes made outside this connector are outside its delivery behavior.
 - LightCDC retention must exceed the longest expected Redis outage. Otherwise a
   stale connector requires a deliberate cache rebuild and seek.
-- Redis and LightCDC are not one distributed transaction. The Redis-side
-  sequence makes crashes idempotent, but restoring only one system to a newer
-  point than the other requires replay or a deliberate cache rebuild.
+- Restoring Redis does not rewind LightCDC. After Redis data loss or a point-in-
+  time restore, flush or rebuild the affected cache and deliberately seek the
+  stopped connector's consumer before restarting it.
+- Redis and LightCDC are not one distributed transaction. A partially applied
+  event is temporarily visible until redelivery repeats all of its retry-safe
+  commands.
 
-Run the live atomicity and duplicate-replay test with:
+Run the live duplicate-replay test with:
 
 ```bash
 docker compose up -d redis
 cargo test -p lightcdc-redis \
-  redis_progress_and_cache_mutation_are_atomic_and_idempotent -- --ignored
+  redis_cache_mutations_converge_when_replayed -- --ignored
 ```

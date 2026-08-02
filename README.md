@@ -342,9 +342,9 @@ docker compose up -d redis
 cargo run -p lightcdc-redis -- --config redis-connector.example.toml
 ```
 
-The connector uses a named LightCDC consumer and atomically stores each applied
-sequence with its Redis cache mutation before acknowledging LightCDC. See the
-connector guide for invalidation, upsert, replay, and retention behavior.
+The connector applies ordered, retry-safe Redis mutations before acknowledging
+its named LightCDC consumer. See the connector guide for invalidation, upsert,
+redelivery, and retention behavior.
 
 Run checks:
 

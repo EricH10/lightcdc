@@ -408,8 +408,8 @@ observable behavior.
 - Add multiple PostgreSQL sources and additional output adapters.
 - Maintain the optional Redis cache connector and extend its explicit truncate,
   TOAST-upsert, and Redis Cluster boundaries only with safe semantics. INITIAL
-  standalone connector DONE for atomic invalidation/upsert plus replay-safe
-  Redis progress.
+  standalone connector DONE for ordered, retry-safe invalidation/upsert with
+  acknowledgement only after Redis success.
 - Keep the storage boundary replaceable if one-node redb storage is outgrown.
 
 ## Current Next Step

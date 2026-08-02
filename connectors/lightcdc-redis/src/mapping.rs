@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{CacheAction, CacheRule};
 
-/// One Redis key mutation performed before the event progress marker advances.
+/// One retry-safe Redis key mutation performed before LightCDC is acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheMutation {
     Delete {
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_is_terminal_instead_of_advancing_progress() {
+    fn truncate_is_terminal_and_remains_unacknowledged() {
         let event = event(Operation::Truncate, None, None, None);
         assert!(
             map_event(&[rule(CacheAction::Invalidate)], &event)

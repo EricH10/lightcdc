@@ -226,11 +226,15 @@ replays only the retained prefix.
 
 ## Redis Recovery
 
-The Redis connector stores its applied sequence atomically with each cache
-mutation. Back up Redis according to its own durability policy. After restore,
-the connector seeks LightCDC to Redis's stored sequence and replays retained
-events. If that sequence has expired, flush/rebuild the affected cache and
-perform a deliberate seek; never advance the Redis progress key by hand.
+The Redis connector resumes from its durable LightCDC consumer offset. A crash
+or connection failure before acknowledgement can replay already applied cache
+commands; repeating them repairs any partially applied event and converges to
+the latest ordered value.
+
+Restoring Redis to an older point does not move the LightCDC consumer offset
+backward automatically. Flush or rebuild the affected cache, stop the connector,
+and deliberately seek its consumer to the appropriate retained position before
+restarting it. If that position has expired, rebuild from the source database.
 
 ## Diagnostics
 

@@ -1,12 +1,10 @@
-//! Runs the ordered LightCDC subscription and atomic Redis cache writer.
+//! Runs the ordered LightCDC subscription and retry-safe Redis cache writer.
 
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use lightcdc_api::proto::{
-    AckRequest, SeekPosition, SeekRequest, SubscribeRequest, light_cdc_client::LightCdcClient,
-};
-use redis::{AsyncCommands, RetryMethod, Script, aio::ConnectionManager};
+use lightcdc_api::proto::{AckRequest, SubscribeRequest, light_cdc_client::LightCdcClient};
+use redis::{RetryMethod, aio::ConnectionManager};
 use thiserror::Error;
 use tonic::{
     Code, Request, Status,
@@ -19,33 +17,6 @@ use crate::{
     config::ConnectorConfig,
     mapping::{CacheMutation, map_event},
 };
-
-const APPLY_SCRIPT: &str = r#"
-local current = redis.call('GET', KEYS[1]) or '00000000000000000000'
-local incoming = ARGV[1]
-if current >= incoming then
-  return 0
-end
-
-local operation_count = tonumber(ARGV[2])
-for index = 1, operation_count do
-  local argument = 3 + ((index - 1) * 3)
-  local action = ARGV[argument]
-  local value = ARGV[argument + 1]
-  local ttl = tonumber(ARGV[argument + 2])
-  local key = KEYS[index + 1]
-  if action == 'delete' then
-    redis.call('DEL', key)
-  elseif ttl > 0 then
-    redis.call('SET', key, value, 'EX', ttl)
-  else
-    redis.call('SET', key, value)
-  end
-end
-
-redis.call('SET', KEYS[1], incoming)
-return 1
-"#;
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
@@ -123,24 +94,9 @@ async fn run_session(
         .get_connection_manager()
         .await
         .map_err(|error| classify_redis(error, "connect to Redis"))?;
-    let progress_key = config.progress_key();
-    let redis_offset = read_progress(&mut redis, &progress_key).await?;
-
     let channel = connect_lightcdc(config).await?;
     let mut client = LightCdcClient::new(channel);
     let mut ack_client = client.clone();
-    client
-        .seek(authenticated_request(
-            SeekRequest {
-                stream: config.lightcdc.stream.clone(),
-                consumer: config.lightcdc.consumer.clone(),
-                position: SeekPosition::Absolute as i32,
-                sequence: redis_offset,
-            },
-            bearer_token,
-        )?)
-        .await
-        .map_err(|status| classify_status(status, "reconcile LightCDC with Redis progress"))?;
     let mut events = client
         .subscribe(authenticated_request(
             SubscribeRequest {
@@ -153,18 +109,15 @@ async fn run_session(
         .await
         .map_err(|status| classify_status(status, "subscribe to LightCDC"))?
         .into_inner();
-    let apply_script = Script::new(APPLY_SCRIPT);
-
     info!(
         endpoint = %config.lightcdc.endpoint,
         stream = %config.lightcdc.stream,
         consumer = %config.lightcdc.consumer,
-        redis_offset,
         "Redis connector session is ready"
     );
 
     let mut unacknowledged = 0_u64;
-    let mut last_sequence = redis_offset;
+    let mut last_sequence = None;
     while let Some(event) = events
         .message()
         .await
@@ -172,23 +125,23 @@ async fn run_session(
     {
         let mutations = map_event(&config.rules, &event)
             .map_err(|error| SessionError::Terminal(error.context("map Redis cache mutation")))?;
-        apply_event(
-            &apply_script,
-            &mut redis,
-            &progress_key,
-            event.sequence,
-            &mutations,
-        )
-        .await?;
-        last_sequence = event.sequence;
+        apply_mutations(&mut redis, &mutations).await?;
+        last_sequence = Some(event.sequence);
         unacknowledged += 1;
         if unacknowledged >= config.lightcdc.ack_every {
-            acknowledge(&mut ack_client, config, bearer_token, last_sequence).await?;
+            acknowledge(
+                &mut ack_client,
+                config,
+                bearer_token,
+                last_sequence.expect("an event is pending acknowledgement"),
+            )
+            .await?;
             unacknowledged = 0;
+            last_sequence = None;
         }
     }
-    if unacknowledged > 0 {
-        acknowledge(&mut ack_client, config, bearer_token, last_sequence).await?;
+    if let Some(sequence) = last_sequence {
+        acknowledge(&mut ack_client, config, bearer_token, sequence).await?;
     }
 
     Err(SessionError::Transient(anyhow!(
@@ -259,75 +212,37 @@ fn authenticated_request<T>(
     Ok(request)
 }
 
-async fn read_progress(
+async fn apply_mutations(
     redis: &mut ConnectionManager,
-    progress_key: &str,
-) -> Result<u64, SessionError> {
-    let stored: Option<String> = redis
-        .get(progress_key)
-        .await
-        .map_err(|error| classify_redis(error, "read Redis progress"))?;
-    let Some(stored) = stored else {
-        return Ok(0);
-    };
-    let sequence = stored.parse::<u64>().map_err(|error| {
-        SessionError::Terminal(anyhow!(error).context(format!(
-            "Redis progress key {progress_key:?} contains invalid sequence {stored:?}"
-        )))
-    })?;
-    if stored != format!("{sequence:020}") {
-        return Err(SessionError::Terminal(anyhow!(
-            "Redis progress key {progress_key:?} must contain a zero-padded 20-digit sequence; found {stored:?}"
-        )));
-    }
-    Ok(sequence)
-}
-
-async fn apply_event(
-    script: &Script,
-    redis: &mut ConnectionManager,
-    progress_key: &str,
-    sequence: u64,
     mutations: &[CacheMutation],
 ) -> Result<(), SessionError> {
-    for mutation in mutations {
-        let key = match mutation {
-            CacheMutation::Delete { key } | CacheMutation::Set { key, .. } => key,
-        };
-        if key == progress_key {
-            return Err(SessionError::Terminal(anyhow!(
-                "Redis cache mutation targets reserved progress key {progress_key:?}"
-            )));
-        }
+    if mutations.is_empty() {
+        return Ok(());
     }
 
-    let mut invocation = script.prepare_invoke();
-    invocation
-        .key(progress_key)
-        .arg(format!("{sequence:020}"))
-        .arg(mutations.len());
+    let mut pipeline = redis::pipe();
     for mutation in mutations {
         match mutation {
             CacheMutation::Delete { key } => {
-                invocation.key(key).arg("delete").arg(&[] as &[u8]).arg(0);
+                pipeline.cmd("DEL").arg(key).ignore();
             }
             CacheMutation::Set {
                 key,
                 value,
                 ttl_seconds,
             } => {
-                invocation
-                    .key(key)
-                    .arg("set")
-                    .arg(value)
-                    .arg(ttl_seconds.unwrap_or(0));
+                let command = pipeline.cmd("SET").arg(key).arg(value);
+                if let Some(ttl_seconds) = ttl_seconds {
+                    command.arg("EX").arg(*ttl_seconds);
+                }
+                command.ignore();
             }
         }
     }
-    let _: i32 = invocation
-        .invoke_async(redis)
+    pipeline
+        .exec_async(redis)
         .await
-        .map_err(|error| classify_redis(error, "atomically apply Redis event"))?;
+        .map_err(|error| classify_redis(error, "apply Redis cache mutations"))?;
     Ok(())
 }
 
@@ -370,6 +285,8 @@ fn doubled_delay(delay: Duration, maximum: Duration) -> Duration {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use redis::AsyncCommands;
+
     use super::*;
 
     #[test]
@@ -397,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Redis on LIGHTCDC_TEST_REDIS_URL or redis://127.0.0.1:6379"]
-    async fn rejects_noncanonical_progress_and_reserved_key_collisions() {
+    async fn redis_cache_mutations_converge_when_replayed() {
         let url = std::env::var("LIGHTCDC_TEST_REDIS_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
         let client = redis::Client::open(url).expect("Redis URL");
@@ -409,122 +326,45 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let progress = format!("lightcdc:test:{suffix}:offset");
+        let old_key = format!("lightcdc:test:{suffix}:old");
+        let new_key = format!("lightcdc:test:{suffix}:new");
         redis
-            .set::<_, _, ()>(&progress, "1")
+            .set::<_, _, ()>(&old_key, "stale")
             .await
-            .expect("write malformed progress");
-
-        let error = read_progress(&mut redis, &progress)
-            .await
-            .expect_err("noncanonical progress must fail");
-        assert!(matches!(error, SessionError::Terminal(_)));
-
-        redis
-            .set::<_, _, ()>(&progress, "00000000000000000001")
-            .await
-            .expect("write canonical progress");
-        let script = Script::new(APPLY_SCRIPT);
-        let error = apply_event(
-            &script,
-            &mut redis,
-            &progress,
-            2,
-            &[CacheMutation::Delete {
-                key: progress.clone(),
-            }],
-        )
-        .await
-        .expect_err("reserved key collision must fail");
-        assert!(matches!(error, SessionError::Terminal(_)));
-        assert_eq!(
-            redis
-                .get::<_, String>(&progress)
-                .await
-                .expect("progress remains unchanged"),
-            "00000000000000000001"
-        );
-
-        let _: usize = redis.del(&progress).await.expect("cleanup progress key");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Redis on LIGHTCDC_TEST_REDIS_URL or redis://127.0.0.1:6379"]
-    async fn redis_progress_and_cache_mutation_are_atomic_and_idempotent() {
-        let url = std::env::var("LIGHTCDC_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
-        let client = redis::Client::open(url).expect("Redis URL");
-        let mut redis = client
-            .get_connection_manager()
-            .await
-            .expect("connect Redis");
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let progress = format!("lightcdc:test:{suffix}:offset");
-        let cache_key = format!("lightcdc:test:{suffix}:cache");
-        let script = Script::new(APPLY_SCRIPT);
-
-        apply_event(
-            &script,
-            &mut redis,
-            &progress,
-            1,
-            &[CacheMutation::Set {
-                key: cache_key.clone(),
+            .expect("seed old cache key");
+        let update = [
+            CacheMutation::Delete {
+                key: old_key.clone(),
+            },
+            CacheMutation::Set {
+                key: new_key.clone(),
                 value: br#"{"id":"1"}"#.to_vec(),
                 ttl_seconds: None,
-            }],
-        )
-        .await
-        .expect("apply first event");
-        assert_eq!(
-            redis
-                .get::<_, Option<String>>(&progress)
-                .await
-                .expect("progress"),
-            Some("00000000000000000001".to_owned())
-        );
+            },
+        ];
 
-        apply_event(
-            &script,
-            &mut redis,
-            &progress,
-            1,
-            &[CacheMutation::Delete {
-                key: cache_key.clone(),
-            }],
-        )
-        .await
-        .expect("skip duplicate event");
-        assert!(
-            redis
-                .exists::<_, bool>(&cache_key)
-                .await
-                .expect("cache key survives duplicate")
-        );
-
-        apply_event(
-            &script,
-            &mut redis,
-            &progress,
-            2,
-            &[CacheMutation::Delete {
-                key: cache_key.clone(),
-            }],
-        )
-        .await
-        .expect("apply next event");
+        apply_mutations(&mut redis, &update)
+            .await
+            .expect("apply cache update");
+        apply_mutations(&mut redis, &update)
+            .await
+            .expect("replay cache update");
         assert!(
             !redis
-                .exists::<_, bool>(&cache_key)
+                .exists::<_, bool>(&old_key)
                 .await
-                .expect("cache key deleted")
+                .expect("old cache key deleted")
+        );
+        assert_eq!(
+            redis
+                .get::<_, Vec<u8>>(&new_key)
+                .await
+                .expect("new cache value"),
+            br#"{"id":"1"}"#
         );
 
         let _: usize = redis
-            .del(&[progress.as_str(), cache_key.as_str()])
+            .del(&[old_key.as_str(), new_key.as_str()])
             .await
             .expect("cleanup keys");
     }
