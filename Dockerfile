@@ -26,7 +26,7 @@ COPY LICENSE-MIT LICENSE-APACHE /usr/share/licenses/lightcdc/
 USER 10001:10001
 WORKDIR /var/lib/lightcdc
 VOLUME ["/var/lib/lightcdc"]
-EXPOSE 50051
+EXPOSE 50051 9187
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/usr/local/bin/lightcdc"]

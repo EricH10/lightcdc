@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
+    net::SocketAddr,
     path::Path,
 };
 
@@ -20,6 +21,9 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     /// Process logging configuration.
     pub logging: LoggingConfig,
+    /// Low-cardinality Prometheus metrics configuration.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
     /// gRPC transport and authorization policy.
     #[serde(default)]
     pub api: ApiConfig,
@@ -88,6 +92,9 @@ pub struct RuntimeConfig {
     /// Maximum simultaneous gRPC subscriptions across all consumers.
     #[serde(default = "default_max_active_subscriptions")]
     pub max_active_subscriptions: usize,
+    /// Maximum durable `(stream, consumer)` offsets retained in the control store.
+    #[serde(default = "default_max_durable_consumers")]
+    pub max_durable_consumers: usize,
     /// Fixed OS threads available for synchronous redb replay reads.
     #[serde(default = "default_replay_reader_threads")]
     pub replay_reader_threads: usize,
@@ -179,6 +186,23 @@ pub struct RuntimeConfig {
 pub struct LoggingConfig {
     /// Default tracing filter when `RUST_LOG` is absent.
     pub level: String,
+}
+
+/// Controls the separate low-overhead Prometheus scrape endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservabilityConfig {
+    /// Starts the metrics listener for capture, run, and serve commands.
+    #[serde(default = "default_metrics_enabled")]
+    pub metrics_enabled: bool,
+    /// Plaintext listener intended for a trusted monitoring network.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
+    /// Interval for filesystem and durable consumer-lag sampling.
+    #[serde(default = "default_metrics_sample_interval_seconds")]
+    pub metrics_sample_interval_seconds: u64,
+    /// Maximum simultaneous TCP connections accepted by the metrics listener.
+    #[serde(default = "default_metrics_max_connections")]
+    pub metrics_max_connections: usize,
 }
 
 /// Controls secure gRPC binding, TLS identity, and bearer principals.
@@ -306,6 +330,12 @@ impl Config {
                 path: path.display().to_string(),
                 reason,
             })?;
+        config
+            .validate_observability()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
         Ok(config)
     }
 
@@ -341,6 +371,10 @@ impl Config {
             (
                 "runtime.max_active_subscriptions",
                 runtime.max_active_subscriptions as u128,
+            ),
+            (
+                "runtime.max_durable_consumers",
+                runtime.max_durable_consumers as u128,
             ),
             (
                 "runtime.replay_reader_threads",
@@ -451,6 +485,9 @@ impl Config {
         }
         if runtime.max_active_subscriptions > 100_000 {
             return Err("runtime.max_active_subscriptions must not exceed 100000".to_owned());
+        }
+        if runtime.max_durable_consumers > 1_000_000 {
+            return Err("runtime.max_durable_consumers must not exceed 1000000".to_owned());
         }
         if runtime.replay_reader_threads > 64 {
             return Err("runtime.replay_reader_threads must not exceed 64".to_owned());
@@ -594,6 +631,45 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Parses and validates the metrics endpoint before runtime startup.
+    pub fn metrics_addr(&self) -> std::result::Result<SocketAddr, String> {
+        self.observability.metrics_addr.parse().map_err(|error| {
+            format!(
+                "observability.metrics_addr {:?} is not a socket address: {error}",
+                self.observability.metrics_addr
+            )
+        })
+    }
+
+    fn validate_observability(&self) -> std::result::Result<(), String> {
+        self.metrics_addr()?;
+        let interval = self.observability.metrics_sample_interval_seconds;
+        if interval == 0 || interval > 3_600 {
+            return Err(
+                "observability.metrics_sample_interval_seconds must be between 1 and 3600"
+                    .to_owned(),
+            );
+        }
+        let maximum = self.observability.metrics_max_connections;
+        if maximum == 0 || maximum > 1_024 {
+            return Err(
+                "observability.metrics_max_connections must be between 1 and 1024".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_enabled: default_metrics_enabled(),
+            metrics_addr: default_metrics_addr(),
+            metrics_sample_interval_seconds: default_metrics_sample_interval_seconds(),
+            metrics_max_connections: default_metrics_max_connections(),
+        }
     }
 }
 
@@ -769,6 +845,22 @@ fn default_streams() -> Vec<StreamConfig> {
     }]
 }
 
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9187".to_owned()
+}
+
+fn default_metrics_sample_interval_seconds() -> u64 {
+    15
+}
+
+fn default_metrics_max_connections() -> usize {
+    16
+}
+
 fn default_stream_source() -> String {
     "default".to_owned()
 }
@@ -791,6 +883,10 @@ fn default_heartbeat_interval_ms() -> u64 {
 
 fn default_max_active_subscriptions() -> usize {
     1_024
+}
+
+fn default_max_durable_consumers() -> usize {
+    10_000
 }
 
 fn default_replay_reader_threads() -> usize {
@@ -922,6 +1018,7 @@ mod tests {
             16 * 1024 * 1024
         );
         assert_eq!(config.runtime.max_active_subscriptions, 1_024);
+        assert_eq!(config.runtime.max_durable_consumers, 10_000);
         assert_eq!(config.runtime.max_consumer_name_bytes, 128);
         assert_eq!(config.runtime.max_outbound_event_bytes, 16 * 1024 * 1024);
         assert_eq!(config.runtime.heartbeat_interval_ms, 10_000);
@@ -938,6 +1035,28 @@ mod tests {
         assert_eq!(config.runtime.retention_max_age_seconds, None);
         assert_eq!(config.runtime.retention_check_interval_ms, 1_000);
         assert_eq!(config.runtime.retention_delete_batch_size, 100_000);
+        assert!(config.observability.metrics_enabled);
+        assert_eq!(config.observability.metrics_addr, "127.0.0.1:9187");
+        assert_eq!(config.observability.metrics_max_connections, 16);
+        assert_eq!(config.observability.metrics_sample_interval_seconds, 15);
+    }
+
+    #[test]
+    fn observability_rejects_invalid_addresses_and_sample_intervals() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+
+        config.observability.metrics_addr = "not-an-address".to_owned();
+        assert!(config.validate_observability().is_err());
+        config.observability.metrics_addr = "127.0.0.1:9187".to_owned();
+        config.observability.metrics_sample_interval_seconds = 0;
+        assert!(config.validate_observability().is_err());
+        config.observability.metrics_sample_interval_seconds = 15;
+        config.observability.metrics_max_connections = 0;
+        assert!(config.validate_observability().is_err());
     }
 
     #[test]
@@ -1158,6 +1277,7 @@ mod tests {
                 channel_capacity: 32,
                 shutdown_timeout_ms: 1_000,
                 max_active_subscriptions: 1_024,
+                max_durable_consumers: 10_000,
                 replay_reader_threads: 2,
                 replay_reader_queue_capacity: 1_024,
                 replay_batch_events: 256,
@@ -1190,6 +1310,7 @@ mod tests {
             logging: super::LoggingConfig {
                 level: "info".to_owned(),
             },
+            observability: super::ObservabilityConfig::default(),
             api: super::ApiConfig {
                 allow_insecure_localhost: true,
                 ..super::ApiConfig::default()

@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use lightcdc_core::{ChangeEvent, Config, StreamConfig};
 use lightcdc_runtime::{
-    CaptureStorageWriter, RuntimeState, runtime_state_channel, shutdown_channel,
+    CaptureStorageWriter, RuntimeState, runtime_state_channel_with_metrics, shutdown_channel,
 };
 use lightcdc_storage::RedbEventStore;
 
@@ -14,8 +14,10 @@ use crate::{
         await_server_shutdown, close_storage_writer, process_shutdown_signal, shutdown_timeout,
     },
     display::{event_to_json, human_bytes, operation_name, print_table},
+    failure,
     logging::init_logging,
-    store::{open_event_store, storage_options},
+    observability::ObservabilityRuntime,
+    store::{open_event_store, storage_options, storage_resource_limits},
 };
 
 /// Replays stored events to stdout, optionally filtering by stream.
@@ -29,7 +31,7 @@ pub(crate) async fn replay(
     let config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
 
-    init_logging(&config.logging.level)?;
+    init_logging(&config.logging.level).map_err(failure::configuration)?;
 
     let stream = stream
         .as_deref()
@@ -245,22 +247,33 @@ pub(crate) async fn serve(config_path: PathBuf, addr: SocketAddr) -> anyhow::Res
     let config = Config::from_path(&config_path)
         .with_context(|| format!("could not load config from {}", config_path.display()))?;
 
-    init_logging(&config.logging.level)?;
+    init_logging(&config.logging.level).map_err(failure::configuration)?;
 
     let timeout = shutdown_timeout(&config)?;
     let store = open_event_store(&config)?;
-    let writer = CaptureStorageWriter::start(store.clone(), config.source.name.clone())?;
-    let (state, state_rx) = runtime_state_channel();
-    state.transition(RuntimeState::Capturing, None);
+    let writer = CaptureStorageWriter::start_with_limits(
+        store.clone(),
+        config.source.name.clone(),
+        Some(storage_resource_limits(&config)),
+    )?;
     let (shutdown, shutdown_rx) = shutdown_channel();
+    let mut observability =
+        ObservabilityRuntime::start(&config, store.clone(), shutdown_rx.clone(), Some(addr))
+            .await?;
+    let production_metrics = observability.metrics();
+    let (state, state_rx) = runtime_state_channel_with_metrics(production_metrics.clone());
+    state.transition(RuntimeState::Capturing, None);
     let mut server = tokio::spawn(lightcdc_api::serve_with_runtime(
         addr,
         config,
         store,
         lightcdc_api::EventNotifier::new(),
-        writer.handle(),
-        state_rx,
-        shutdown_rx,
+        lightcdc_api::ApiRuntime {
+            storage_writer: writer.handle(),
+            state: state_rx,
+            shutdown: shutdown_rx,
+            metrics: Some(production_metrics),
+        },
     ));
 
     let outcome = tokio::select! {
@@ -269,13 +282,26 @@ pub(crate) async fn serve(config_path: PathBuf, addr: SocketAddr) -> anyhow::Res
             Ok(Err(error)) => Err(error).context("gRPC server failed"),
             Err(error) => Err(error).context("gRPC server task failed"),
         },
+        error = observability.stopped() => {
+            state.transition(RuntimeState::Failed, Some(error.to_string()));
+            shutdown.trigger();
+            await_server_shutdown(&mut server, timeout).await?;
+            Err(error)
+        },
         () = process_shutdown_signal() => {
             state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
             shutdown.trigger();
             await_server_shutdown(&mut server, timeout).await
         }
     };
-    close_storage_writer(writer, timeout).await?;
+    if let Err(error) = &outcome {
+        state.transition(RuntimeState::Failed, Some(error.to_string()));
+    }
+    shutdown.trigger();
+    let writer_outcome = close_storage_writer(writer, timeout).await;
+    let metrics_outcome = observability.shutdown(timeout).await;
+    writer_outcome?;
+    metrics_outcome?;
     outcome
 }
 

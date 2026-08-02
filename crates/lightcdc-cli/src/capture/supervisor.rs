@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow};
 use lightcdc_core::{Config, SourceConfig};
 use lightcdc_postgres::{LIGHTCDC_HEARTBEAT_PREFIX, LogicalHeartbeatEmitter, ReplicationReader};
-use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle, RuntimeState};
+use lightcdc_runtime::{CaptureBatchLimits, CaptureStorageHandle, ProductionMetrics, RuntimeState};
 use lightcdc_storage::RetentionPolicy;
 use tracing::{info, warn};
 
@@ -30,6 +30,7 @@ pub(super) struct CaptureRetention {
 pub(super) async fn run_retention_sweeps(
     storage: CaptureStorageHandle,
     retention: CaptureRetention,
+    metrics: ProductionMetrics,
 ) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(retention.check_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -37,10 +38,17 @@ pub(super) async fn run_retention_sweeps(
 
     loop {
         interval.tick().await;
-        let outcome = storage
+        let outcome = match storage
             .prune(retention.policy, unix_timestamp_ms_i64())
             .await
-            .context("event retention sweep failed")?;
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                metrics.record_retention_error();
+                return Err(error).context("event retention sweep failed");
+            }
+        };
+        metrics.record_retention(outcome);
         if outcome.deleted_events > 0 {
             info!(
                 deleted_events = outcome.deleted_events,
@@ -128,6 +136,9 @@ async fn validate_source_until_ready(
         .await
         {
             Ok(validation) => {
+                context
+                    .production_metrics
+                    .record_source_wal_end(validation.current_wal_lsn);
                 let local_lsn = context
                     .store
                     .source_offset(context.source_name)
@@ -250,6 +261,7 @@ async fn wait_before_session_reconnect(
 
 /// Records a reconnect only when opt-in metrics are active.
 fn record_capture_reconnect(context: &CaptureContext<'_>) {
+    context.production_metrics.record_source_reconnect();
     if let Some(metrics) = context.metrics {
         metrics.record_reconnect();
     }

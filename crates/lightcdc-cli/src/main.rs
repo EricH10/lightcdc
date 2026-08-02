@@ -1,6 +1,6 @@
 //! Parses the command line and dispatches into focused runtime modules.
 
-use std::time::Duration;
+use std::{process::ExitCode, time::Duration};
 
 use clap::Parser;
 
@@ -14,15 +14,27 @@ mod capture;
 mod cli;
 mod commands;
 mod display;
+mod failure;
 mod logging;
 mod maintenance;
+mod observability;
 mod store;
 
 /// Parses CLI arguments and dispatches to the requested command.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
+    match dispatch(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let class = failure::classify(&error);
+            eprintln!("lightcdc: {} failure: {error:#}", class.label());
+            class.code()
+        }
+    }
+}
 
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Capture {
             config,

@@ -841,10 +841,32 @@ impl SegmentStore {
         consumer_name: &str,
         last_acknowledged_sequence: u64,
     ) -> Result<(), StorageError> {
+        self.set_consumer_offset_bounded(
+            stream_name,
+            consumer_name,
+            last_acknowledged_sequence,
+            usize::MAX,
+        )
+    }
+
+    pub(crate) fn set_consumer_offset_bounded(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+        last_acknowledged_sequence: u64,
+        maximum_consumers: usize,
+    ) -> Result<(), StorageError> {
         let key = consumer_offset_key(stream_name, consumer_name);
         let write = self.control.begin_write().map_err(redb_error)?;
         {
             let mut offsets = write.open_table(CONSUMER_OFFSETS).map_err(redb_error)?;
+            if offsets.get(key.as_str()).map_err(redb_error)?.is_none()
+                && offsets.len().map_err(redb_error)? >= maximum_consumers as u64
+            {
+                return Err(StorageError::ConsumerLimitReached {
+                    maximum: maximum_consumers,
+                });
+            }
             offsets
                 .insert(key.as_str(), last_acknowledged_sequence)
                 .map_err(redb_error)?;
@@ -859,6 +881,21 @@ impl SegmentStore {
         consumer_name: &str,
         acknowledged_sequence: u64,
     ) -> Result<u64, StorageError> {
+        self.acknowledge_consumer_offset_bounded(
+            stream_name,
+            consumer_name,
+            acknowledged_sequence,
+            usize::MAX,
+        )
+    }
+
+    pub(crate) fn acknowledge_consumer_offset_bounded(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+        acknowledged_sequence: u64,
+        maximum_consumers: usize,
+    ) -> Result<u64, StorageError> {
         let key = consumer_offset_key(stream_name, consumer_name);
         let write = self.control.begin_write().map_err(redb_error)?;
         let persisted_offset = {
@@ -867,6 +904,13 @@ impl SegmentStore {
                 .get(key.as_str())
                 .map_err(redb_error)?
                 .map(|value| value.value());
+            if current_offset.is_none()
+                && offsets.len().map_err(redb_error)? >= maximum_consumers as u64
+            {
+                return Err(StorageError::ConsumerLimitReached {
+                    maximum: maximum_consumers,
+                });
+            }
             let persisted_offset = current_offset
                 .unwrap_or_default()
                 .max(acknowledged_sequence);

@@ -102,7 +102,11 @@ pub(super) async fn run_capture_session(
             continue;
         }
 
-        match wait_for_capture_progress(context, reader, &mut pipeline).await {
+        let progress = wait_for_capture_progress(context, reader, &mut pipeline).await;
+        context
+            .production_metrics
+            .record_source_wal_end(reader.latest_wal_end().as_u64());
+        match progress {
             CaptureProgress::Storage(completion) => {
                 let replayed = complete_pipelined_capture_write(
                     context,
@@ -298,7 +302,7 @@ async fn submit_capture_batch(
             .storage_writer
             .submit(
                 std::mem::take(&mut pipeline.batch),
-                context.metrics.is_some(),
+                true,
                 !pipeline.replay_reconciled,
             )
             .await?,
@@ -419,9 +423,13 @@ fn complete_capture_write(
         .last()
         .expect("capture never persists an empty batch")
         .ack_lsn;
-    let persist_outcome = completion
-        .result
-        .context("failed to persist captured transaction batch to redb")?;
+    let persist_outcome = match completion.result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            context.production_metrics.record_storage_error();
+            return Err(error).context("failed to persist captured transaction batch to redb");
+        }
+    };
 
     let outcome = match persist_outcome {
         PersistTransactionOutcome::Persisted => {
@@ -442,6 +450,17 @@ fn complete_capture_write(
                     batch.staged_transaction_count,
                 );
             }
+            context.production_metrics.record_capture_persisted(
+                transaction_count,
+                batch.event_count,
+                batch.decoded_bytes,
+                batch.staged_bytes,
+                batch.staged_transaction_count,
+                completion
+                    .persist_latency
+                    .expect("production capture always measures storage latency"),
+                ack_lsn.as_u64(),
+            );
             if matches!(context.options.output, CaptureOutput::Json) {
                 for transaction in &batch.transactions {
                     for event in transaction
@@ -458,6 +477,9 @@ fn complete_capture_write(
             PersistCaptureBatchOutcome::Persisted(batch.event_count)
         }
         PersistTransactionOutcome::AlreadyPersisted => {
+            context
+                .production_metrics
+                .record_durable_source_lsn(ack_lsn.as_u64());
             warn!(
                 transaction_count,
                 event_count = batch.event_count,

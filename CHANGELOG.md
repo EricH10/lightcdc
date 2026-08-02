@@ -14,5 +14,7 @@ All notable changes to this project will be documented here. The format follows
 - Offline integrity check, checksummed backup, and verified restore commands.
 - TLS, source identity/gap protection, bounded resources, graceful shutdown,
   durable-format migrations, and production support validation.
+- Fixed-cardinality Prometheus metrics, storage-aware readiness, and bounded
+  durable consumer identities.
 
 [Unreleased]: https://github.com/EricH10/lightcdc/compare/v0.1.0...HEAD

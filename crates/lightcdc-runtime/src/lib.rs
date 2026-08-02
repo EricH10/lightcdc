@@ -1,10 +1,12 @@
 //! Serializes synchronous redb writes from capture and API callers on one thread.
 
+mod metrics;
 mod state;
 
+pub use metrics::{ProductionMetrics, StorageMetricsSampler, bind_metrics_listener, serve_metrics};
 pub use state::{
     RuntimeState, RuntimeStateHandle, RuntimeStateReceiver, ShutdownHandle, ShutdownReceiver,
-    runtime_state_channel, shutdown_channel,
+    runtime_state_channel, runtime_state_channel_with_metrics, shutdown_channel,
 };
 
 use std::{
@@ -201,12 +203,14 @@ enum StorageCommand {
         stream_name: String,
         consumer_name: String,
         sequence: u64,
+        maximum_consumers: usize,
         response: oneshot::Sender<Result<u64, StorageError>>,
     },
     SetConsumerOffset {
         stream_name: String,
         consumer_name: String,
         offset: u64,
+        maximum_consumers: usize,
         response: oneshot::Sender<Result<(), StorageError>>,
     },
 }
@@ -428,24 +432,28 @@ impl CaptureStorageWriter {
                             stream_name,
                             consumer_name,
                             sequence,
+                            maximum_consumers,
                             response,
                         } => {
-                            let _ = response.send(store.acknowledge_consumer_offset(
+                            let _ = response.send(store.acknowledge_consumer_offset_bounded(
                                 &stream_name,
                                 &consumer_name,
                                 sequence,
+                                maximum_consumers,
                             ));
                         }
                         StorageCommand::SetConsumerOffset {
                             stream_name,
                             consumer_name,
                             offset,
+                            maximum_consumers,
                             response,
                         } => {
-                            let _ = response.send(store.set_consumer_offset(
+                            let _ = response.send(store.set_consumer_offset_bounded(
                                 &stream_name,
                                 &consumer_name,
                                 offset,
+                                maximum_consumers,
                             ));
                         }
                     }
@@ -565,6 +573,7 @@ impl CaptureStorageHandle {
         stream_name: String,
         consumer_name: String,
         sequence: u64,
+        maximum_consumers: usize,
     ) -> anyhow::Result<u64> {
         let (response, response_receiver) = oneshot::channel();
         self.sender
@@ -572,6 +581,7 @@ impl CaptureStorageHandle {
                 stream_name,
                 consumer_name,
                 sequence,
+                maximum_consumers,
                 response,
             })
             .await
@@ -590,6 +600,7 @@ impl CaptureStorageHandle {
         stream_name: String,
         consumer_name: String,
         offset: u64,
+        maximum_consumers: usize,
     ) -> anyhow::Result<()> {
         let (response, response_receiver) = oneshot::channel();
         self.sender
@@ -597,6 +608,7 @@ impl CaptureStorageHandle {
                 stream_name,
                 consumer_name,
                 offset,
+                maximum_consumers,
                 response,
             })
             .await
@@ -680,7 +692,7 @@ fn ensure_storage_capacity(
     Ok(())
 }
 
-fn directory_size(path: &Path) -> Result<u64, StorageError> {
+pub(crate) fn directory_size(path: &Path) -> Result<u64, StorageError> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -929,19 +941,27 @@ mod tests {
         let handle = writer.handle();
 
         handle
-            .set_consumer_offset("orders".to_owned(), "search".to_owned(), 5)
+            .set_consumer_offset("orders".to_owned(), "search".to_owned(), 5, 1)
             .await
             .expect("seek consumer");
+        let limit_error = handle
+            .set_consumer_offset("orders".to_owned(), "analytics".to_owned(), 5, 1)
+            .await
+            .expect_err("second durable consumer must be rejected");
+        assert!(matches!(
+            limit_error.downcast_ref::<StorageError>(),
+            Some(StorageError::ConsumerLimitReached { maximum: 1 })
+        ));
         assert_eq!(
             handle
-                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 3)
+                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 3, 1)
                 .await
                 .expect("monotonic acknowledgement"),
             5
         );
         assert_eq!(
             handle
-                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 8)
+                .acknowledge_consumer_offset("orders".to_owned(), "search".to_owned(), 8, 1)
                 .await
                 .expect("advance acknowledgement"),
             8

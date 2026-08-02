@@ -107,10 +107,11 @@ them has optional work remaining.
   sizes, outbound event sizes, and total memory. Validate every configured
   numeric limit and reject zero, contradictory, or ineffective settings.
   DONE for the single-node API: active subscriptions, subscription queues,
-  consumer names, inbound/outbound messages, HTTP/2 headers and per-connection
-  request concurrency, TCP connections, replay queueing, and aggregate replay
-  batches are bounded. Multi-instance deployments should additionally enforce
-  aggregate limits at their service manager or ingress.
+  durable consumer identities, consumer names, inbound/outbound messages,
+  HTTP/2 headers and per-connection request concurrency, TCP connections,
+  replay queueing, and aggregate replay batches are bounded. Multi-instance
+  deployments should additionally enforce aggregate limits at their service
+  manager or ingress.
 - Remove or implement inert configuration fields such as `channel_capacity`;
   production configuration must not appear to control behavior that ignores it.
   DONE: `channel_capacity` controls each subscription's outbound queue.
@@ -142,17 +143,20 @@ them has optional work remaining.
 
 - Expose the standard gRPC health service and separate liveness from readiness.
   Readiness must reflect capture state, storage writability, source continuity,
-  and whether serving retained events is still safe. PARTIAL: standard named
-  liveness/readiness services reflect lifecycle and source reconnect state;
-  explicit disk-pressure and integrity signals remain.
+  and whether serving retained events is still safe. DONE: named liveness and
+  readiness services combine lifecycle/source state with sampled disk limits
+  and latched runtime storage failures; startup integrity failures prevent bind.
 - Export low-overhead production metrics for source LSN and WAL lag, capture
   rate, redb latency, retention lag, consumer lag, reconnects, subscription
   pressure, disk and staging usage, and terminal state. Define actionable alert
-  thresholds and do not rely on benchmark-only JSONL metrics.
+  thresholds and do not rely on benchmark-only JSONL metrics. DONE with a
+  fixed-cardinality Prometheus endpoint, relaxed atomics, fixed latency buckets,
+  a dedicated sampled-storage thread, and documented initial alerts.
 - Add structured runtime states and stable exit behavior so supervisors can
   distinguish starting, capturing, retrying, degraded, draining, and terminal
-  configuration or data-loss failures. PARTIAL: shared states now drive health
-  and clean/terminal exits; production metrics still need state transitions.
+  configuration or data-loss failures. DONE: shared states drive health and
+  fixed-cardinality metrics; clean, runtime, configuration, and data-safety
+  process exits have documented stable codes and black-box tests.
 - Provide a production container or release binaries that run as a non-root
   user, use a persistent volume, handle signals, expose health checks, and pin
   supported Rust, OS, architecture, PostgreSQL, and redb versions. DONE for a

@@ -904,9 +904,10 @@ async fn capture_exits_for_a_missing_publication_instead_of_retrying() -> anyhow
     );
 
     let status = capture.wait_for_exit().await?;
-    assert!(
-        !status.success(),
-        "capture should stop for a missing publication"
+    assert_eq!(
+        status.code(),
+        Some(10),
+        "missing publication requires a configuration change"
     );
 
     fixture.cleanup().await?;
@@ -944,9 +945,10 @@ async fn capture_exits_when_a_configured_table_is_missing_from_the_publication()
     );
 
     let status = capture.wait_for_exit().await?;
-    assert!(
-        !status.success(),
-        "capture should stop when a configured table is not published"
+    assert_eq!(
+        status.code(),
+        Some(10),
+        "missing published table requires a configuration change"
     );
 
     fixture.cleanup().await?;
@@ -1140,7 +1142,11 @@ async fn capture_rejects_a_replaced_postgres_source_without_mutating_identity() 
     );
 
     let status = capture.wait_for_exit().await?;
-    assert!(!status.success(), "capture must reject a replaced source");
+    assert_eq!(
+        status.code(),
+        Some(20),
+        "a replaced source is a data-safety failure"
+    );
     let store = open_store(temp.path().to_path_buf())?;
     assert_eq!(
         store.source_identity(&fixture.source_name)?,
@@ -1184,9 +1190,10 @@ async fn capture_rejects_a_slot_checkpoint_ahead_of_local_durability() -> anyhow
     );
 
     let status = capture.wait_for_exit().await?;
-    assert!(
-        !status.success(),
-        "capture must reject an acknowledged WAL gap"
+    assert_eq!(
+        status.code(),
+        Some(20),
+        "an acknowledged WAL gap is a data-safety failure"
     );
     let store = open_store(temp.path().to_path_buf())?;
     assert_eq!(

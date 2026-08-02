@@ -31,6 +31,7 @@ the example below assumes the configured TLS and password files live under
 docker run --name lightcdc --init \
   --stop-timeout 30 \
   --publish 50051:50051 \
+  --publish 127.0.0.1:9187:9187 \
   --mount type=volume,source=lightcdc-data,target=/var/lib/lightcdc \
   --mount type=bind,source=/etc/lightcdc,target=/etc/lightcdc,readonly \
   --mount type=bind,source=/run/secrets/lightcdc,target=/run/secrets,readonly \
@@ -49,6 +50,14 @@ The gRPC port implements the standard health protocol. Probe
 while capture is starting, reconnecting, degraded, draining, or failed. The
 probe client must use the same TLS trust policy as other clients; health is not
 a separate plaintext endpoint.
+
+Prometheus metrics are served separately at `GET /metrics`. In a container,
+set `observability.metrics_addr = "0.0.0.0:9187"` only on a private monitoring
+network and restrict the published port at the host, security group, or network
+policy. The endpoint has no TLS or authentication and deliberately omits
+source, table, stream, consumer, and payload labels. See `docs/metrics.md` for
+the metric and alert contract. Keep `observability.metrics_max_connections`
+small; scrapers should reuse at most a few connections.
 
 Tagged releases build and test the workspace on Ubuntu 24.04, publish both
 binaries with the README, changelog, and licenses, and attach a SHA-256 file.
@@ -69,6 +78,24 @@ a transaction boundary, resolves accepted redb work, acknowledges only the
 durable source LSN, and drains gRPC. Do not use `SIGKILL` for routine operations.
 An abrupt kill is recoverable, but PostgreSQL may replay the last unacknowledged
 transaction.
+
+## Exit Status
+
+Service managers can use the stable process status to choose whether to restart
+or wait for an operator:
+
+| Code | Class | Operator action |
+| ---: | --- | --- |
+| `0` | Clean stop | No failure; a signal or bounded capture completed. |
+| `1` | Runtime | Inspect logs and health; retry only under the deployment's restart policy. |
+| `2` | CLI usage | Correct command-line arguments. This code is owned by Clap. |
+| `10` | Configuration | Correct configuration, secrets, PostgreSQL publication, permissions, or unsupported source settings before restarting. |
+| `20` | Data safety | Do not loop-restart. Investigate a source identity mismatch, acknowledged WAL gap, incompatible or corrupt durable format, or failed integrity boundary. |
+
+The final stderr line starts with `lightcdc: configuration failure`,
+`lightcdc: data_safety failure`, or `lightcdc: runtime failure`. Runtime-state
+metrics and gRPC health describe a process while it is alive; the exit status
+is the supervisor contract after it terminates.
 
 ## Integrity Check
 

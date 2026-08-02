@@ -45,6 +45,14 @@ pub enum PostgresError {
     #[error("invalid PostgreSQL source configuration: {0}")]
     Configuration(String),
 
+    #[error(
+        "replication slot confirmed_flush_lsn {confirmed_flush_lsn} is ahead of the local durable checkpoint {local_lsn}; PostgreSQL can no longer replay the missing range"
+    )]
+    ResumeLsnGap {
+        local_lsn: String,
+        confirmed_flush_lsn: String,
+    },
+
     #[error("invalid replication stream state: {0}")]
     StreamState(String),
 
@@ -68,6 +76,8 @@ pub struct ReplicationReader {
     decoder: PgOutputDecoder,
     /// Last locally assigned event sequence.
     sequence: u64,
+    /// Latest server WAL end observed on keepalive or data frames.
+    latest_wal_end: Lsn,
     /// Metadata for the source transaction currently being decoded.
     transaction: Option<TransactionMetadata>,
     /// Commit timestamp announced for the current source transaction.
@@ -100,6 +110,8 @@ pub struct SourceValidation {
     pub confirmed_flush_lsn: Option<String>,
     /// Oldest WAL position still retained for this slot.
     pub restart_lsn: Option<String>,
+    /// Current source WAL insertion position observed during validation.
+    pub current_wal_lsn: u64,
     /// Alignment between configured stream tables and the publication.
     pub publication: PublicationAlignment,
 }
@@ -108,6 +120,7 @@ struct ValidatedSource {
     identity: SourceIdentity,
     confirmed_flush_lsn: Option<String>,
     restart_lsn: Option<String>,
+    current_wal_lsn: String,
     publish_via_partition_root: bool,
 }
 
@@ -217,6 +230,7 @@ impl ReplicationReader {
             client,
             decoder: PgOutputDecoder::default(),
             sequence: 0,
+            latest_wal_end: start_lsn,
             transaction: None,
             commit_timestamp_ms: None,
             pending_events,
@@ -227,6 +241,11 @@ impl ReplicationReader {
     /// Sets the local sequence number that will be assigned to the next event.
     pub fn set_next_sequence(&mut self, sequence: u64) {
         self.sequence = sequence.saturating_sub(1);
+    }
+
+    /// Returns the latest server WAL end observed by this replication session.
+    pub fn latest_wal_end(&self) -> Lsn {
+        self.latest_wal_end
     }
 
     /// Waits for the next committed PostgreSQL transaction.
@@ -274,6 +293,7 @@ impl ReplicationReader {
 
             match event {
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
+                    self.latest_wal_end = self.latest_wal_end.max(wal_end);
                     debug!(%wal_end, "received replication keepalive");
                 }
                 ReplicationEvent::Begin {
@@ -330,56 +350,62 @@ impl ReplicationReader {
                     }));
                 }
                 ReplicationEvent::XLogData {
-                    wal_start, data, ..
-                } => match self.decoder.decode(&data)? {
-                    PgOutputMessage::Relation(relation) => {
-                        debug!(
-                            relation_id = relation.id,
-                            schema = %relation.namespace,
-                            table = %relation.name,
-                            "decoded relation metadata"
-                        );
-                    }
-                    PgOutputMessage::Insert(row) => {
-                        if self
-                            .capture_plan
-                            .matches_table(&row.relation.namespace, &row.relation.name)
-                        {
-                            let event = self.row_change(Operation::Insert, row, wal_start);
-                            self.pending_events.push(event)?;
+                    wal_start,
+                    wal_end,
+                    data,
+                    ..
+                } => {
+                    self.latest_wal_end = self.latest_wal_end.max(wal_end);
+                    match self.decoder.decode(&data)? {
+                        PgOutputMessage::Relation(relation) => {
+                            debug!(
+                                relation_id = relation.id,
+                                schema = %relation.namespace,
+                                table = %relation.name,
+                                "decoded relation metadata"
+                            );
                         }
-                    }
-                    PgOutputMessage::Update(row) => {
-                        if self
-                            .capture_plan
-                            .matches_table(&row.relation.namespace, &row.relation.name)
-                        {
-                            let event = self.row_change(Operation::Update, row, wal_start);
-                            self.pending_events.push(event)?;
-                        }
-                    }
-                    PgOutputMessage::Delete(row) => {
-                        if self
-                            .capture_plan
-                            .matches_table(&row.relation.namespace, &row.relation.name)
-                        {
-                            let event = self.row_change(Operation::Delete, row, wal_start);
-                            self.pending_events.push(event)?;
-                        }
-                    }
-                    PgOutputMessage::Truncate(relations) => {
-                        for relation in relations {
+                        PgOutputMessage::Insert(row) => {
                             if self
                                 .capture_plan
-                                .matches_table(&relation.namespace, &relation.name)
+                                .matches_table(&row.relation.namespace, &row.relation.name)
                             {
-                                let event = self.truncate_change(relation, wal_start);
+                                let event = self.row_change(Operation::Insert, row, wal_start);
                                 self.pending_events.push(event)?;
                             }
                         }
+                        PgOutputMessage::Update(row) => {
+                            if self
+                                .capture_plan
+                                .matches_table(&row.relation.namespace, &row.relation.name)
+                            {
+                                let event = self.row_change(Operation::Update, row, wal_start);
+                                self.pending_events.push(event)?;
+                            }
+                        }
+                        PgOutputMessage::Delete(row) => {
+                            if self
+                                .capture_plan
+                                .matches_table(&row.relation.namespace, &row.relation.name)
+                            {
+                                let event = self.row_change(Operation::Delete, row, wal_start);
+                                self.pending_events.push(event)?;
+                            }
+                        }
+                        PgOutputMessage::Truncate(relations) => {
+                            for relation in relations {
+                                if self
+                                    .capture_plan
+                                    .matches_table(&relation.namespace, &relation.name)
+                                {
+                                    let event = self.truncate_change(relation, wal_start);
+                                    self.pending_events.push(event)?;
+                                }
+                            }
+                        }
+                        PgOutputMessage::Ignored => {}
                     }
-                    PgOutputMessage::Ignored => {}
-                },
+                }
                 ReplicationEvent::Message { prefix, lsn, .. } => {
                     if prefix != LIGHTCDC_HEARTBEAT_PREFIX {
                         return Err(PostgresError::UnsupportedFeature(format!(
@@ -473,6 +499,7 @@ impl PostgresError {
                 replication_server_sqlstate(message).is_some_and(is_retryable_sqlstate)
             }
             Self::Configuration(_)
+            | Self::ResumeLsnGap { .. }
             | Self::StreamState(_)
             | Self::Replication(_)
             | Self::Decode(_)
@@ -550,6 +577,14 @@ pub async fn validate_source_config_with_plan(
         identity: source.identity,
         confirmed_flush_lsn: source.confirmed_flush_lsn,
         restart_lsn: source.restart_lsn,
+        current_wal_lsn: Lsn::from_str(&source.current_wal_lsn)
+            .map_err(|error| {
+                PostgresError::StreamState(format!(
+                    "PostgreSQL returned invalid current WAL LSN {:?}: {error}",
+                    source.current_wal_lsn
+                ))
+            })?
+            .as_u64(),
         publication,
     })
 }
@@ -645,7 +680,8 @@ async fn validate_source_client(
                 current_database(),
                 current_user,
                 role.rolsuper,
-                role.rolreplication
+                role.rolreplication,
+                pg_current_wal_lsn()::text
             FROM pg_roles AS role
             WHERE role.rolname = current_user
             "#,
@@ -658,6 +694,7 @@ async fn validate_source_client(
     let user: String = row.get(2);
     let is_superuser: bool = row.get(3);
     let can_replicate: bool = row.get(4);
+    let current_wal_lsn: String = row.get(5);
 
     if wal_level != "logical" {
         return Err(PostgresError::Configuration(format!(
@@ -788,6 +825,7 @@ async fn validate_source_client(
         database_oid = %identity.database_oid,
         confirmed_flush_lsn = ?confirmed_flush_lsn,
         restart_lsn = ?restart_lsn,
+        current_wal_lsn,
         "validated PostgreSQL source config"
     );
 
@@ -795,6 +833,7 @@ async fn validate_source_client(
         identity,
         confirmed_flush_lsn,
         restart_lsn,
+        current_wal_lsn,
         publish_via_partition_root: publication.get(4),
     })
 }
@@ -819,9 +858,10 @@ pub fn validate_resume_lsn(
         ))
     })?;
     if confirmed > local {
-        return Err(PostgresError::Configuration(format!(
-            "replication slot confirmed_flush_lsn {confirmed_flush_lsn} is ahead of the local durable checkpoint {local_lsn}; PostgreSQL can no longer replay the missing range"
-        )));
+        return Err(PostgresError::ResumeLsnGap {
+            local_lsn: local_lsn.to_owned(),
+            confirmed_flush_lsn: confirmed_flush_lsn.to_owned(),
+        });
     }
     Ok(())
 }
@@ -1111,7 +1151,7 @@ mod tests {
 
         let error = validate_resume_lsn(Some("0/10"), Some("0/20"))
             .expect_err("slot acknowledged beyond local durability");
-        assert!(matches!(error, PostgresError::Configuration(_)));
+        assert!(matches!(error, PostgresError::ResumeLsnGap { .. }));
         assert!(error.to_string().contains("can no longer replay"));
     }
 

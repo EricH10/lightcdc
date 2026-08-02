@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::ProductionMetrics;
+
 /// Stable lifecycle states exposed through readiness and structured logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeState {
@@ -26,6 +28,7 @@ pub struct RuntimeStatus {
 #[derive(Clone, Debug)]
 pub struct RuntimeStateHandle {
     sender: watch::Sender<RuntimeStatus>,
+    metrics: Option<ProductionMetrics>,
 }
 
 /// Observes lifecycle transitions without owning process state.
@@ -48,12 +51,25 @@ pub struct ShutdownReceiver {
 
 /// Creates one lifecycle publisher and its initial observer.
 pub fn runtime_state_channel() -> (RuntimeStateHandle, RuntimeStateReceiver) {
+    runtime_state_channel_inner(None)
+}
+
+/// Creates lifecycle state that also updates production metrics atomically.
+pub fn runtime_state_channel_with_metrics(
+    metrics: ProductionMetrics,
+) -> (RuntimeStateHandle, RuntimeStateReceiver) {
+    runtime_state_channel_inner(Some(metrics))
+}
+
+fn runtime_state_channel_inner(
+    metrics: Option<ProductionMetrics>,
+) -> (RuntimeStateHandle, RuntimeStateReceiver) {
     let (sender, receiver) = watch::channel(RuntimeStatus {
         state: RuntimeState::Starting,
         detail: None,
     });
     (
-        RuntimeStateHandle { sender },
+        RuntimeStateHandle { sender, metrics },
         RuntimeStateReceiver { receiver },
     )
 }
@@ -67,6 +83,9 @@ pub fn shutdown_channel() -> (ShutdownHandle, ShutdownReceiver) {
 impl RuntimeStateHandle {
     /// Records a state transition and optional operator-facing context.
     pub fn transition(&self, state: RuntimeState, detail: Option<String>) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_runtime_state(state);
+        }
         let detail = detail.map(Arc::<str>::from);
         self.sender.send_replace(RuntimeStatus { state, detail });
     }

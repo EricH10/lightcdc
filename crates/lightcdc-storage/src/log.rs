@@ -455,6 +455,22 @@ impl RedbEventStore {
             .set_consumer_offset(stream_name, consumer_name, last_acknowledged_sequence)
     }
 
+    /// Sets a consumer offset without creating more than `maximum_consumers` identities.
+    pub fn set_consumer_offset_bounded(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+        last_acknowledged_sequence: u64,
+        maximum_consumers: usize,
+    ) -> Result<(), StorageError> {
+        self.inner.set_consumer_offset_bounded(
+            stream_name,
+            consumer_name,
+            last_acknowledged_sequence,
+            maximum_consumers,
+        )
+    }
+
     /// Advances a consumer offset monotonically.
     pub fn acknowledge_consumer_offset(
         &self,
@@ -464,6 +480,22 @@ impl RedbEventStore {
     ) -> Result<u64, StorageError> {
         self.inner
             .acknowledge_consumer_offset(stream_name, consumer_name, acknowledged_sequence)
+    }
+
+    /// Advances an offset without creating more than `maximum_consumers` identities.
+    pub fn acknowledge_consumer_offset_bounded(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+        acknowledged_sequence: u64,
+        maximum_consumers: usize,
+    ) -> Result<u64, StorageError> {
+        self.inner.acknowledge_consumer_offset_bounded(
+            stream_name,
+            consumer_name,
+            acknowledged_sequence,
+            maximum_consumers,
+        )
     }
 
     /// Reads one stream-consumer checkpoint.
@@ -544,6 +576,9 @@ pub enum StorageError {
 
     #[error("storage resource limit reached: {0}")]
     ResourceLimit(String),
+
+    #[error("maximum durable consumer count of {maximum} reached")]
+    ConsumerLimitReached { maximum: usize },
 
     #[error("invalid segment options: {0}")]
     InvalidSegmentOptions(String),
@@ -807,6 +842,42 @@ mod tests {
                 .consumer_offset("orders", "search-indexer")
                 .expect("get consumer offset"),
             Some(11)
+        );
+    }
+
+    #[test]
+    fn durable_consumer_limit_is_atomic_and_allows_existing_offsets() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open(&LogOpenOptions {
+            data_dir: temp.path().to_path_buf(),
+            database_file: "test.redb".to_owned(),
+        })
+        .expect("open store");
+
+        store
+            .set_consumer_offset_bounded("orders", "first", 1, 1)
+            .expect("create first offset");
+        assert!(matches!(
+            store.set_consumer_offset_bounded("orders", "second", 1, 1),
+            Err(StorageError::ConsumerLimitReached { maximum: 1 })
+        ));
+        assert_eq!(store.stats().expect("store stats").consumer_offset_count, 1);
+
+        assert_eq!(
+            store
+                .acknowledge_consumer_offset_bounded("orders", "first", 2, 1)
+                .expect("advance existing offset"),
+            2
+        );
+        assert!(matches!(
+            store.acknowledge_consumer_offset_bounded("orders", "second", 2, 1),
+            Err(StorageError::ConsumerLimitReached { maximum: 1 })
+        ));
+        assert_eq!(
+            store
+                .consumer_offset("orders", "second")
+                .expect("read rejected offset"),
+            None
         );
     }
 

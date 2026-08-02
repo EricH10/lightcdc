@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fmt, fs,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -12,9 +12,9 @@ use std::{
 use anyhow::Context;
 use lightcdc_core::{ApiConfig, ChangeEvent as CoreChangeEvent, Config, Operation, StreamConfig};
 use lightcdc_runtime::{
-    CaptureStorageHandle, CaptureStorageWriter, RuntimeState, RuntimeStateReceiver, ShutdownHandle,
-    ShutdownReceiver, StorageReaderHandle, StorageReaderPool, runtime_state_channel,
-    shutdown_channel,
+    CaptureStorageHandle, CaptureStorageWriter, ProductionMetrics, RuntimeState,
+    RuntimeStateReceiver, ShutdownHandle, ShutdownReceiver, StorageReaderHandle, StorageReaderPool,
+    runtime_state_channel, shutdown_channel,
 };
 use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::{
@@ -72,6 +72,26 @@ pub struct LightCdcService {
     delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
     /// Resolved bearer principals and per-stream permissions.
     authorizer: Arc<ApiAuthorizer>,
+    /// Fixed-cardinality counters and health signals in production runtimes.
+    metrics: Option<ProductionMetrics>,
+}
+
+/// Groups externally owned runtime handles shared with the gRPC server.
+pub struct ApiRuntime {
+    pub storage_writer: CaptureStorageHandle,
+    pub state: RuntimeStateReceiver,
+    pub shutdown: ShutdownReceiver,
+    pub metrics: Option<ProductionMetrics>,
+}
+
+/// Marks API startup failures that require a configuration change.
+#[derive(Debug)]
+pub struct ApiConfigurationFailure;
+
+impl fmt::Display for ApiConfigurationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("gRPC API configuration requires operator action")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,6 +111,15 @@ struct ApiPrincipal {
 struct LimitedConnection {
     stream: TcpStream,
     _permit: OwnedSemaphorePermit,
+    metrics: Option<ProductionMetrics>,
+}
+
+impl Drop for LimitedConnection {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_api_connection_finished();
+        }
+    }
 }
 
 impl AsyncRead for LimitedConnection {
@@ -270,11 +299,15 @@ impl Default for EventNotifier {
 struct ActiveSubscription {
     key: SubscriptionKey,
     active: Arc<Mutex<HashSet<SubscriptionKey>>>,
+    metrics: Option<ProductionMetrics>,
 }
 
 impl Drop for ActiveSubscription {
     fn drop(&mut self) {
         active_subscriptions(&self.active).remove(&self.key);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_subscription_finished();
+        }
     }
 }
 
@@ -289,6 +322,7 @@ struct ServiceParts {
     storage_reader_owner: Arc<StorageReaderPool>,
     shutdown: ShutdownReceiver,
     shutdown_owner: Option<ShutdownHandle>,
+    metrics: Option<ProductionMetrics>,
 }
 
 impl LightCdcService {
@@ -322,6 +356,7 @@ impl LightCdcService {
                 storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
+                metrics: None,
             },
             ApiAuthorizer::default(),
         )
@@ -332,7 +367,8 @@ impl LightCdcService {
         store: RedbEventStore,
         event_notifier: EventNotifier,
     ) -> anyhow::Result<Self> {
-        let authorizer = ApiAuthorizer::from_config(&config.api)?;
+        let authorizer = ApiAuthorizer::from_config(&config.api)
+            .map_err(|error| error.context(ApiConfigurationFailure))?;
         let (shutdown_owner, shutdown) = shutdown_channel();
         let storage_writer_owner = Arc::new(CaptureStorageWriter::start(
             store.clone(),
@@ -351,6 +387,7 @@ impl LightCdcService {
                 storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
+                metrics: None,
             },
             authorizer,
         ))
@@ -377,6 +414,7 @@ impl LightCdcService {
                 storage_reader_owner,
                 shutdown,
                 shutdown_owner: Some(shutdown_owner),
+                metrics: None,
             },
             ApiAuthorizer::default(),
         )
@@ -389,8 +427,10 @@ impl LightCdcService {
         event_notifier: EventNotifier,
         storage_writer: CaptureStorageHandle,
         shutdown: ShutdownReceiver,
+        metrics: Option<ProductionMetrics>,
     ) -> anyhow::Result<Self> {
-        let authorizer = ApiAuthorizer::from_config(&config.api)?;
+        let authorizer = ApiAuthorizer::from_config(&config.api)
+            .map_err(|error| error.context(ApiConfigurationFailure))?;
         let (storage_reader_owner, storage_reader) = start_storage_readers(&config, &store)?;
         Ok(Self::from_parts(
             ServiceParts {
@@ -403,6 +443,7 @@ impl LightCdcService {
                 storage_reader_owner,
                 shutdown,
                 shutdown_owner: None,
+                metrics,
             },
             authorizer,
         ))
@@ -425,6 +466,7 @@ impl LightCdcService {
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
             authorizer: Arc::new(authorizer),
+            metrics: parts.metrics,
         }
     }
 }
@@ -477,8 +519,10 @@ fn server_tls_identity(config: &ApiConfig) -> anyhow::Result<Option<Identity>> {
 
 /// Runs the lightcdc gRPC server until it is stopped.
 pub async fn serve(addr: SocketAddr, config: Config, store: RedbEventStore) -> anyhow::Result<()> {
-    validate_api_binding(addr, &config.api)?;
-    let tls = server_tls_identity(&config.api)?;
+    validate_api_binding(addr, &config.api)
+        .map_err(|error| error.context(ApiConfigurationFailure))?;
+    let tls =
+        server_tls_identity(&config.api).map_err(|error| error.context(ApiConfigurationFailure))?;
     let (state, state_rx) = runtime_state_channel();
     state.transition(RuntimeState::Capturing, None);
     let (_shutdown, shutdown_rx) = shutdown_channel();
@@ -502,9 +546,12 @@ pub async fn serve_with_notifier(
         config,
         store,
         event_notifier,
-        storage_writer,
-        state_rx,
-        shutdown_rx,
+        ApiRuntime {
+            storage_writer,
+            state: state_rx,
+            shutdown: shutdown_rx,
+            metrics: None,
+        },
     )
     .await
 }
@@ -515,18 +562,25 @@ pub async fn serve_with_runtime(
     config: Config,
     store: RedbEventStore,
     event_notifier: EventNotifier,
-    storage_writer: CaptureStorageHandle,
-    state: RuntimeStateReceiver,
-    shutdown: ShutdownReceiver,
+    runtime: ApiRuntime,
 ) -> anyhow::Result<()> {
-    validate_api_binding(addr, &config.api)?;
-    let tls = server_tls_identity(&config.api)?;
+    validate_api_binding(addr, &config.api)
+        .map_err(|error| error.context(ApiConfigurationFailure))?;
+    let tls =
+        server_tls_identity(&config.api).map_err(|error| error.context(ApiConfigurationFailure))?;
+    let ApiRuntime {
+        storage_writer,
+        state,
+        shutdown,
+        metrics,
+    } = runtime;
     let service = LightCdcService::new_with_runtime(
         config,
         store,
         event_notifier,
         storage_writer,
         shutdown.clone(),
+        metrics,
     )?;
     serve_service(addr, service, state, shutdown, tls).await
 }
@@ -545,8 +599,14 @@ async fn serve_service(
     let max_requests_per_connection = service.config.runtime.max_requests_per_connection;
     let max_api_connections = service.config.runtime.max_api_connections;
     let max_header_list_bytes = service.config.runtime.max_header_list_bytes;
+    let metrics = service.metrics.clone();
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    let health_task = tokio::spawn(report_health(health_reporter, state, shutdown.clone()));
+    let health_task = tokio::spawn(report_health(
+        health_reporter,
+        state,
+        shutdown.clone(),
+        metrics.clone(),
+    ));
     let mut server = Server::builder()
         .concurrency_limit_per_connection(max_requests_per_connection)
         .http2_max_header_list_size(max_header_list_bytes);
@@ -563,7 +623,7 @@ async fn serve_service(
                 .max_encoding_message_size(max_outbound_event_bytes.saturating_add(64 * 1024)),
         )
         .serve_with_incoming_shutdown(
-            limited_incoming(addr, max_api_connections).await?,
+            limited_incoming(addr, max_api_connections, metrics).await?,
             async move { shutdown.cancelled().await },
         )
         .await;
@@ -575,25 +635,39 @@ async fn serve_service(
 async fn limited_incoming(
     addr: SocketAddr,
     maximum: usize,
+    metrics: Option<ProductionMetrics>,
 ) -> anyhow::Result<impl tokio_stream::Stream<Item = Result<LimitedConnection, std::io::Error>>> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind gRPC listener {addr}"))?;
-    Ok(limited_incoming_from(listener, maximum))
+    Ok(limited_incoming_from(listener, maximum, metrics))
 }
 
 fn limited_incoming_from(
     listener: TcpListener,
     maximum: usize,
+    metrics: Option<ProductionMetrics>,
 ) -> impl tokio_stream::Stream<Item = Result<LimitedConnection, std::io::Error>> {
     let permits = Arc::new(Semaphore::new(maximum));
     TcpListenerStream::new(listener).filter_map(move |incoming| match incoming {
-        Ok(stream) => Arc::clone(&permits).try_acquire_owned().ok().map(|permit| {
-            Ok(LimitedConnection {
-                stream,
-                _permit: permit,
-            })
-        }),
+        Ok(stream) => match Arc::clone(&permits).try_acquire_owned() {
+            Ok(permit) => {
+                if let Some(metrics) = &metrics {
+                    metrics.record_api_connection_started();
+                }
+                Some(Ok(LimitedConnection {
+                    stream,
+                    _permit: permit,
+                    metrics: metrics.clone(),
+                }))
+            }
+            Err(_) => {
+                if let Some(metrics) = &metrics {
+                    metrics.record_api_connection_limit_rejection();
+                }
+                None
+            }
+        },
         Err(error) => Some(Err(error)),
     })
 }
@@ -606,13 +680,17 @@ async fn report_health(
     reporter: tonic_health::server::HealthReporter,
     mut state: RuntimeStateReceiver,
     mut shutdown: ShutdownReceiver,
+    metrics: Option<ProductionMetrics>,
 ) {
     reporter
         .set_service_status(LIVENESS_SERVICE, ServingStatus::Serving)
         .await;
     loop {
         let status = state.current();
-        let serving = if status.state == RuntimeState::Capturing {
+        let storage_ready = metrics
+            .as_ref()
+            .is_none_or(ProductionMetrics::storage_ready);
+        let serving = if status.state == RuntimeState::Capturing && storage_ready {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
@@ -639,6 +717,7 @@ async fn report_health(
                     return;
                 }
             }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
     }
 }
@@ -668,12 +747,12 @@ impl LightCdc for LightCdcService {
             .storage_reader
             .consumer_offset(stream.name.clone(), consumer.to_owned())
             .await
-            .map_err(internal)?;
+            .map_err(|error| internal_with_metrics(&self.metrics, error))?;
         let start_offset = match stored_offset {
             Some(offset) => offset,
             None => earliest_retained_offset(&self.storage_reader)
                 .await
-                .map_err(internal)?,
+                .map_err(|error| internal_with_metrics(&self.metrics, error))?,
         };
         let limit = request.limit as usize;
         let (tx, rx) = mpsc::channel(self.config.runtime.channel_capacity);
@@ -685,6 +764,7 @@ impl LightCdc for LightCdcService {
         let max_outbound_event_bytes = self.config.runtime.max_outbound_event_bytes;
         let replay_batch_events = self.config.runtime.replay_batch_events;
         let replay_batch_max_bytes = self.config.runtime.replay_batch_max_bytes;
+        let metrics = self.metrics.clone();
 
         // This worker owns cloned state because it can outlive the subscribe RPC.
         tokio::spawn(async move {
@@ -702,6 +782,10 @@ impl LightCdc for LightCdcService {
                 {
                     Ok(batch) => batch,
                     Err(error) => {
+                        if let Some(metrics) = &metrics {
+                            metrics.record_replay_error();
+                            metrics.record_storage_error();
+                        }
                         let _ = tx.send(Err(replay_status(error))).await;
                         return;
                     }
@@ -734,6 +818,11 @@ impl LightCdc for LightCdcService {
                         return;
                     }
 
+                    if tx.capacity() == 0
+                        && let Some(metrics) = &metrics
+                    {
+                        metrics.record_subscription_backpressure();
+                    }
                     let permit = tokio::select! {
                         result = tx.reserve() => match result {
                             Ok(permit) => permit,
@@ -742,6 +831,9 @@ impl LightCdc for LightCdcService {
                         _ = shutdown.cancelled() => return,
                     };
                     record_delivery(&delivery_high_watermarks, &delivery_key, event.sequence);
+                    if let Some(metrics) = &metrics {
+                        metrics.record_delivery();
+                    }
                     permit.send(Ok(event.into()));
                     emitted += 1;
 
@@ -789,9 +881,17 @@ impl LightCdc for LightCdcService {
 
         let offset = self
             .storage_writer
-            .acknowledge_consumer_offset(stream.name.clone(), consumer.to_owned(), request.sequence)
+            .acknowledge_consumer_offset(
+                stream.name.clone(),
+                consumer.to_owned(),
+                request.sequence,
+                self.config.runtime.max_durable_consumers,
+            )
             .await
-            .map_err(internal)?;
+            .map_err(|error| consumer_write_status(&self.metrics, error))?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_acknowledgement();
+        }
 
         Ok(Response::new(AckResponse { offset }))
     }
@@ -815,12 +915,12 @@ impl LightCdc for LightCdcService {
         let offset = match position {
             SeekPosition::Earliest => earliest_retained_offset(&self.storage_reader)
                 .await
-                .map_err(internal)?,
+                .map_err(|error| internal_with_metrics(&self.metrics, error))?,
             SeekPosition::Latest => self
                 .storage_reader
                 .last_sequence()
                 .await
-                .map_err(internal)?
+                .map_err(|error| internal_with_metrics(&self.metrics, error))?
                 .unwrap_or(0),
             SeekPosition::Absolute => request.sequence,
             SeekPosition::Unspecified => {
@@ -831,11 +931,19 @@ impl LightCdc for LightCdcService {
         };
 
         self.storage_writer
-            .set_consumer_offset(stream.name.clone(), consumer.to_owned(), offset)
+            .set_consumer_offset(
+                stream.name.clone(),
+                consumer.to_owned(),
+                offset,
+                self.config.runtime.max_durable_consumers,
+            )
             .await
-            .map_err(internal)?;
+            .map_err(|error| consumer_write_status(&self.metrics, error))?;
         delivery_high_watermarks(&self.delivery_high_watermarks)
             .remove(&(stream.name.clone(), consumer.to_owned()));
+        if let Some(metrics) = &self.metrics {
+            metrics.record_seek();
+        }
 
         Ok(Response::new(SeekResponse { offset }))
     }
@@ -858,15 +966,22 @@ impl LightCdcService {
         }
         if active.len() > self.config.runtime.max_active_subscriptions {
             active.remove(&key);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_subscription_limit_rejection();
+            }
             return Err(Status::resource_exhausted(
                 "active subscription limit reached",
             ));
         }
         drop(active);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_subscription_started();
+        }
 
         Ok(ActiveSubscription {
             key,
             active: Arc::clone(&self.active_subscriptions),
+            metrics: self.metrics.clone(),
         })
     }
 
@@ -1012,6 +1127,28 @@ fn internal(error: impl ToString) -> Status {
     Status::internal("internal service error")
 }
 
+fn internal_with_metrics(metrics: &Option<ProductionMetrics>, error: impl ToString) -> Status {
+    if let Some(metrics) = metrics {
+        metrics.record_storage_error();
+    }
+    internal(error)
+}
+
+fn consumer_write_status(metrics: &Option<ProductionMetrics>, error: anyhow::Error) -> Status {
+    if let Some(StorageError::ConsumerLimitReached { maximum }) =
+        error.downcast_ref::<StorageError>()
+    {
+        if let Some(metrics) = metrics {
+            metrics.record_durable_consumer_limit_rejection();
+        }
+        warn!(%error, "durable consumer limit reached");
+        return Status::resource_exhausted(format!(
+            "maximum durable consumer count of {maximum} reached"
+        ));
+    }
+    internal_with_metrics(metrics, error)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
@@ -1032,7 +1169,7 @@ mod tests {
     async fn connection_limit_rejects_excess_and_recovers_after_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("listener address");
-        let mut incoming = Box::pin(limited_incoming_from(listener, 1));
+        let mut incoming = Box::pin(limited_incoming_from(listener, 1, None));
 
         let _first_client = TcpStream::connect(addr).await.expect("first client");
         let first_server = incoming
@@ -1258,7 +1395,7 @@ mod tests {
         let (shutdown, shutdown_rx) = shutdown_channel();
         let reporter = tonic_health::server::HealthReporter::new();
         let health = tonic_health::server::HealthService::from_health_reporter(reporter.clone());
-        let task = tokio::spawn(report_health(reporter, state_rx, shutdown_rx));
+        let task = tokio::spawn(report_health(reporter, state_rx, shutdown_rx, None));
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -1283,6 +1420,31 @@ mod tests {
             health_status(&health, READINESS_SERVICE).await,
             tonic_health::pb::health_check_response::ServingStatus::NotServing as i32
         );
+    }
+
+    #[tokio::test]
+    async fn health_requires_a_successful_production_storage_sample() {
+        let (state, state_rx) = runtime_state_channel();
+        state.transition(RuntimeState::Capturing, None);
+        let (shutdown, shutdown_rx) = shutdown_channel();
+        let reporter = tonic_health::server::HealthReporter::new();
+        let health = tonic_health::server::HealthService::from_health_reporter(reporter.clone());
+        let metrics = ProductionMetrics::new(1_000_000, 1_000, 32, 10_000, 16, 8);
+        let task = tokio::spawn(report_health(
+            reporter,
+            state_rx,
+            shutdown_rx,
+            Some(metrics),
+        ));
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            health_status(&health, READINESS_SERVICE).await,
+            tonic_health::pb::health_check_response::ServingStatus::NotServing as i32
+        );
+
+        shutdown.trigger();
+        task.await.expect("health task");
     }
 
     #[test]
@@ -1653,6 +1815,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seek_bounds_durable_consumer_identities_without_blocking_existing_ones() {
+        let mut service = service_with_events(&[event(1, "public", "orders")]);
+        config_for_service(&mut service)
+            .runtime
+            .max_durable_consumers = 1;
+
+        let seek = |consumer: &str| {
+            Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: consumer.to_owned(),
+                position: SeekPosition::Latest as i32,
+                sequence: 0,
+            })
+        };
+        service
+            .seek(seek("first"))
+            .await
+            .expect("create first durable consumer");
+
+        let error = service
+            .seek(seek("second"))
+            .await
+            .expect_err("second durable consumer must be rejected");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            service
+                .store
+                .stats()
+                .expect("store stats")
+                .consumer_offset_count,
+            1
+        );
+
+        service
+            .seek(seek("first"))
+            .await
+            .expect("existing durable consumer remains writable");
+    }
+
+    #[tokio::test]
     async fn seek_clears_the_previous_delivery_high_water_mark() {
         let service = service_with_events(&[event(1, "public", "orders")]);
         let mut subscription = service
@@ -1787,6 +1989,7 @@ mod tests {
                 channel_capacity: 1024,
                 shutdown_timeout_ms: 10000,
                 max_active_subscriptions: 1_024,
+                max_durable_consumers: 10_000,
                 replay_reader_threads: 2,
                 replay_reader_queue_capacity: 1_024,
                 replay_batch_events: 256,
@@ -1819,6 +2022,7 @@ mod tests {
             logging: LoggingConfig {
                 level: "info".to_owned(),
             },
+            observability: lightcdc_core::ObservabilityConfig::default(),
             api: lightcdc_core::ApiConfig {
                 allow_insecure_localhost: true,
                 ..lightcdc_core::ApiConfig::default()

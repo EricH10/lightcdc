@@ -157,6 +157,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -165,6 +167,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1187,6 +1190,7 @@ name = "lightcdc-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "flume",
  "fs2",
  "lightcdc-core",
@@ -1194,6 +1198,7 @@ dependencies = [
  "lightcdc-storage",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

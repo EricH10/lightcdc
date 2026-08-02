@@ -16,6 +16,7 @@ storage_file = "lightcdc.redb"
 channel_capacity = 1024
 shutdown_timeout_ms = 10000
 max_active_subscriptions = 1024
+max_durable_consumers = 10000
 replay_reader_threads = 2
 replay_reader_queue_capacity = 1024
 replay_batch_events = 256
@@ -47,6 +48,12 @@ retention_delete_batch_size = 100000
 
 [logging]
 level = "info"
+
+[observability]
+metrics_enabled = true
+metrics_addr = "127.0.0.1:9187"
+metrics_sample_interval_seconds = 15
+metrics_max_connections = 16
 
 [api]
 # Plaintext and unauthenticated serving is accepted only on a loopback bind.

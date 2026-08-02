@@ -6,8 +6,8 @@ use anyhow::Context;
 use lightcdc_api::EventNotifier;
 use lightcdc_core::{CapturePlan, Config};
 use lightcdc_runtime::{
-    CaptureBatchLimits, CaptureStorageWriter, RuntimeState, RuntimeStateHandle,
-    runtime_state_channel, shutdown_channel,
+    CaptureBatchLimits, CaptureStorageWriter, ProductionMetrics, RuntimeState, RuntimeStateHandle,
+    runtime_state_channel_with_metrics, shutdown_channel,
 };
 use lightcdc_storage::{RedbEventStore, TransactionBufferOptions};
 use tokio::task::JoinHandle;
@@ -22,7 +22,9 @@ use self::{
 };
 use crate::{
     cli::CaptureOptions,
+    failure,
     logging::init_logging,
+    observability::ObservabilityRuntime,
     store::{open_event_store, storage_options, storage_resource_limits},
 };
 
@@ -37,6 +39,7 @@ struct CaptureContext<'a> {
     storage_writer: &'a CaptureStorageWriter,
     options: &'a CaptureOptions,
     metrics: &'a Option<CaptureMetrics>,
+    production_metrics: &'a ProductionMetrics,
     event_notifier: &'a Option<EventNotifier>,
     source_name: &'a str,
     capture_plan: &'a CapturePlan,
@@ -78,9 +81,10 @@ pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> an
     config
         .resolve_source_password()
         .map_err(anyhow::Error::msg)
+        .map_err(failure::configuration)
         .context("could not resolve PostgreSQL password")?;
 
-    init_logging(&config.logging.level)?;
+    init_logging(&config.logging.level).map_err(failure::configuration)?;
 
     info!(
         config = %config_path.display(),
@@ -95,23 +99,58 @@ pub(crate) async fn capture(config_path: PathBuf, options: CaptureOptions) -> an
         config.source.name.clone(),
         Some(storage_resource_limits(&config)),
     )?;
-    let (state, _state_rx) = runtime_state_channel();
-    let outcome = {
-        let capture = capture_with_store(config, store, options, None, &storage_writer, &state);
+    let (shutdown, shutdown_rx) = shutdown_channel();
+    let mut observability =
+        ObservabilityRuntime::start(&config, store.clone(), shutdown_rx, None).await?;
+    let production_metrics = observability.metrics();
+    let (state, _state_rx) = runtime_state_channel_with_metrics(production_metrics.clone());
+    enum CaptureExit {
+        Capture(anyhow::Result<()>),
+        Metrics(anyhow::Error),
+        Signal,
+    }
+    let exit = {
+        let capture = capture_with_store(
+            config,
+            store,
+            options,
+            None,
+            &storage_writer,
+            &state,
+            &production_metrics,
+        );
         tokio::pin!(capture);
         tokio::select! {
-            result = &mut capture => result,
-            () = process_shutdown_signal() => {
-                state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
-                info!("capture is draining after shutdown signal");
-                Ok(())
-            }
+            result = &mut capture => CaptureExit::Capture(result),
+            error = observability.stopped() => CaptureExit::Metrics(error),
+            () = process_shutdown_signal() => CaptureExit::Signal,
         }
     };
-    close_storage_writer(storage_writer, shutdown_timeout).await?;
-    if let Err(error) = &outcome {
-        state.transition(RuntimeState::Failed, Some(error.to_string()));
-    }
+    let outcome = match exit {
+        CaptureExit::Capture(result) => {
+            match &result {
+                Ok(()) => {
+                    state.transition(RuntimeState::Draining, Some("capture completed".to_owned()))
+                }
+                Err(error) => state.transition(RuntimeState::Failed, Some(error.to_string())),
+            }
+            result
+        }
+        CaptureExit::Metrics(error) => {
+            state.transition(RuntimeState::Failed, Some(error.to_string()));
+            Err(error)
+        }
+        CaptureExit::Signal => {
+            state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
+            info!("capture is draining after shutdown signal");
+            Ok(())
+        }
+    };
+    shutdown.trigger();
+    let writer_outcome = close_storage_writer(storage_writer, shutdown_timeout).await;
+    let metrics_outcome = observability.shutdown(shutdown_timeout).await;
+    writer_outcome?;
+    metrics_outcome?;
     outcome
 }
 
@@ -126,9 +165,10 @@ pub(crate) async fn run(
     config
         .resolve_source_password()
         .map_err(anyhow::Error::msg)
+        .map_err(failure::configuration)
         .context("could not resolve PostgreSQL password")?;
 
-    init_logging(&config.logging.level)?;
+    init_logging(&config.logging.level).map_err(failure::configuration)?;
 
     info!(
         config = %config_path.display(),
@@ -150,23 +190,32 @@ pub(crate) async fn run(
         Some(storage_resource_limits(&config)),
     )?;
     let server_storage = storage_writer.handle();
-    let (state, state_rx) = runtime_state_channel();
     let (shutdown, shutdown_rx) = shutdown_channel();
+    let mut observability =
+        ObservabilityRuntime::start(&config, store.clone(), shutdown_rx.clone(), Some(addr))
+            .await?;
+    let production_metrics = observability.metrics();
+    let (state, state_rx) = runtime_state_channel_with_metrics(production_metrics.clone());
+    let server_metrics = production_metrics.clone();
     let mut server = tokio::spawn(async move {
         lightcdc_api::serve_with_runtime(
             addr,
             server_config,
             server_store,
             server_notifier,
-            server_storage,
-            state_rx,
-            shutdown_rx,
+            lightcdc_api::ApiRuntime {
+                storage_writer: server_storage,
+                state: state_rx,
+                shutdown: shutdown_rx,
+                metrics: Some(server_metrics),
+            },
         )
         .await
     });
     enum RunExit {
         Capture(anyhow::Result<()>),
         Server(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        Metrics(anyhow::Error),
         Signal,
     }
 
@@ -178,6 +227,7 @@ pub(crate) async fn run(
             Some(event_notifier),
             &storage_writer,
             &state,
+            &production_metrics,
         );
         tokio::pin!(capture);
         tokio::select! {
@@ -187,6 +237,7 @@ pub(crate) async fn run(
             server_result = &mut server => {
                 RunExit::Server(server_result)
             }
+            error = observability.stopped() => RunExit::Metrics(error),
             () = process_shutdown_signal() => RunExit::Signal,
         }
     };
@@ -212,6 +263,12 @@ pub(crate) async fn run(
             shutdown.trigger();
             Err(error)
         }
+        RunExit::Metrics(error) => {
+            state.transition(RuntimeState::Failed, Some(error.to_string()));
+            shutdown.trigger();
+            await_server_shutdown(&mut server, shutdown_timeout).await?;
+            Err(error)
+        }
         RunExit::Signal => {
             state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
             info!("runtime is draining after shutdown signal");
@@ -220,7 +277,10 @@ pub(crate) async fn run(
             Ok(())
         }
     };
-    close_storage_writer(storage_writer, shutdown_timeout).await?;
+    let writer_outcome = close_storage_writer(storage_writer, shutdown_timeout).await;
+    let metrics_outcome = observability.shutdown(shutdown_timeout).await;
+    writer_outcome?;
+    metrics_outcome?;
     outcome
 }
 
@@ -232,6 +292,7 @@ async fn capture_with_store(
     event_notifier: Option<EventNotifier>,
     storage_writer: &CaptureStorageWriter,
     state: &RuntimeStateHandle,
+    production_metrics: &ProductionMetrics,
 ) -> anyhow::Result<()> {
     let storage = storage_options(&config);
     let source_name = config.source.name.clone();
@@ -294,6 +355,7 @@ async fn capture_with_store(
         storage_writer,
         options: &options,
         metrics: &metrics,
+        production_metrics,
         event_notifier: &event_notifier,
         source_name: &source_name,
         capture_plan: &capture_plan,
@@ -304,7 +366,11 @@ async fn capture_with_store(
     };
     if let Some(retention) = retention {
         let capture = supervise_capture(capture_context);
-        let sweeps = run_retention_sweeps(storage_writer.handle(), retention);
+        let sweeps = run_retention_sweeps(
+            storage_writer.handle(),
+            retention,
+            production_metrics.clone(),
+        );
         tokio::pin!(capture);
         tokio::pin!(sweeps);
         tokio::select! {

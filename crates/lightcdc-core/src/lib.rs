@@ -9,7 +9,7 @@ pub mod event;
 
 pub use config::{
     ApiConfig, ApiTokenConfig, CapturePlan, CapturePlanError, Config, LoggingConfig,
-    PostgresTlsMode, RuntimeConfig, SourceConfig, StreamConfig,
+    ObservabilityConfig, PostgresTlsMode, RuntimeConfig, SourceConfig, StreamConfig,
 };
 pub use error::{Error, Result};
 pub use event::{ChangeEvent, Operation, SourceMetadata, TransactionMetadata};

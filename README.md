@@ -22,6 +22,11 @@ feature matrix, change-only bootstrap boundary, and least-privilege role.
 
 See [`docs/operations.md`](docs/operations.md) for production deployment,
 health probes, backup, recovery, and upgrade procedures.
+The runbook defines stable configuration and data-safety exit codes so service
+managers can avoid unsafe restart loops.
+
+See [`docs/metrics.md`](docs/metrics.md) for the Prometheus metric contract and
+starting alert thresholds.
 
 ## Prerequisites
 
@@ -100,6 +105,7 @@ service:
 ```toml
 channel_capacity = 1024
 max_active_subscriptions = 1024
+max_durable_consumers = 10000
 max_consumer_name_bytes = 128
 max_outbound_event_bytes = 16777216
 max_inbound_request_bytes = 65536
@@ -115,12 +121,30 @@ min_free_disk_bytes = 1073741824
 shutdown_timeout_ms = 10000
 ```
 
+Production metrics use fixed atomics and a separate storage-sampling thread:
+
+```toml
+[observability]
+metrics_enabled = true
+metrics_addr = "127.0.0.1:9187"
+metrics_sample_interval_seconds = 15
+metrics_max_connections = 16
+```
+
+`GET /metrics` is plaintext and contains no table, stream, consumer, or row
+labels. Bind it only to loopback or a trusted monitoring network. Filesystem
+sampling remains active when the listener is disabled because gRPC readiness
+uses it to detect storage pressure.
+
 `channel_capacity` is the bounded per-subscription event queue. An oversized
 event or exhausted subscription limit returns `RESOURCE_EXHAUSTED` without
 advancing the consumer offset. Synchronous redb replay runs on a fixed reader
 pool, not Tokio workers. Its command queue, event count, byte size, and
 simultaneous completed batches are bounded. Tonic also enforces request,
 header-list, TCP connection, and per-connection concurrent-request limits.
+Creating an offset with ACK or seek is also rejected once
+`max_durable_consumers` distinct `(stream, consumer)` identities exist; existing
+identities can continue advancing.
 
 Transaction buffering is bounded by three `[runtime]` settings:
 
