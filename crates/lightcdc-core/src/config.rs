@@ -30,6 +30,9 @@ pub struct Config {
     /// Durable consumer-facing stream definitions.
     #[serde(default = "default_streams")]
     pub streams: Vec<StreamConfig>,
+    /// In-process destination workers started by `lightcdc run`.
+    #[serde(default)]
+    pub sinks: Vec<SinkConfig>,
 }
 
 /// Describes the PostgreSQL source used for logical replication.
@@ -251,6 +254,71 @@ pub struct StreamConfig {
     pub tables: Vec<String>,
 }
 
+/// Routes one durable stream into a configured in-process destination.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SinkConfig {
+    /// Stable sink identity used to scope its durable consumer offset.
+    pub name: String,
+    /// Configured stream this sink consumes.
+    pub stream: String,
+    /// Maximum source events read and delivered in one attempt.
+    #[serde(default = "default_sink_batch_max_events")]
+    pub batch_max_events: usize,
+    /// Soft serialized-byte boundary for one delivery batch.
+    #[serde(default = "default_sink_batch_max_bytes")]
+    pub batch_max_bytes: u64,
+    /// Initial delay after a retryable destination failure.
+    #[serde(default = "default_sink_retry_initial_ms")]
+    pub retry_initial_ms: u64,
+    /// Maximum retry delay after repeated destination failures.
+    #[serde(default = "default_sink_retry_max_ms")]
+    pub retry_max_ms: u64,
+    /// Destination adapter and its destination-specific settings.
+    pub destination: SinkDestinationConfig,
+}
+
+/// Built-in destination adapters available to the in-process sink runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SinkDestinationConfig {
+    Redis(RedisSinkConfig),
+}
+
+/// Redis connection and cache mapping configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisSinkConfig {
+    /// Direct Redis URL, suitable for local development.
+    pub url: Option<String>,
+    /// Environment variable containing the Redis URL in production.
+    pub url_env: Option<String>,
+    /// File containing the Redis URL, including credentials when required.
+    pub url_file: Option<String>,
+    /// Hard command bound after expanding every event through every rule.
+    #[serde(default = "default_redis_max_commands_per_batch")]
+    pub max_commands_per_batch: usize,
+    /// Ordered cache rules evaluated for every delivered event.
+    #[serde(default)]
+    pub rules: Vec<RedisCacheRule>,
+}
+
+/// Maps one PostgreSQL table to one Redis cache behavior.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RedisCacheRule {
+    pub table: String,
+    pub key: String,
+    pub action: RedisCacheAction,
+    pub ttl_seconds: Option<u64>,
+}
+
+/// Retry-safe Redis cache operations generated from source changes.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisCacheAction {
+    Invalidate,
+    Upsert,
+}
+
 /// Compiles configured durable streams into the tables capture must preserve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturePlan {
@@ -338,6 +406,12 @@ impl Config {
             })?;
         config
             .validate_observability()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
+        config
+            .validate_sinks()
             .map_err(|reason| Error::InvalidConfig {
                 path: path.display().to_string(),
                 reason,
@@ -713,6 +787,95 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_sinks(&self) -> std::result::Result<(), String> {
+        let mut names = HashSet::new();
+        for sink in &self.sinks {
+            if sink.name.trim().is_empty() || !names.insert(sink.name.as_str()) {
+                return Err("sink names must be nonempty and unique".to_owned());
+            }
+            if "sink:".len().saturating_add(sink.name.len()) > self.runtime.max_consumer_name_bytes
+            {
+                return Err(format!(
+                    "sink {:?} durable identity exceeds runtime.max_consumer_name_bytes",
+                    sink.name
+                ));
+            }
+            let stream = self.stream(&sink.stream).ok_or_else(|| {
+                format!(
+                    "sink {:?} references unknown stream {:?}",
+                    sink.name, sink.stream
+                )
+            })?;
+            if sink.batch_max_events == 0 || sink.batch_max_bytes == 0 {
+                return Err(format!(
+                    "sink {:?} batch limits must be greater than zero",
+                    sink.name
+                ));
+            }
+            if sink.retry_initial_ms == 0 || sink.retry_max_ms < sink.retry_initial_ms {
+                return Err(format!(
+                    "sink {:?} retry delays must be nonzero and retry_max_ms must be at least retry_initial_ms",
+                    sink.name
+                ));
+            }
+            match &sink.destination {
+                SinkDestinationConfig::Redis(redis) => {
+                    let selected = usize::from(redis.url.is_some())
+                        + usize::from(redis.url_env.is_some())
+                        + usize::from(redis.url_file.is_some());
+                    if selected != 1 {
+                        return Err(format!(
+                            "Redis sink {:?} must configure exactly one of url, url_env, or url_file",
+                            sink.name
+                        ));
+                    }
+                    if redis.max_commands_per_batch == 0 || redis.rules.is_empty() {
+                        return Err(format!(
+                            "Redis sink {:?} requires a positive command limit and at least one rule",
+                            sink.name
+                        ));
+                    }
+                    for rule in &redis.rules {
+                        let Some((schema, table)) = rule.table.split_once('.') else {
+                            return Err(format!(
+                                "Redis sink {:?} rule table {:?} must use schema.table form",
+                                sink.name, rule.table
+                            ));
+                        };
+                        if schema.is_empty() || table.is_empty() || table.contains('.') {
+                            return Err(format!(
+                                "Redis sink {:?} rule table {:?} must use schema.table form",
+                                sink.name, rule.table
+                            ));
+                        }
+                        if !stream.matches_table(schema, table) {
+                            return Err(format!(
+                                "Redis sink {:?} rule table {:?} is outside stream {:?}",
+                                sink.name, rule.table, stream.name
+                            ));
+                        }
+                        if rule.key.is_empty() || !rule.key.contains('{') {
+                            return Err(format!(
+                                "Redis sink {:?} rule {:?} needs a key placeholder",
+                                sink.name, rule.key
+                            ));
+                        }
+                        if rule.ttl_seconds == Some(0)
+                            || (rule.action == RedisCacheAction::Invalidate
+                                && rule.ttl_seconds.is_some())
+                        {
+                            return Err(format!(
+                                "Redis sink {:?} has an invalid rule TTL",
+                                sink.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ObservabilityConfig {
@@ -935,6 +1098,26 @@ fn default_stream_tables() -> Vec<String> {
     vec!["*".to_owned()]
 }
 
+fn default_sink_batch_max_events() -> usize {
+    500
+}
+
+fn default_sink_batch_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_sink_retry_initial_ms() -> u64 {
+    250
+}
+
+fn default_sink_retry_max_ms() -> u64 {
+    15_000
+}
+
+fn default_redis_max_commands_per_batch() -> usize {
+    10_000
+}
+
 fn default_transaction_memory_threshold_bytes() -> u64 {
     16 * 1024 * 1024
 }
@@ -1045,10 +1228,52 @@ fn default_retention_delete_batch_size() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crate::{Operation, SourceMetadata};
 
     use super::{CapturePlanError, Config, StreamConfig, quote_postgres_parameter};
     use tempfile::TempDir;
+
+    #[test]
+    fn example_config_defines_a_valid_in_process_redis_sink() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lightcdc.example.toml");
+
+        let config = Config::from_path(path).expect("example config");
+
+        assert_eq!(config.sinks.len(), 1);
+        assert_eq!(config.sinks[0].name, "orders-cache");
+        assert_eq!(config.sinks[0].stream, "orders");
+    }
+
+    #[test]
+    fn sink_rules_must_belong_to_the_selected_stream() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lightcdc.example.toml");
+        let mut config = Config::from_path(path).expect("example config");
+        let super::SinkDestinationConfig::Redis(redis) = &mut config.sinks[0].destination;
+        redis.rules[0].table = "public.customers".to_owned();
+
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("rule outside stream must fail")
+                .contains("outside stream")
+        );
+    }
+
+    #[test]
+    fn sink_identity_respects_the_consumer_name_limit() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lightcdc.example.toml");
+        let mut config = Config::from_path(path).expect("example config");
+        config.runtime.max_consumer_name_bytes = "sink:orders-cache".len() - 1;
+
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("oversized sink identity must fail")
+                .contains("max_consumer_name_bytes")
+        );
+    }
 
     #[test]
     fn transaction_limits_have_bounded_defaults() {
@@ -1418,6 +1643,7 @@ mod tests {
                 ..super::ApiConfig::default()
             },
             streams,
+            sinks: Vec::new(),
         }
     }
 

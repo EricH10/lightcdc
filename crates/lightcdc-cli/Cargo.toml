@@ -17,6 +17,7 @@ lightcdc-core = { path = "../lightcdc-core", version = "0.1.0" }
 lightcdc-api = { path = "../lightcdc-api", version = "0.1.0" }
 lightcdc-postgres = { path = "../lightcdc-postgres", version = "0.1.0" }
 lightcdc-runtime = { path = "../lightcdc-runtime", version = "0.1.0" }
+lightcdc-redis = { path = "../../connectors/lightcdc-redis", version = "0.1.0" }
 lightcdc-storage = { path = "../lightcdc-storage", version = "0.1.0" }
 hdrhistogram.workspace = true
 serde.workspace = true

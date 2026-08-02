@@ -20,7 +20,7 @@ use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
 };
 use tokio_stream::{
     StreamExt,
@@ -265,35 +265,7 @@ fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
 /// Identifies one consumer independently within one configured stream.
 type SubscriptionKey = (String, String);
 
-/// Wakes live subscribers after capture durably commits new events.
-#[derive(Clone, Debug)]
-pub struct EventNotifier {
-    sender: watch::Sender<()>,
-}
-
-impl EventNotifier {
-    /// Creates an independent event notification channel.
-    pub fn new() -> Self {
-        let (sender, _receiver) = watch::channel(());
-        Self { sender }
-    }
-
-    /// Signals that subscribers should check the durable event log again.
-    pub fn notify(&self) {
-        self.sender.send_replace(());
-    }
-
-    /// Creates a receiver that wakes when capture commits another batch.
-    fn subscribe(&self) -> watch::Receiver<()> {
-        self.sender.subscribe()
-    }
-}
-
-impl Default for EventNotifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use lightcdc_runtime::EventNotifier;
 
 /// Removes a subscription identity from the active set when its task exits.
 struct ActiveSubscription {
@@ -1015,6 +987,10 @@ fn operation_to_proto(operation: Operation) -> i32 {
 fn validate_consumer(consumer: &str, max_bytes: usize) -> Result<&str, Status> {
     if consumer.is_empty() {
         Err(Status::invalid_argument("consumer name is required"))
+    } else if consumer.starts_with("sink:") {
+        Err(Status::invalid_argument(
+            "consumer names beginning with sink: are reserved for in-process sinks",
+        ))
     } else if consumer.len() > max_bytes {
         Err(Status::invalid_argument(format!(
             "consumer name exceeds configured {max_bytes}-byte limit"
@@ -1286,6 +1262,15 @@ mod tests {
             .await
             .expect_err("subscription count limit");
         assert_eq!(limit_error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn external_consumers_cannot_use_the_internal_sink_namespace() {
+        let error = validate_consumer("sink:orders-cache", 128)
+            .expect_err("sink consumer namespace must be reserved");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("reserved"));
     }
 
     #[tokio::test]
@@ -2014,6 +1999,7 @@ mod tests {
                 source: "default".to_owned(),
                 tables: vec!["public.orders".to_owned()],
             }],
+            sinks: Vec::new(),
         }
     }
 

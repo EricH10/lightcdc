@@ -3,11 +3,10 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
-use lightcdc_api::EventNotifier;
 use lightcdc_core::{CapturePlan, Config};
 use lightcdc_runtime::{
-    CaptureBatchLimits, CaptureStorageWriter, ProductionMetrics, RuntimeState, RuntimeStateHandle,
-    runtime_state_channel_with_metrics, shutdown_channel,
+    CaptureBatchLimits, CaptureStorageWriter, EventNotifier, ProductionMetrics, RuntimeState,
+    RuntimeStateHandle, runtime_state_channel_with_metrics, shutdown_channel,
 };
 use lightcdc_storage::{RedbEventStore, TransactionBufferOptions};
 use tokio::task::JoinHandle;
@@ -25,6 +24,7 @@ use crate::{
     failure,
     logging::init_logging,
     observability::ObservabilityRuntime,
+    sinks,
     store::{open_event_store, storage_options, storage_resource_limits},
 };
 
@@ -191,6 +191,13 @@ pub(crate) async fn run(
     )?;
     let server_storage = storage_writer.handle();
     let (shutdown, shutdown_rx) = shutdown_channel();
+    let mut sinks = sinks::start(
+        &config,
+        store.clone(),
+        storage_writer.handle(),
+        event_notifier.clone(),
+        shutdown_rx.clone(),
+    )?;
     let mut observability =
         ObservabilityRuntime::start(&config, store.clone(), shutdown_rx.clone(), Some(addr))
             .await?;
@@ -216,6 +223,7 @@ pub(crate) async fn run(
         Capture(anyhow::Result<()>),
         Server(Result<anyhow::Result<()>, tokio::task::JoinError>),
         Metrics(anyhow::Error),
+        Sink(anyhow::Error),
         Signal,
     }
 
@@ -238,6 +246,7 @@ pub(crate) async fn run(
                 RunExit::Server(server_result)
             }
             error = observability.stopped() => RunExit::Metrics(error),
+            error = sinks.stopped() => RunExit::Sink(error),
             () = process_shutdown_signal() => RunExit::Signal,
         }
     };
@@ -269,6 +278,12 @@ pub(crate) async fn run(
             await_server_shutdown(&mut server, shutdown_timeout).await?;
             Err(error)
         }
+        RunExit::Sink(error) => {
+            state.transition(RuntimeState::Failed, Some(error.to_string()));
+            shutdown.trigger();
+            await_server_shutdown(&mut server, shutdown_timeout).await?;
+            Err(error)
+        }
         RunExit::Signal => {
             state.transition(RuntimeState::Draining, Some("process signal".to_owned()));
             info!("runtime is draining after shutdown signal");
@@ -277,8 +292,10 @@ pub(crate) async fn run(
             Ok(())
         }
     };
+    let sink_outcome = sinks.shutdown(shutdown_timeout).await;
     let writer_outcome = close_storage_writer(storage_writer, shutdown_timeout).await;
     let metrics_outcome = observability.shutdown(shutdown_timeout).await;
+    sink_outcome?;
     writer_outcome?;
     metrics_outcome?;
     outcome

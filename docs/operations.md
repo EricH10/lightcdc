@@ -134,7 +134,7 @@ space and are intentionally excluded.
 
 ## Restore
 
-1. Stop LightCDC and the Redis connector.
+1. Stop LightCDC, including every in-process sink worker.
 2. Keep the failed data directory for diagnosis; configure an empty replacement
    directory.
 3. Restore the PostgreSQL recovery point and logical slot/WAL range coordinated
@@ -226,15 +226,16 @@ replays only the retained prefix.
 
 ## Redis Recovery
 
-The Redis connector resumes from its durable LightCDC consumer offset. A crash
-or connection failure before acknowledgement can replay already applied cache
-commands; repeating them repairs any partially applied event and converges to
+The Redis sink resumes from its durable `sink:<name>` offset. A crash or
+connection failure before the offset advances can replay already applied cache
+commands; repeating them repairs any partially applied batch and converges to
 the latest ordered value.
 
 Restoring Redis to an older point does not move the LightCDC consumer offset
-backward automatically. Flush or rebuild the affected cache, stop the connector,
-and deliberately seek its consumer to the appropriate retained position before
-restarting it. If that position has expired, rebuild from the source database.
+backward automatically. Flush or rebuild the affected cache, stop `lightcdc
+run`, and deliberately repair the sink offset to the appropriate retained
+position before restarting it. If that position has expired, rebuild from the
+source database.
 
 ## Diagnostics
 

@@ -5,7 +5,7 @@ ENV RUSTUP_TOOLCHAIN=1.89.0
 WORKDIR /workspace
 COPY . .
 RUN rustc --version \
-    && cargo build --locked --release --bin lightcdc --bin lightcdc-redis
+    && cargo build --locked --release --bin lightcdc
 
 FROM debian:bookworm-slim AS runtime
 
@@ -20,7 +20,6 @@ RUN apt-get update \
     && install --directory --owner lightcdc --group lightcdc /var/lib/lightcdc /etc/lightcdc
 
 COPY --from=builder /workspace/target/release/lightcdc /usr/local/bin/lightcdc
-COPY --from=builder /workspace/target/release/lightcdc-redis /usr/local/bin/lightcdc-redis
 COPY LICENSE-MIT LICENSE-APACHE /usr/share/licenses/lightcdc/
 
 USER 10001:10001

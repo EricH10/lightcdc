@@ -9,7 +9,7 @@ PostgreSQL logical replication
     -> replication reader
     -> redb-backed local event store
     -> configured stream
-    -> replay CLI or gRPC consumer
+    -> in-process sink or replay/gRPC consumer
 ```
 
 Milestone 0 established the workspace, local database, configuration model, and
@@ -22,10 +22,10 @@ and truncate messages.
 - `lightcdc-postgres`: PostgreSQL connectivity and replication support.
 - `lightcdc-storage`: transaction staging plus redb-backed event, source offset,
   and consumer offset storage.
-- `lightcdc-runtime`: shared storage writer, capture batching, and write-command
-  coordination used by capture, retention, and gRPC.
-- `lightcdc-redis`: optional external gRPC consumer that applies ordered,
-  retry-safe cache mutations before acknowledging events.
+- `lightcdc-runtime`: shared storage writer, capture batching, sink delivery,
+  and write-command coordination used by capture, retention, sinks, and gRPC.
+- `lightcdc-redis`: built-in Redis adapter that maps canonical events to
+  retry-safe cache mutations.
 - `lightcdc-api`: gRPC Subscribe, Ack, and Seek service.
 - `lightcdc-cli`: user-facing binary.
 
@@ -53,6 +53,23 @@ The gRPC API exposes:
 - `Subscribe`: stream events for a configured stream and consumer.
 - `Ack`: persist a stream-scoped consumer offset.
 - `Seek`: move a consumer offset to earliest, latest, or an explicit sequence.
+
+## In-Process Sinks
+
+`lightcdc run` starts every configured sink beside capture and gRPC. Each sink
+uses the generic `Sink` runtime for bounded replay batches, durable offsets,
+retry backoff, and coordinated shutdown; its adapter only translates and
+delivers a batch. A Redis outage therefore creates Redis sink lag while capture
+and other sink workers continue. A terminal mapping or authentication error
+stops `run` for operator action without acknowledging the failed batch.
+
+Sink offsets use the reserved `sink:<name>` consumer identity. An existing sink
+resumes after its last successful batch, while a new sink starts at the earliest
+retained event. Built-in sinks do not traverse gRPC or require API credentials.
+
+Custom compiled adapters implement `lightcdc_runtime::Sink` and are registered
+by the CLI composition layer. Independently deployed or dynamically authored
+consumers should continue to use the language-neutral gRPC API.
 
 ## Capture Selection and Idle Progress
 

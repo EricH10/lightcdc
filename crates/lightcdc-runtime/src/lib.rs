@@ -1,12 +1,14 @@
 //! Serializes synchronous redb writes from capture and API callers on one thread.
 
 mod metrics;
+mod sink;
 mod state;
 
 pub use metrics::{ProductionMetrics, StorageMetricsSampler, bind_metrics_listener, serve_metrics};
+pub use sink::{Sink, SinkDeliveryError, SinkRegistration, SinkRuntime, SinkWorkerConfig};
 pub use state::{
-    RuntimeState, RuntimeStateHandle, RuntimeStateReceiver, ShutdownHandle, ShutdownReceiver,
-    runtime_state_channel, runtime_state_channel_with_metrics, shutdown_channel,
+    EventNotifier, RuntimeState, RuntimeStateHandle, RuntimeStateReceiver, ShutdownHandle,
+    ShutdownReceiver, runtime_state_channel, runtime_state_channel_with_metrics, shutdown_channel,
 };
 
 use std::{

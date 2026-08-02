@@ -1,66 +1,82 @@
-# Redis Cache Connector
+# Redis Sink
 
-`lightcdc-redis` is an optional downstream process that turns an ordered
-LightCDC stream into Redis cache invalidations or JSON row updates. It uses the
-public gRPC API and does not run inside PostgreSQL capture. A Redis outage can
-therefore make this consumer lag without stopping WAL capture or other
-consumers.
+The Redis adapter is an optional built-in sink that turns an ordered LightCDC
+stream into Redis cache invalidations or JSON row updates. `lightcdc run` starts
+it in the same process as capture and gRPC; there is no connector executable or
+internal gRPC hop.
 
-The connector handles SIGINT and SIGTERM and exits successfully. If it is
-killed after Redis applies commands but before LightCDC records the ACK, the
-same event is safely replayed as described below.
+The shared sink runtime owns replay, batching, durable offsets, retry backoff,
+and shutdown. The Redis adapter only maps canonical events and applies the
+resulting commands. A Redis outage makes this sink lag while PostgreSQL capture,
+gRPC consumers, and other sink workers continue.
 
 ## Delivery Safety
 
-For each event, the connector maps the change to ordinary Redis `SET` and `DEL`
-commands and sends them in one ordered pipeline. It acknowledges LightCDC only
-after Redis reports success. Events are processed serially, and every generated
-command is safe to repeat:
+The runtime reads a bounded source batch, keeps only events matching the sink's
+configured stream, and sends all generated `SET` and `DEL` commands in one
+Redis pipeline. It advances the durable `sink:<name>` offset only after Redis
+reports success. Every generated command is safe to repeat:
 
 - replaying `DEL` leaves the key deleted;
 - replaying `SET` writes the same row value and restarts its configured TTL; and
 - replaying a key-changing update repeats both the old-key deletion and the
   new-key write.
 
-A connection failure can leave only part of an event applied, and a crash can
-happen after all commands succeed but before acknowledgement. In either case,
-LightCDC retains the previous consumer offset and redelivers the event. Repeating
-the complete command set converges to the latest ordered value before the offset
-advances. During replay the cache can temporarily show an earlier value or a
-partially applied key change, and a replayed upsert restarts its TTL. The
-connector does not claim a distributed transaction between Redis and LightCDC.
+A connection failure can leave part of a pipeline applied, and a crash can
+happen after Redis succeeds but before redb records the new offset. LightCDC
+then retries the complete batch. Its idempotent commands converge to the latest
+ordered value, although replay can temporarily expose an earlier value or a
+partially applied key change. Redis and redb do not form a distributed
+transaction.
 
-At session startup, the connector simply subscribes with its stable consumer
-name. LightCDC's durable consumer offset is the only delivery authority. A new
-consumer starts at the earliest retained event, while an existing consumer
-resumes after its last cumulative acknowledgement.
+An existing sink resumes after its last durable offset. A newly named sink
+starts at the earliest retained event. Renaming a sink therefore creates a new
+delivery identity rather than renaming its old offset.
 
 ## Configuration
 
-Start LightCDC, Redis, and the connector:
-
-```bash
-docker compose up -d postgres redis
-cargo run -p lightcdc-cli -- run --config lightcdc.example.toml
-cargo run -p lightcdc-redis -- --config redis-connector.example.toml
-```
-
-An invalidation rule deletes every distinct key rendered from the event's key,
-before, and after rows. This also removes both keys when an update changes a
-primary key:
+Define the sink in the main LightCDC configuration under a stream that contains
+every rule table:
 
 ```toml
-[[rules]]
+[[streams]]
+name = "orders"
+source = "default"
+tables = ["public.orders"]
+
+[[sinks]]
+name = "orders-cache"
+stream = "orders"
+batch_max_events = 500
+batch_max_bytes = 16777216
+retry_initial_ms = 250
+retry_max_ms = 15000
+
+[sinks.destination]
+type = "redis"
+url = "redis://127.0.0.1:6379"
+max_commands_per_batch = 10000
+
+[[sinks.destination.rules]]
 table = "public.orders"
 key = "order:{id}"
 action = "invalidate"
 ```
 
-An upsert rule stores the exact JSON `after` row and optionally sets a TTL.
-Deletes still remove the cache key:
+Start all required services and run the combined process:
+
+```bash
+docker compose up -d postgres redis
+cargo run -p lightcdc-cli -- run --config lightcdc.example.toml
+```
+
+An invalidation rule deletes every distinct key rendered from the event's key,
+before, and after rows. This also removes both keys when an update changes a
+primary key. An upsert rule stores the exact JSON `after` row and optionally
+sets a TTL; deletes still remove the key:
 
 ```toml
-[[rules]]
+[[sinks.destination.rules]]
 table = "public.orders"
 key = "tenant:{tenant_id}:order:{id}"
 action = "upsert"
@@ -68,70 +84,47 @@ ttl_seconds = 3600
 ```
 
 PostgreSQL text-format values are JSON strings, so `{id}` renders without JSON
-quotes. Placeholders must resolve to non-null scalar fields. In production,
-put credentials in environment variables or mounted secret files instead of
-TOML:
+quotes. Placeholders must resolve to non-null scalar fields. Configure exactly
+one URL source. Use an environment variable or mounted secret file for
+production credentials:
 
 ```toml
-[lightcdc]
-endpoint = "https://lightcdc.internal:50051"
-stream = "orders"
-consumer = "redis-orders-cache"
-token_file = "/run/secrets/lightcdc-api-token"
-# tls_ca_file = "/run/secrets/lightcdc-ca.pem" # private CA only
-ack_every = 100
-
-[redis]
+[sinks.destination]
+type = "redis"
 url_file = "/run/secrets/redis-url"
+max_commands_per_batch = 10000
 ```
 
-The matching LightCDC API principal only needs permission to consume this
-stream. Routine connector startup does not seek the consumer:
-
-```toml
-[api]
-tls_cert_file = "/run/secrets/lightcdc-server.pem"
-tls_key_file = "/run/secrets/lightcdc-server-key.pem"
-
-[[api.tokens]]
-name = "redis-orders-cache"
-token_file = "/run/secrets/lightcdc-api-token"
-streams = ["orders"]
-```
-
-`ack_every` controls cumulative LightCDC acknowledgements. Every event is still
-applied before the connector handles the next event. A crash can replay up to
-that many already applied events, and their repeated commands converge to the
-same cache state. Keep `ack_every` comfortably below the LightCDC event-retention
-window so an outage during a partial batch cannot expire the last acknowledged
-position.
+`batch_max_events` and `batch_max_bytes` bound source replay. One event can
+expand through multiple rules, so `max_commands_per_batch` independently bounds
+the final Redis pipeline. A batch that exceeds that hard command limit is a
+terminal configuration error and remains unacknowledged.
 
 `redis://` and certificate-verified `rediss://` URLs are supported by the Redis
-client. The initial connector supports one standalone Redis endpoint. Redis
+client. The initial adapter supports one standalone Redis endpoint. Redis
 Cluster and Sentinel topology discovery have not yet been implemented or
 validated.
 
 ## Explicit Limits
 
 - `TRUNCATE` cannot be represented as a bounded per-row cache mutation. A
-  matching truncate stops the connector without ACKing the event.
+  matching truncate stops `run` without advancing the sink offset.
 - An upsert containing an `__unchanged_toast` marker is incomplete and stops
-  without ACK. Use invalidation for tables with large TOASTed values unless a
-  later enrichment layer can fetch the complete row.
-- Cache changes made outside this connector are outside its delivery behavior.
-- LightCDC retention must exceed the longest expected Redis outage. Otherwise a
-  stale connector requires a deliberate cache rebuild and seek.
-- Restoring Redis does not rewind LightCDC. After Redis data loss or a point-in-
-  time restore, flush or rebuild the affected cache and deliberately seek the
-  stopped connector's consumer before restarting it.
-- Redis and LightCDC are not one distributed transaction. A partially applied
-  event is temporarily visible until redelivery repeats all of its retry-safe
-  commands.
+  without advancing the offset. Use invalidation for tables with large TOASTed
+  values unless a later enrichment layer can fetch the complete row.
+- Cache changes made outside this sink are outside its delivery behavior.
+- Retention must exceed the longest expected Redis outage. Otherwise a stale
+  sink requires a deliberate cache rebuild and offset repair.
+- Restoring Redis does not rewind LightCDC. After Redis data loss or a
+  point-in-time restore, flush or rebuild the affected cache and deliberately
+  repair the stopped sink's offset before restarting it.
+- The first runtime is serial per sink to preserve order. Separate configured
+  sinks run concurrently, but one sink does not yet partition a stream across
+  workers.
 
 Run the live duplicate-replay test with:
 
 ```bash
 docker compose up -d redis
-cargo test -p lightcdc-redis \
-  redis_cache_mutations_converge_when_replayed -- --ignored
+cargo test -p lightcdc-redis -- --ignored --test-threads=1
 ```

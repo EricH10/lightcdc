@@ -6,6 +6,36 @@ use tokio::sync::watch;
 
 use crate::ProductionMetrics;
 
+/// Wakes readers after capture durably commits new events.
+#[derive(Clone, Debug)]
+pub struct EventNotifier {
+    sender: watch::Sender<()>,
+}
+
+impl EventNotifier {
+    /// Creates an independent event notification channel.
+    pub fn new() -> Self {
+        let (sender, _receiver) = watch::channel(());
+        Self { sender }
+    }
+
+    /// Signals that readers should check the durable event log again.
+    pub fn notify(&self) {
+        self.sender.send_replace(());
+    }
+
+    /// Creates a receiver that wakes after the next durable capture commit.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.sender.subscribe()
+    }
+}
+
+impl Default for EventNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Stable lifecycle states exposed through readiness and structured logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeState {

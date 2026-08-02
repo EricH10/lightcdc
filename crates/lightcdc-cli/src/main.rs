@@ -18,6 +18,7 @@ mod failure;
 mod logging;
 mod maintenance;
 mod observability;
+mod sinks;
 mod store;
 
 /// Parses CLI arguments and dispatches to the requested command.

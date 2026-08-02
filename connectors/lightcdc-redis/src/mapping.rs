@@ -3,10 +3,8 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, anyhow};
-use lightcdc_api::proto::{ChangeEvent, Operation};
+use lightcdc_core::{ChangeEvent, Operation, RedisCacheAction, RedisCacheRule};
 use serde_json::{Map, Value};
-
-use crate::config::{CacheAction, CacheRule};
 
 /// One retry-safe Redis key mutation performed before LightCDC is acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +21,7 @@ pub(crate) enum CacheMutation {
 
 /// Builds all configured cache mutations for one ordered event.
 pub(crate) fn map_event(
-    rules: &[CacheRule],
+    rules: &[RedisCacheRule],
     event: &ChangeEvent,
 ) -> anyhow::Result<Vec<CacheMutation>> {
     let qualified_table = format!("{}.{}", event.schema, event.table);
@@ -35,10 +33,10 @@ pub(crate) fn map_event(
         return Ok(Vec::new());
     }
 
-    let operation = Operation::try_from(event.operation).unwrap_or(Operation::Unspecified);
-    if matches!(operation, Operation::Truncate | Operation::Unspecified) {
+    let operation = event.operation;
+    if operation == Operation::Truncate {
         return Err(anyhow!(
-            "Redis connector cannot safely map {operation:?} for {qualified_table}; event {} was not acknowledged",
+            "Redis sink cannot safely map {operation:?} for {qualified_table}; event {} was not acknowledged",
             event.sequence
         ));
     }
@@ -49,7 +47,7 @@ pub(crate) fn map_event(
     let mut output = Vec::new();
     for rule in matching {
         match (rule.action, operation) {
-            (CacheAction::Invalidate, _) | (CacheAction::Upsert, Operation::Delete) => {
+            (RedisCacheAction::Invalidate, _) | (RedisCacheAction::Upsert, Operation::Delete) => {
                 let keys = render_distinct_keys(rule, [&key, &before, &after])?;
                 if keys.is_empty() {
                     return Err(anyhow!(
@@ -60,7 +58,7 @@ pub(crate) fn map_event(
                 }
                 output.extend(keys.into_iter().map(|key| CacheMutation::Delete { key }));
             }
-            (CacheAction::Upsert, Operation::Insert | Operation::Update) => {
+            (RedisCacheAction::Upsert, Operation::Insert | Operation::Update) => {
                 let after_row = after.as_ref().ok_or_else(|| {
                     anyhow!(
                         "event {} needs an after row for Redis upsert rule {:?}",
@@ -86,7 +84,9 @@ pub(crate) fn map_event(
                     ttl_seconds: rule.ttl_seconds,
                 });
             }
-            (CacheAction::Upsert, _) => unreachable!("unsupported operations returned above"),
+            (RedisCacheAction::Upsert, _) => {
+                unreachable!("unsupported operations returned above")
+            }
         }
     }
     Ok(output)
@@ -122,7 +122,7 @@ fn parse_object(
 }
 
 fn render_distinct_keys<'a>(
-    rule: &CacheRule,
+    rule: &RedisCacheRule,
     rows: impl IntoIterator<Item = &'a Option<Map<String, Value>>>,
 ) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::new();
@@ -178,14 +178,16 @@ fn render_key(template: &str, row: &Map<String, Value>) -> anyhow::Result<String
 
 #[cfg(test)]
 mod tests {
+    use lightcdc_core::SourceMetadata;
+
     use super::*;
 
-    fn rule(action: CacheAction) -> CacheRule {
-        CacheRule {
+    fn rule(action: RedisCacheAction) -> RedisCacheRule {
+        RedisCacheRule {
             table: "public.orders".to_owned(),
             key: "tenant:{tenant_id}:order:{id}".to_owned(),
             action,
-            ttl_seconds: (action == CacheAction::Upsert).then_some(60),
+            ttl_seconds: (action == RedisCacheAction::Upsert).then_some(60),
         }
     }
 
@@ -198,11 +200,15 @@ mod tests {
         ChangeEvent {
             sequence: 42,
             event_id: "event".to_owned(),
-            source: None,
+            source: SourceMetadata {
+                database: "postgres".to_owned(),
+                slot: "lightcdc".to_owned(),
+                lsn: "0/2A".to_owned(),
+            },
             transaction: None,
             schema: "public".to_owned(),
             table: "orders".to_owned(),
-            operation: operation as i32,
+            operation,
             key: key.map(str::as_bytes).map(ToOwned::to_owned),
             before: before.map(str::as_bytes).map(ToOwned::to_owned),
             after: after.map(str::as_bytes).map(ToOwned::to_owned),
@@ -220,7 +226,7 @@ mod tests {
         );
 
         assert_eq!(
-            map_event(&[rule(CacheAction::Invalidate)], &event).expect("map event"),
+            map_event(&[rule(RedisCacheAction::Invalidate)], &event).expect("map event"),
             [
                 CacheMutation::Delete {
                     key: "tenant:a:order:1".to_owned()
@@ -241,7 +247,7 @@ mod tests {
             Some(r#"{"tenant_id":"a","id":"2","status":"paid"}"#),
         );
 
-        let mutations = map_event(&[rule(CacheAction::Upsert)], &event).expect("map event");
+        let mutations = map_event(&[rule(RedisCacheAction::Upsert)], &event).expect("map event");
         assert_eq!(mutations.len(), 2);
         assert_eq!(
             mutations[0],
@@ -260,7 +266,7 @@ mod tests {
     fn truncate_is_terminal_and_remains_unacknowledged() {
         let event = event(Operation::Truncate, None, None, None);
         assert!(
-            map_event(&[rule(CacheAction::Invalidate)], &event)
+            map_event(&[rule(RedisCacheAction::Invalidate)], &event)
                 .expect_err("truncate must stop")
                 .to_string()
                 .contains("was not acknowledged")
@@ -277,7 +283,7 @@ mod tests {
         );
 
         assert!(
-            map_event(&[rule(CacheAction::Upsert)], &event)
+            map_event(&[rule(RedisCacheAction::Upsert)], &event)
                 .expect_err("incomplete row must stop")
                 .to_string()
                 .contains("unchanged TOAST")

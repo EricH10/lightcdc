@@ -36,7 +36,7 @@ jobs:
       - run: cargo test -p lightcdc-redis --locked -- --ignored --test-threads=1
       - if: always()
         run: docker compose down --volumes
-      - run: cargo build --locked --release --bin lightcdc --bin lightcdc-redis
+      - run: cargo build --locked --release --bin lightcdc
       - name: Package release
         shell: bash
         run: |
@@ -45,7 +45,6 @@ jobs:
           archive="lightcdc-${version}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/${archive}"
           install -m 0755 target/release/lightcdc "dist/${archive}/lightcdc"
-          install -m 0755 target/release/lightcdc-redis "dist/${archive}/lightcdc-redis"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
           pushd dist

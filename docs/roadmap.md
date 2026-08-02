@@ -132,7 +132,7 @@ them has optional work remaining.
   allowlists, constant-time token checks, and separate seek permission.
 - Load passwords, keys, and tokens from environment variables or secret files;
   avoid requiring plaintext secrets in the main TOML file. DONE for PostgreSQL,
-  the gRPC API, and the Redis connector.
+  the gRPC API, and configured in-process sinks.
 - Sanitize external gRPC errors so storage paths, database details, and internal
   failures are logged server-side without being returned to untrusted clients.
   DONE for internal storage failures.

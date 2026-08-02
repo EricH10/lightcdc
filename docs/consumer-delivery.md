@@ -2,7 +2,8 @@
 
 LightCDC currently gives each `(stream, consumer)` pair one ordered, durable
 cursor. The consumer name is chosen by the downstream application or its
-operator and should remain stable across restarts.
+operator and should remain stable across restarts. Names beginning with `sink:`
+are reserved for configured in-process sinks.
 
 ## Current Model
 

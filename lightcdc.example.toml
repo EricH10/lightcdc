@@ -68,3 +68,23 @@ tables = ["public.orders"]
 name = "all"
 source = "default"
 tables = ["*"]
+
+# Built-in sinks run inside `lightcdc run` and keep their own durable offset.
+[[sinks]]
+name = "orders-cache"
+stream = "orders"
+batch_max_events = 500
+batch_max_bytes = 16777216
+retry_initial_ms = 250
+retry_max_ms = 15000
+
+[sinks.destination]
+type = "redis"
+url = "redis://127.0.0.1:6379"
+# Use url_env or url_file instead of url for production credentials.
+max_commands_per_batch = 10000
+
+[[sinks.destination.rules]]
+table = "public.orders"
+key = "order:{id}"
+action = "invalidate"

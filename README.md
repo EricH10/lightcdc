@@ -15,7 +15,7 @@ See [`docs/consumer-delivery.md`](docs/consumer-delivery.md) for the current
 ordered consumer and acknowledgement contract.
 
 See [`docs/redis-connector.md`](docs/redis-connector.md) for the optional,
-crash-safe Redis cache invalidation and update connector.
+in-process Redis cache invalidation and update sink.
 
 See [`docs/postgres-support.md`](docs/postgres-support.md) for the PostgreSQL 17
 feature matrix, change-only bootstrap boundary, and least-privilege role.
@@ -56,9 +56,9 @@ docker build -t lightcdc:0.1.0 .
 docker run --rm lightcdc:0.1.0 --version
 ```
 
-The image runs as UID/GID 10001 and contains both `lightcdc` and the optional
-`lightcdc-redis` connector. Production deployment requires a read-only config
-mount, mounted secrets, and a persistent `/var/lib/lightcdc` volume. Set
+The image runs as UID/GID 10001 and includes built-in sink adapters in the
+`lightcdc` binary. Production deployment requires a read-only config mount,
+mounted secrets, and a persistent `/var/lib/lightcdc` volume. Set
 `storage.data_dir = "/var/lib/lightcdc"` in the mounted configuration. The
 complete command, signal, health, and supported-platform contract is in the
 operations runbook.
@@ -335,15 +335,15 @@ cargo run -p lightcdc-api --example consumer -- \
   --limit 32
 ```
 
-Run the Redis cache connector:
+Run capture, gRPC, and the configured Redis sink in one process:
 
 ```bash
 docker compose up -d redis
-cargo run -p lightcdc-redis -- --config redis-connector.example.toml
+cargo run -p lightcdc-cli -- run --config lightcdc.example.toml
 ```
 
-The connector applies ordered, retry-safe Redis mutations before acknowledging
-its named LightCDC consumer. See the connector guide for invalidation, upsert,
+The sink applies ordered, retry-safe Redis mutations before advancing its
+durable offset. See the sink guide for configuration, invalidation, upsert,
 redelivery, and retention behavior.
 
 Run checks:

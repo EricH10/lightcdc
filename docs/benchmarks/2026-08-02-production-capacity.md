@@ -177,7 +177,7 @@ The focused failure and filtering commands are documented in
   requires restart or offline restore; it does not provide automatic failover.
 - The supported profile does not include Redis Cluster, shared consumer groups,
   built-in snapshots, or transaction-parallel delivery.
-- The Redis connector is an independent ordered consumer. Its own Redis latency,
+- The Redis sink is an independent ordered worker. Its own Redis latency,
   operation mix, key size, and retry behavior must be capacity-tested against
   the target Redis deployment.
 - Larger values and incompressible payloads consume the byte limits earlier.

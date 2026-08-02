@@ -1126,6 +1126,7 @@ dependencies = [
  "lightcdc-api",
  "lightcdc-core",
  "lightcdc-postgres",
+ "lightcdc-redis",
  "lightcdc-runtime",
  "lightcdc-storage",
  "serde",
@@ -1171,18 +1172,12 @@ name = "lightcdc-redis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "lightcdc-api",
+ "lightcdc-core",
+ "lightcdc-runtime",
  "redis",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.19",
  "tokio",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
