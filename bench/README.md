@@ -88,6 +88,45 @@ The generated payload is intentionally compressible. Add an incompressible
 payload scenario before using these results to size TOAST-heavy production
 traffic.
 
+Exercise repeated logical-replication disconnects during a 10k events/second
+workload with:
+
+```bash
+TERMINATIONS=10 bench/run-reconnect-storm.sh
+```
+
+The fault runner terminates only PostgreSQL's active logical-replication
+backend. It succeeds when LightCDC reconnects after every fault and generated,
+captured, and consumed event totals converge exactly with no dropped capture
+samples.
+
+Exercise an abrupt LightCDC process kill while PostgreSQL continues writing:
+
+```bash
+bench/run-process-restart.sh
+```
+
+The replacement process reopens the same redb data directory and resumes from
+the durable source LSN. The benchmark consumer reconnects with its existing
+name, counts redeliveries separately, and verifies that unique stored and
+consumed sequences exactly match successful source transactions.
+
+Exercise the configured storage ceiling during active capture with:
+
+```bash
+bench/run-disk-pressure.sh
+```
+
+The runner uses a deliberately impossible free-space reserve and succeeds only
+when capture stops with a resource-limit error before acknowledging additional
+PostgreSQL WAL. This safely exercises the disk-pressure boundary without
+filling the development machine; it is not a throughput benchmark.
+
+Use `WORKLOAD=mixed` to write both captured and unrelated rows in every source
+transaction, or `WORKLOAD=unrelated` to write only the broad publication table
+that no configured stream selects. `UNRELATED_ROWS_PER_TRANSACTION` controls
+the unrelated side independently.
+
 To prove that a healthy consumer remains current while a slow consumer crosses
 the retained replay window, run a multi-consumer test with a processing delay:
 

@@ -29,6 +29,9 @@ pub(crate) struct LightCdcConfig {
     pub(crate) token_file: Option<String>,
     /// Optional PEM CA bundle for a private LightCDC gRPC certificate.
     pub(crate) tls_ca_file: Option<String>,
+    /// Applied events per cumulative LightCDC acknowledgement.
+    #[serde(default = "default_ack_every")]
+    pub(crate) ack_every: u64,
     #[serde(default = "default_reconnect_initial_ms")]
     pub(crate) reconnect_initial_ms: u64,
     #[serde(default = "default_reconnect_max_ms")]
@@ -144,6 +147,9 @@ impl ConnectorConfig {
                 "reconnect delays must be nonzero and reconnect_max_ms must be at least reconnect_initial_ms"
             ));
         }
+        if self.lightcdc.ack_every == 0 {
+            return Err(anyhow!("lightcdc.ack_every must be greater than zero"));
+        }
         if self.rules.is_empty() {
             return Err(anyhow!("at least one Redis cache rule is required"));
         }
@@ -188,6 +194,10 @@ impl ConnectorConfig {
     }
 }
 
+fn default_ack_every() -> u64 {
+    100
+}
+
 fn default_reconnect_initial_ms() -> u64 {
     250
 }
@@ -227,6 +237,7 @@ mod tests {
             config.progress_key(),
             "lightcdc:redis:orders:redis-cache:offset"
         );
+        assert_eq!(config.lightcdc.ack_every, 100);
     }
 
     #[test]

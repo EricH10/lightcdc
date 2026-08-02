@@ -33,7 +33,7 @@ jobs:
       - run: cargo test --workspace --release --locked
       - run: docker compose up --detach --wait postgres redis
       - run: cargo test -p lightcdc-cli --test capture_integration --locked -- --ignored --test-threads=1
-      - run: cargo test -p lightcdc-redis --locked redis_progress_and_cache_mutation_are_atomic_and_idempotent -- --ignored
+      - run: cargo test -p lightcdc-redis --locked -- --ignored --test-threads=1
       - if: always()
         run: docker compose down --volumes
       - run: cargo build --locked --release --bin lightcdc --bin lightcdc-redis

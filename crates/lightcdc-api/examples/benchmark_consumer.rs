@@ -65,6 +65,7 @@ struct ConsumerStats {
     events_total: u64,
     payload_bytes_total: u64,
     acknowledgements_total: u64,
+    redeliveries_total: u64,
     interval_events: u64,
     interval_payload_bytes: u64,
     last_sequence: u64,
@@ -84,6 +85,7 @@ impl ConsumerStats {
             events_total: 0,
             payload_bytes_total: 0,
             acknowledgements_total: 0,
+            redeliveries_total: 0,
             interval_events: 0,
             interval_payload_bytes: 0,
             last_sequence: 0,
@@ -147,6 +149,7 @@ impl ConsumerStats {
             "events_total": self.events_total,
             "payload_bytes_total": self.payload_bytes_total,
             "acknowledgements_total": self.acknowledgements_total,
+            "redeliveries_total": self.redeliveries_total,
             "last_sequence": self.last_sequence,
             "missing_commit_timestamps_total": self.missing_commit_timestamps,
             "clock_skew_samples_total": self.clock_skew_samples,
@@ -181,18 +184,7 @@ async fn main() -> Result<()> {
     }
 
     let mut writer = open_metrics_file(&args.metrics_file)?;
-    let mut client = connect_with_retry(&args.endpoint).await?;
-    let mut ack_client = client.clone();
-    seek_consumer(&mut client, &args).await?;
-    let mut events = client
-        .subscribe(SubscribeRequest {
-            stream: args.stream.clone(),
-            consumer: args.consumer.clone(),
-            limit: 0,
-        })
-        .await
-        .context("subscribe to benchmark stream")?
-        .into_inner();
+    let (mut ack_client, mut events) = open_subscription_with_retry(&args, true).await?;
 
     let mut stats = ConsumerStats::new()?;
     let mut report_tick = interval(Duration::from_secs(args.report_interval_seconds));
@@ -200,43 +192,61 @@ async fn main() -> Result<()> {
     let deadline = sleep(Duration::from_secs(args.duration_seconds));
     tokio::pin!(deadline);
     let mut unacknowledged = 0_u64;
+    let mut last_delivered_sequence = 0_u64;
 
     loop {
         tokio::select! {
             _ = &mut deadline => break,
             _ = report_tick.tick() => stats.write_report(&mut writer, false)?,
-            event = events.message() => {
-                let Some(event) = event.context("receive benchmark event")? else {
-                    break;
-                };
-                stats.record_event(&event);
-                unacknowledged += 1;
+            event = events.message() => match event {
+                Ok(Some(event)) => {
+                    if event.sequence > stats.last_sequence {
+                        stats.record_event(&event);
+                    } else {
+                        stats.redeliveries_total += 1;
+                    }
+                    unacknowledged += 1;
+                    last_delivered_sequence = event.sequence;
 
-                if args.processing_delay_micros > 0 {
-                    sleep(Duration::from_micros(args.processing_delay_micros)).await;
+                    if args.processing_delay_micros > 0 {
+                        sleep(Duration::from_micros(args.processing_delay_micros)).await;
+                    }
+
+                    if unacknowledged >= args.ack_every {
+                        let latency = acknowledge(
+                            &mut ack_client,
+                            &args.stream,
+                            &args.consumer,
+                            event.sequence,
+                        )
+                        .await?;
+                        stats.record_acknowledgement(latency);
+                        unacknowledged = 0;
+                    }
                 }
-
-                if unacknowledged >= args.ack_every {
-                    let latency = acknowledge(
-                        &mut ack_client,
-                        &args.stream,
-                        &args.consumer,
-                        event.sequence,
-                    )
-                    .await?;
-                    stats.record_acknowledgement(latency);
+                Ok(None) => {
+                    eprintln!("lightcdc closed the benchmark stream; reconnecting");
+                    (ack_client, events) = open_subscription_with_retry(&args, false).await?;
                     unacknowledged = 0;
+                    last_delivered_sequence = 0;
                 }
+                Err(status) if transient_status(&status) => {
+                    eprintln!("benchmark stream interrupted: {status}; reconnecting");
+                    (ack_client, events) = open_subscription_with_retry(&args, false).await?;
+                    unacknowledged = 0;
+                    last_delivered_sequence = 0;
+                }
+                Err(status) => return Err(status).context("receive benchmark event"),
             }
         }
     }
 
-    if unacknowledged > 0 && stats.last_sequence > 0 {
+    if unacknowledged > 0 && last_delivered_sequence > 0 {
         let latency = acknowledge(
             &mut ack_client,
             &args.stream,
             &args.consumer,
-            stats.last_sequence,
+            last_delivered_sequence,
         )
         .await?;
         stats.record_acknowledgement(latency);
@@ -245,19 +255,76 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Retries startup connection briefly so benchmark processes can launch together.
-async fn connect_with_retry(endpoint: &str) -> Result<LightCdcClient<tonic::transport::Channel>> {
+/// Retries the complete connection and subscription handshake after transient failures.
+async fn open_subscription_with_retry(
+    args: &Args,
+    apply_initial_seek: bool,
+) -> Result<(
+    LightCdcClient<tonic::transport::Channel>,
+    tonic::Streaming<ChangeEvent>,
+)> {
     let started = Instant::now();
     loop {
-        match LightCdcClient::connect(endpoint.to_owned()).await {
-            Ok(client) => return Ok(client),
-            Err(error) if started.elapsed() < Duration::from_secs(15) => {
-                eprintln!("waiting for lightcdc at {endpoint}: {error}");
+        match open_subscription(args, apply_initial_seek).await {
+            Ok(subscription) => return Ok(subscription),
+            Err(error)
+                if transient_subscription_error(&error)
+                    && started.elapsed() < Duration::from_secs(15) =>
+            {
+                eprintln!("waiting for LightCDC subscription: {error:#}");
                 sleep(Duration::from_millis(100)).await;
             }
-            Err(error) => return Err(error).with_context(|| format!("connect to {endpoint}")),
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// Opens one subscription session and optionally applies the configured initial seek.
+async fn open_subscription(
+    args: &Args,
+    apply_initial_seek: bool,
+) -> Result<(
+    LightCdcClient<tonic::transport::Channel>,
+    tonic::Streaming<ChangeEvent>,
+)> {
+    let mut client = LightCdcClient::connect(args.endpoint.clone())
+        .await
+        .with_context(|| format!("connect to {}", args.endpoint))?;
+    if apply_initial_seek {
+        seek_consumer(&mut client, args).await?;
+    }
+    let ack_client = client.clone();
+    let events = client
+        .subscribe(SubscribeRequest {
+            stream: args.stream.clone(),
+            consumer: args.consumer.clone(),
+            limit: 0,
+        })
+        .await
+        .context("subscribe to benchmark stream")?
+        .into_inner();
+    Ok((ack_client, events))
+}
+
+/// Identifies transport and temporary server statuses that preserve replay safety.
+fn transient_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Unavailable
+    )
+}
+
+fn transient_subscription_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(transient_status)
+        || error.downcast_ref::<tonic::transport::Error>().is_some()
 }
 
 /// Applies the requested initial consumer offset before subscribing.

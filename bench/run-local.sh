@@ -10,6 +10,7 @@ CLIENTS="${CLIENTS:-8}"
 THREADS="${THREADS:-4}"
 RATE="${RATE:-0}"
 ROWS_PER_TRANSACTION="${ROWS_PER_TRANSACTION:-1}"
+UNRELATED_ROWS_PER_TRANSACTION="${UNRELATED_ROWS_PER_TRANSACTION:-$ROWS_PER_TRANSACTION}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-256}"
 ACK_EVERY="${ACK_EVERY:-5000}"
 CONSUMER_COUNT="${CONSUMER_COUNT:-1}"
@@ -17,6 +18,8 @@ SLOW_CONSUMER_DELAY_MICROS="${SLOW_CONSUMER_DELAY_MICROS:-0}"
 EXPECTED_SLOW_CONSUMER_EXPIRATION="${EXPECTED_SLOW_CONSUMER_EXPIRATION:-false}"
 CAPTURE_BATCH_MAX_EVENTS="${CAPTURE_BATCH_MAX_EVENTS:-1000}"
 CAPTURE_BATCH_MAX_DELAY_MS="${CAPTURE_BATCH_MAX_DELAY_MS:-20}"
+MAX_STORAGE_BYTES="${MAX_STORAGE_BYTES:-107374182400}"
+MIN_FREE_DISK_BYTES="${MIN_FREE_DISK_BYTES:-1073741824}"
 WORKLOAD="${WORKLOAD:-insert}"
 PRELOAD_ROWS="${PRELOAD_ROWS:-100000}"
 PGHOST="${PGHOST:-localhost}"
@@ -31,6 +34,8 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RESULT_DIR="$RESULTS_ROOT/$RUN_ID"
 DATA_DIR="$ROOT/bench/.data"
 RUN_CONFIG="$RESULT_DIR/lightcdc.toml"
+PGBENCH_RUN_KEY="${RUN_ID//[^a-zA-Z0-9_.-]/_}"
+PGBENCH_PID_FILE="/tmp/lightcdc-pgbench-$PGBENCH_RUN_KEY.pid"
 
 export PGPASSWORD
 
@@ -61,22 +66,50 @@ db_psql() {
 
 db_pgbench() {
     local script="$1"
+    local status=0
     shift
     if [[ "$USE_DOCKER_CLIENTS" == "true" ]]; then
         docker exec -i -e "PGPASSWORD=$PGPASSWORD" "$POSTGRES_CONTAINER" \
-            pgbench "$@" --file - <"$script"
+            sh -c 'pid_file=$1; shift; echo $$ >"$pid_file"; exec pgbench "$@" --file -' \
+            sh "$PGBENCH_PID_FILE" "$@" <"$script" || status=$?
+        stop_container_pgbench
     else
-        pgbench "$@" --file "$script"
+        pgbench "$@" --file "$script" || status=$?
     fi
+    return "$status"
+}
+
+stop_container_pgbench() {
+    if [[ "$USE_DOCKER_CLIENTS" != "true" ]]; then
+        return
+    fi
+    docker exec "$POSTGRES_CONTAINER" sh -c '
+        pid_file=$1
+        if [ -f "$pid_file" ]; then
+            pid=$(cat "$pid_file")
+            if [ -r "/proc/$pid/comm" ] && [ "$(cat "/proc/$pid/comm")" = pgbench ]; then
+                kill -TERM "$pid" 2>/dev/null || true
+            fi
+            rm -f "$pid_file"
+        fi
+    ' sh "$PGBENCH_PID_FILE" >/dev/null 2>&1 || true
 }
 
 case "$WORKLOAD" in
-    insert|update) ;;
+    insert|update|mixed|unrelated) ;;
     *)
-        echo "WORKLOAD must be insert or update" >&2
+        echo "WORKLOAD must be insert, update, mixed, or unrelated" >&2
         exit 1
         ;;
 esac
+if ! [[ "$ROWS_PER_TRANSACTION" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ROWS_PER_TRANSACTION must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "$UNRELATED_ROWS_PER_TRANSACTION" =~ ^[1-9][0-9]*$ ]]; then
+    echo "UNRELATED_ROWS_PER_TRANSACTION must be a positive integer" >&2
+    exit 1
+fi
 if ! [[ "$CONSUMER_COUNT" =~ ^[1-9][0-9]*$ ]]; then
     echo "CONSUMER_COUNT must be a positive integer" >&2
     exit 1
@@ -103,6 +136,8 @@ rm -rf "$DATA_DIR"
 awk \
     -v max_events="$CAPTURE_BATCH_MAX_EVENTS" \
     -v max_delay_ms="$CAPTURE_BATCH_MAX_DELAY_MS" \
+    -v max_storage_bytes="$MAX_STORAGE_BYTES" \
+    -v min_free_disk_bytes="$MIN_FREE_DISK_BYTES" \
     '
         /^capture_batch_max_events =/ {
             print "capture_batch_max_events = " max_events
@@ -110,6 +145,14 @@ awk \
         }
         /^capture_batch_max_delay_ms =/ {
             print "capture_batch_max_delay_ms = " max_delay_ms
+            next
+        }
+        /^max_storage_bytes =/ {
+            print "max_storage_bytes = " max_storage_bytes
+            next
+        }
+        /^min_free_disk_bytes =/ {
+            print "min_free_disk_bytes = " min_free_disk_bytes
             next
         }
         { print }
@@ -121,14 +164,24 @@ CONSUMER_PIDS=()
 SAMPLER_PID=""
 
 cleanup() {
-    for pid in "$SAMPLER_PID" "${CONSUMER_PIDS[@]}" "$LIGHTCDC_PID"; do
+    stop_container_pgbench
+    for pid in "$SAMPLER_PID" "$LIGHTCDC_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi
     done
+    if [[ "${#CONSUMER_PIDS[@]}" -gt 0 ]]; then
+        for pid in "${CONSUMER_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 cat >"$RESULT_DIR/environment.txt" <<EOF
 run_id=$RUN_ID
@@ -145,6 +198,7 @@ clients=$CLIENTS
 threads=$THREADS
 rate=$RATE
 rows_per_transaction=$ROWS_PER_TRANSACTION
+unrelated_rows_per_transaction=$UNRELATED_ROWS_PER_TRANSACTION
 payload_bytes=$PAYLOAD_BYTES
 ack_every=$ACK_EVERY
 consumer_count=$CONSUMER_COUNT
@@ -152,6 +206,8 @@ slow_consumer_delay_micros=$SLOW_CONSUMER_DELAY_MICROS
 expected_slow_consumer_expiration=$EXPECTED_SLOW_CONSUMER_EXPIRATION
 capture_batch_max_events=$CAPTURE_BATCH_MAX_EVENTS
 capture_batch_max_delay_ms=$CAPTURE_BATCH_MAX_DELAY_MS
+max_storage_bytes=$MAX_STORAGE_BYTES
+min_free_disk_bytes=$MIN_FREE_DISK_BYTES
 workload=$WORKLOAD
 preload_rows=$PRELOAD_ROWS
 EOF
@@ -234,6 +290,7 @@ target/release/lightcdc run \
     --metrics-file "$RESULT_DIR/capture.jsonl" \
     >"$RESULT_DIR/lightcdc.log" 2>&1 &
 LIGHTCDC_PID=$!
+printf '%s\n' "$LIGHTCDC_PID" >"$RESULT_DIR/lightcdc.pid"
 
 for _ in $(seq 1 150); do
     if ! kill -0 "$LIGHTCDC_PID" 2>/dev/null; then
@@ -332,6 +389,7 @@ PGBENCH_ARGS=(
     --progress 1
     --progress-timestamp
     --define "rows_per_transaction=$ROWS_PER_TRANSACTION"
+    --define "unrelated_rows_per_transaction=$UNRELATED_ROWS_PER_TRANSACTION"
     --define "payload_bytes=$PAYLOAD_BYTES"
 )
 

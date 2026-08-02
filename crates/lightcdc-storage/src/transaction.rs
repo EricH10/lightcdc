@@ -744,6 +744,35 @@ mod tests {
     }
 
     #[test]
+    fn truncated_staging_record_is_rejected() {
+        let temp = TempDir::new().expect("temp dir");
+        let options = TransactionBufferOptions::bounded(temp.path(), "source", 1, 1_000_000, 10);
+        let mut buffer = TransactionBuffer::new(options).expect("buffer");
+        buffer.begin(42).expect("begin");
+        buffer.push(event(1)).expect("event");
+        let events = buffer.finish().expect("finish");
+        let TransactionEvents::Staged(staged) = &events else {
+            panic!("expected staged events");
+        };
+        let length = fs::metadata(staged.path()).expect("staging metadata").len();
+        OpenOptions::new()
+            .write(true)
+            .open(staged.path())
+            .expect("open staging file")
+            .set_len(length - 1)
+            .expect("truncate staging file");
+
+        let error = events
+            .iter()
+            .expect("valid staging header")
+            .next()
+            .expect("one staged record")
+            .expect_err("truncated record must fail");
+
+        assert!(matches!(error, TransactionBufferError::Io(_)));
+    }
+
+    #[test]
     fn startup_removes_only_source_scoped_orphan_files() {
         let temp = TempDir::new().expect("temp dir");
         let options = TransactionBufferOptions::bounded(temp.path(), "source", 1, 1_000_000, 10);
@@ -804,6 +833,31 @@ mod tests {
     }
 
     #[test]
+    fn hard_event_limit_accepts_the_exact_boundary() {
+        let options = TransactionBufferOptions {
+            staging_dir: None,
+            memory_threshold_bytes: u64::MAX,
+            max_transaction_bytes: u64::MAX,
+            max_transaction_events: 2,
+            min_free_disk_bytes: 0,
+        };
+        let mut buffer = TransactionBuffer::new(options).expect("buffer");
+        buffer.begin(42).expect("begin");
+
+        buffer.push(event(1)).expect("first event");
+        buffer.push(event(2)).expect("event at exact limit");
+        let error = buffer.push(event(3)).expect_err("event above limit");
+
+        assert!(matches!(
+            error,
+            TransactionBufferError::EventLimitExceeded {
+                attempted: 3,
+                maximum: 2
+            }
+        ));
+    }
+
+    #[test]
     fn hard_byte_limit_rejects_the_transaction_before_staging() {
         let temp = TempDir::new().expect("temp dir");
         let options = TransactionBufferOptions::bounded(temp.path(), "source", 1, 1, 10);
@@ -815,6 +869,31 @@ mod tests {
         assert!(matches!(
             error,
             TransactionBufferError::ByteLimitExceeded { maximum: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn hard_byte_limit_accepts_the_exact_boundary() {
+        let temp = TempDir::new().expect("temp dir");
+        let candidate = event(1);
+        let maximum = estimated_decoded_bytes(&candidate).max(
+            STAGING_HEADER_BYTES
+                + RECORD_LENGTH_BYTES
+                + serde_json::to_vec(&candidate).expect("encode event").len() as u64,
+        );
+        let options = TransactionBufferOptions::bounded(temp.path(), "source", 0, maximum, 10);
+        let mut buffer = TransactionBuffer::new(options).expect("buffer");
+        buffer.begin(42).expect("begin");
+
+        buffer.push(candidate).expect("event at exact byte limit");
+        let error = buffer.push(event(2)).expect_err("event above byte limit");
+
+        assert!(matches!(
+            error,
+            TransactionBufferError::ByteLimitExceeded {
+                maximum: found,
+                ..
+            } if found == maximum
         ));
     }
 

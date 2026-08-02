@@ -6,6 +6,11 @@ public gRPC API and does not run inside PostgreSQL capture. A Redis outage can
 therefore make this consumer lag without stopping WAL capture or other
 consumers.
 
+The connector handles SIGINT and SIGTERM, stops between atomic event
+applications, and exits successfully. If it is killed after Redis commits but
+before LightCDC records the ACK, the same sequence is safely replayed as
+described below.
+
 ## Delivery Safety
 
 For each event, the connector runs one Redis Lua script that atomically:
@@ -20,6 +25,8 @@ causes redelivery. The Lua script observes the sequence already in Redis, skips
 the duplicate mutation, and allows the connector to ACK it again. Sequence
 values are stored as zero-padded decimal strings so comparison remains exact
 across the full `u64` range instead of using Lua's floating-point numbers.
+Noncanonical progress values and cache rules that resolve to the reserved
+progress key stop before mutation rather than risking ambiguous ordering.
 
 At session startup, the connector seeks its named LightCDC consumer to the
 Redis-side sequence. This makes Redis the authority for whether a cache event
@@ -71,6 +78,7 @@ stream = "orders"
 consumer = "redis-orders-cache"
 token_file = "/run/secrets/lightcdc-api-token"
 # tls_ca_file = "/run/secrets/lightcdc-ca.pem" # private CA only
+ack_every = 100
 
 [redis]
 url_file = "/run/secrets/redis-url"
@@ -91,6 +99,13 @@ token_file = "/run/secrets/lightcdc-api-token"
 streams = ["orders"]
 allow_seek = true
 ```
+
+`ack_every` controls cumulative LightCDC acknowledgements, not Redis mutation
+durability. Every event is still applied together with its Redis progress before
+the connector handles the next event. A crash can replay up to that many events,
+which the progress comparison skips idempotently. Keep `ack_every` comfortably
+below the LightCDC event-retention window so an outage during a partial batch
+cannot expire the last acknowledged position.
 
 `redis://` and certificate-verified `rediss://` URLs are supported by the Redis
 client. The initial connector supports one standalone Redis deployment; Redis

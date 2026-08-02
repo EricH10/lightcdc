@@ -594,7 +594,7 @@ async fn connect_sql(
     source: &SourceConfig,
     purpose: &'static str,
 ) -> Result<(Client, JoinHandle<()>), PostgresError> {
-    let config: tokio_postgres::Config = source.connection_string().parse()?;
+    let config = sql_config(source);
     match source.tls_mode {
         PostgresTlsMode::Disable => {
             let (client, connection) = config.connect(NoTls).await?;
@@ -617,6 +617,18 @@ async fn connect_sql(
             Ok((client, task))
         }
     }
+}
+
+/// Builds SQL connection settings without reparsing operator-controlled values.
+fn sql_config(source: &SourceConfig) -> tokio_postgres::Config {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&source.host)
+        .port(source.port)
+        .dbname(&source.database)
+        .user(&source.user)
+        .password(&source.password);
+    config
 }
 
 fn sql_tls_connector(source: &SourceConfig) -> Result<MakeRustlsConnect, PostgresError> {
@@ -1076,8 +1088,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, sql_tls_connector,
-        validate_resume_lsn,
+        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, sql_config,
+        sql_tls_connector, validate_resume_lsn,
     };
 
     #[test]
@@ -1098,6 +1110,31 @@ mod tests {
             ))
             .is_retryable()
         );
+    }
+
+    #[test]
+    fn sql_config_preserves_operator_values_without_reparsing() {
+        let source = SourceConfig {
+            name: "default".to_owned(),
+            host: "postgres.internal".to_owned(),
+            port: 5432,
+            database: "light cdc".to_owned(),
+            user: "capture user".to_owned(),
+            password: "secret host=attacker password='other'".to_owned(),
+            password_env: None,
+            password_file: None,
+            tls_mode: PostgresTlsMode::VerifyFull,
+            tls_ca_file: None,
+            publication: "lightcdc_publication".to_owned(),
+            slot: "lightcdc_slot".to_owned(),
+        };
+
+        let config = sql_config(&source);
+
+        assert_eq!(config.get_user(), Some(source.user.as_str()));
+        assert_eq!(config.get_password(), Some(source.password.as_bytes()));
+        assert_eq!(config.get_dbname(), Some(source.database.as_str()));
+        assert_eq!(config.get_ports(), [source.port]);
     }
 
     #[test]

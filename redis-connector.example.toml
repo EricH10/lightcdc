@@ -5,6 +5,7 @@ consumer = "redis-orders-cache"
 # token_env = "LIGHTCDC_API_TOKEN"
 # token_file = "/run/secrets/lightcdc-api-token"
 # tls_ca_file = "/run/secrets/lightcdc-ca.pem"
+ack_every = 100
 reconnect_initial_ms = 250
 reconnect_max_ms = 15000
 

@@ -68,8 +68,12 @@ them has optional work remaining.
   newer file byte-for-byte unchanged before opening redb or running migrations.
 - Test the no-loss boundary across process kill, host restart, PostgreSQL
   restart, network interruption, storage failure, retention, and supported
-  schema changes. PARTIAL: process, reconnect, transaction, retention, and
-  selected schema-change boundaries are covered.
+  schema changes. DONE for the single-node release boundary with pre/post-commit
+  process kills, same-store process restart under load, repeated replication
+  backend termination, atomic storage-limit rejection with retained WAL,
+  retention, and supported schema-change tests. Full-machine power loss is not
+  injected in CI; offline integrity/restore plus same-store restart are the
+  documented recovery boundary.
 
 ### Recovery and Resource Safety
 
@@ -182,17 +186,30 @@ them has optional work remaining.
 
 - Establish a supported capacity envelope by payload size, source transaction
   size, retention window, consumer count, acknowledgement frequency, and disk.
+  DONE for the conservative single-node 10k events/second profile in
+  `docs/benchmarks/2026-08-02-production-capacity.md`; higher rates require
+  target-system validation.
 - Run multi-hour soak tests with retention active and verify bounded memory,
   bounded allocated disk, stable latency, no sequence gaps, and no growing
-  PostgreSQL WAL lag.
+  PostgreSQL WAL lag. ACCEPTED LIMITATION: the operator ended the sustained run
+  after 48 minutes 49 seconds and explicitly excluded further soak tests. Its
+  29,208,400 events had exact capture/consumer totals, bounded memory/disk/WAL,
+  and stable post-warmup latency. This is a measured baseline, not a multi-hour
+  or target-infrastructure guarantee.
 - Exercise slow and disconnected consumers, PostgreSQL outages, process restarts,
-  disk pressure, and reconnect storms during load.
+  disk pressure, and reconnect storms during load. DONE with slow-consumer
+  expiry, five forced replication disconnects, same-store SIGKILL/restart, and
+  a pre-ACK free-space-reserve failure that leaves PostgreSQL WAL retained.
 - Drive sustained unrelated-table writes and verify they do not consume redb
   retention capacity, materially reduce useful capture throughput, or cause
   unbounded replication-slot WAL retention while relevant tables are idle.
+  DONE: mixed traffic stores only relevant rows; eventless transactions no
+  longer retain replay markers; 105,900 unrelated changes left zero events,
+  zero markers, one 624 KiB segment, and bounded WAL lag.
 - Restore append-like sustained throughput while retention is active, or publish
   a lower measured limit. A production release needs predictable capacity, not
-  maximum possible benchmark throughput.
+  maximum possible benchmark throughput. DONE by publishing 10k events/second
+  as the initial continuous envelope with short-run headroom through 60k/s.
 
 Production-ready means every item above is complete or has an explicit,
 documented limitation that does not permit silent data loss, unauthorized
@@ -397,6 +414,8 @@ observable behavior.
 
 ## Current Next Step
 
-Finish the combined-runtime outage test, explicit runtime states, graceful
-shutdown, and standard health/readiness service. Then enforce subscription and
-disk bounds before returning to retention throughput work.
+Push the production-readiness branch after GitHub credentials include workflow
+permission, let required CI validate the release matrix, and cut the first
+release candidate. High availability, shared consumer groups, and further
+retention/partitioning performance work remain later milestones rather than
+release blockers.

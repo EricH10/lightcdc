@@ -337,13 +337,15 @@ impl SegmentStore {
             let mut metadata = write.open_table(METADATA).map_err(redb_error)?;
 
             for transaction in transactions {
-                let replay_id = transaction_replay_id(source_name, transaction.source_lsn);
-                if replay_ids
-                    .get(replay_id.as_str())
-                    .map_err(redb_error)?
-                    .is_some()
+                let replay_id = (!transaction.events.is_empty())
+                    .then(|| transaction_replay_id(source_name, transaction.source_lsn));
+                if let Some(replay_id) = &replay_id
+                    && replay_ids
+                        .get(replay_id.as_str())
+                        .map_err(redb_error)?
+                        .is_some()
                 {
-                    return Err(StorageError::DuplicateTransactionMarker(replay_id));
+                    return Err(StorageError::DuplicateTransactionMarker(replay_id.clone()));
                 }
                 for event in transaction.events.iter()? {
                     let event = event?;
@@ -361,13 +363,15 @@ impl SegmentStore {
                         .map_err(redb_error)?;
                     descriptor.record_event(&event, payload.len() as u64);
                 }
-                replay_ids
-                    .insert(
-                        replay_id.as_str(),
-                        descriptor.high_watermark.unwrap_or_default(),
-                    )
-                    .map_err(redb_error)?;
-                descriptor.replay_id_count = descriptor.replay_id_count.saturating_add(1);
+                if let Some(replay_id) = replay_id {
+                    replay_ids
+                        .insert(
+                            replay_id.as_str(),
+                            descriptor.high_watermark.unwrap_or_default(),
+                        )
+                        .map_err(redb_error)?;
+                    descriptor.replay_id_count = descriptor.replay_id_count.saturating_add(1);
+                }
             }
             source_offsets
                 .insert(source_name, source_lsn)

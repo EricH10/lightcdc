@@ -1321,7 +1321,9 @@ async fn logical_heartbeats_advance_the_slot_during_only_unrelated_writes() -> a
 
     capture.kill_and_wait()?;
     let store = open_store(temp.path().to_path_buf())?;
-    assert_eq!(store.stats()?.event_count, 0);
+    let stats = store.stats()?;
+    assert_eq!(stats.event_count, 0);
+    assert_eq!(stats.replay_id_count, 0);
     assert!(store.source_offset(&fixture.source_name)?.is_some());
     drop(store);
 

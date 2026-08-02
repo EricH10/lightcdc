@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow};
 use lightcdc_api::proto::{
     AckRequest, SeekPosition, SeekRequest, SubscribeRequest, light_cdc_client::LightCdcClient,
 };
-use redis::{AsyncCommands, Script, aio::ConnectionManager};
+use redis::{AsyncCommands, RetryMethod, Script, aio::ConnectionManager};
 use thiserror::Error;
 use tonic::{
     Code, Request, Status,
@@ -61,11 +61,13 @@ pub(crate) async fn run(config: ConnectorConfig) -> anyhow::Result<()> {
     let bearer_token = config.bearer_token()?;
     redis::Client::open(redis_url.as_str()).context("validate Redis URL")?;
     let mut delay = config.initial_reconnect_delay();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for shutdown signal")?;
+            signal = &mut shutdown => {
+                signal?;
                 info!("Redis connector received shutdown signal");
                 return Ok(());
             }
@@ -81,14 +83,33 @@ pub(crate) async fn run(config: ConnectorConfig) -> anyhow::Result<()> {
         }
 
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for shutdown signal")?;
+            signal = &mut shutdown => {
+                signal?;
                 return Ok(());
             }
             () = tokio::time::sleep(delay) => {}
         }
         delay = doubled_delay(delay, config.max_reconnect_delay());
     }
+}
+
+/// Resolves the process signals used by terminals and production supervisors.
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("listen for SIGINT")?,
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.context("listen for Ctrl-C")?;
+
+    Ok(())
 }
 
 async fn run_session(
@@ -132,6 +153,7 @@ async fn run_session(
         .await
         .map_err(|status| classify_status(status, "subscribe to LightCDC"))?
         .into_inner();
+    let apply_script = Script::new(APPLY_SCRIPT);
 
     info!(
         endpoint = %config.lightcdc.endpoint,
@@ -141,6 +163,8 @@ async fn run_session(
         "Redis connector session is ready"
     );
 
+    let mut unacknowledged = 0_u64;
+    let mut last_sequence = redis_offset;
     while let Some(event) = events
         .message()
         .await
@@ -148,23 +172,48 @@ async fn run_session(
     {
         let mutations = map_event(&config.rules, &event)
             .map_err(|error| SessionError::Terminal(error.context("map Redis cache mutation")))?;
-        apply_event(&mut redis, &progress_key, event.sequence, &mutations).await?;
-        ack_client
-            .ack(authenticated_request(
-                AckRequest {
-                    stream: config.lightcdc.stream.clone(),
-                    consumer: config.lightcdc.consumer.clone(),
-                    sequence: event.sequence,
-                },
-                bearer_token,
-            )?)
-            .await
-            .map_err(|status| classify_status(status, "acknowledge LightCDC event"))?;
+        apply_event(
+            &apply_script,
+            &mut redis,
+            &progress_key,
+            event.sequence,
+            &mutations,
+        )
+        .await?;
+        last_sequence = event.sequence;
+        unacknowledged += 1;
+        if unacknowledged >= config.lightcdc.ack_every {
+            acknowledge(&mut ack_client, config, bearer_token, last_sequence).await?;
+            unacknowledged = 0;
+        }
+    }
+    if unacknowledged > 0 {
+        acknowledge(&mut ack_client, config, bearer_token, last_sequence).await?;
     }
 
     Err(SessionError::Transient(anyhow!(
         "LightCDC closed the subscription stream"
     )))
+}
+
+async fn acknowledge(
+    client: &mut LightCdcClient<Channel>,
+    config: &ConnectorConfig,
+    bearer_token: Option<&str>,
+    sequence: u64,
+) -> Result<(), SessionError> {
+    client
+        .ack(authenticated_request(
+            AckRequest {
+                stream: config.lightcdc.stream.clone(),
+                consumer: config.lightcdc.consumer.clone(),
+                sequence,
+            },
+            bearer_token,
+        )?)
+        .await
+        .map_err(|status| classify_status(status, "acknowledge LightCDC events"))?;
+    Ok(())
 }
 
 async fn connect_lightcdc(config: &ConnectorConfig) -> Result<Channel, SessionError> {
@@ -221,20 +270,37 @@ async fn read_progress(
     let Some(stored) = stored else {
         return Ok(0);
     };
-    stored.parse::<u64>().map_err(|error| {
+    let sequence = stored.parse::<u64>().map_err(|error| {
         SessionError::Terminal(anyhow!(error).context(format!(
             "Redis progress key {progress_key:?} contains invalid sequence {stored:?}"
         )))
-    })
+    })?;
+    if stored != format!("{sequence:020}") {
+        return Err(SessionError::Terminal(anyhow!(
+            "Redis progress key {progress_key:?} must contain a zero-padded 20-digit sequence; found {stored:?}"
+        )));
+    }
+    Ok(sequence)
 }
 
 async fn apply_event(
+    script: &Script,
     redis: &mut ConnectionManager,
     progress_key: &str,
     sequence: u64,
     mutations: &[CacheMutation],
 ) -> Result<(), SessionError> {
-    let script = Script::new(APPLY_SCRIPT);
+    for mutation in mutations {
+        let key = match mutation {
+            CacheMutation::Delete { key } | CacheMutation::Set { key, .. } => key,
+        };
+        if key == progress_key {
+            return Err(SessionError::Terminal(anyhow!(
+                "Redis cache mutation targets reserved progress key {progress_key:?}"
+            )));
+        }
+    }
+
     let mut invocation = script.prepare_invoke();
     invocation
         .key(progress_key)
@@ -287,12 +353,12 @@ fn classify_redis(error: redis::RedisError, action: &str) -> SessionError {
     use redis::ErrorKind;
 
     let kind = error.kind();
+    let retry_method = error.retry_method();
     let error = anyhow!(error).context(action.to_owned());
-    match kind {
-        ErrorKind::AuthenticationFailed
-        | ErrorKind::InvalidClientConfig
-        | ErrorKind::UnexpectedReturnType => SessionError::Terminal(error),
-        _ => SessionError::Transient(error),
+    if kind == ErrorKind::AuthenticationFailed || matches!(retry_method, RetryMethod::NoRetry) {
+        SessionError::Terminal(error)
+    } else {
+        SessionError::Transient(error)
     }
 }
 
@@ -331,6 +397,59 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Redis on LIGHTCDC_TEST_REDIS_URL or redis://127.0.0.1:6379"]
+    async fn rejects_noncanonical_progress_and_reserved_key_collisions() {
+        let url = std::env::var("LIGHTCDC_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+        let client = redis::Client::open(url).expect("Redis URL");
+        let mut redis = client
+            .get_connection_manager()
+            .await
+            .expect("connect Redis");
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let progress = format!("lightcdc:test:{suffix}:offset");
+        redis
+            .set::<_, _, ()>(&progress, "1")
+            .await
+            .expect("write malformed progress");
+
+        let error = read_progress(&mut redis, &progress)
+            .await
+            .expect_err("noncanonical progress must fail");
+        assert!(matches!(error, SessionError::Terminal(_)));
+
+        redis
+            .set::<_, _, ()>(&progress, "00000000000000000001")
+            .await
+            .expect("write canonical progress");
+        let script = Script::new(APPLY_SCRIPT);
+        let error = apply_event(
+            &script,
+            &mut redis,
+            &progress,
+            2,
+            &[CacheMutation::Delete {
+                key: progress.clone(),
+            }],
+        )
+        .await
+        .expect_err("reserved key collision must fail");
+        assert!(matches!(error, SessionError::Terminal(_)));
+        assert_eq!(
+            redis
+                .get::<_, String>(&progress)
+                .await
+                .expect("progress remains unchanged"),
+            "00000000000000000001"
+        );
+
+        let _: usize = redis.del(&progress).await.expect("cleanup progress key");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis on LIGHTCDC_TEST_REDIS_URL or redis://127.0.0.1:6379"]
     async fn redis_progress_and_cache_mutation_are_atomic_and_idempotent() {
         let url = std::env::var("LIGHTCDC_TEST_REDIS_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
@@ -345,8 +464,10 @@ mod tests {
             .as_nanos();
         let progress = format!("lightcdc:test:{suffix}:offset");
         let cache_key = format!("lightcdc:test:{suffix}:cache");
+        let script = Script::new(APPLY_SCRIPT);
 
         apply_event(
+            &script,
             &mut redis,
             &progress,
             1,
@@ -367,6 +488,7 @@ mod tests {
         );
 
         apply_event(
+            &script,
             &mut redis,
             &progress,
             1,
@@ -384,6 +506,7 @@ mod tests {
         );
 
         apply_event(
+            &script,
             &mut redis,
             &progress,
             2,

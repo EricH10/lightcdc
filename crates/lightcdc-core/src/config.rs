@@ -307,6 +307,12 @@ impl Config {
             source,
         })?;
         config
+            .validate_source()
+            .map_err(|reason| Error::InvalidConfig {
+                path: path.display().to_string(),
+                reason,
+            })?;
+        config
             .validate_source_password_config()
             .map_err(|reason| Error::InvalidConfig {
                 path: path.display().to_string(),
@@ -349,9 +355,56 @@ impl Config {
         CapturePlan::from_streams(&self.source.name, &self.streams)
     }
 
+    /// Rejects source values that cannot safely identify one PostgreSQL slot.
+    fn validate_source(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            ("source.name", self.source.name.as_str()),
+            ("source.host", self.source.host.as_str()),
+            ("source.database", self.source.database.as_str()),
+            ("source.user", self.source.user.as_str()),
+            ("source.publication", self.source.publication.as_str()),
+            ("source.slot", self.source.slot.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(format!("{name} must not be empty"));
+            }
+        }
+        if self.source.port == 0 {
+            return Err("source.port must be greater than zero".to_owned());
+        }
+        if self.source.slot.len() > 63
+            || !self
+                .source
+                .slot
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(
+                "source.slot must be at most 63 lowercase ASCII letters, digits, or underscores"
+                    .to_owned(),
+            );
+        }
+        if self.source.tls_mode == PostgresTlsMode::Disable && self.source.tls_ca_file.is_some() {
+            return Err("source.tls_ca_file requires source.tls_mode = \"verify_full\"".to_owned());
+        }
+        if self.source.tls_ca_file.as_deref() == Some("") {
+            return Err("source.tls_ca_file must not be empty when configured".to_owned());
+        }
+        if self.source.password_env.as_deref() == Some("") {
+            return Err("source.password_env must not be empty when configured".to_owned());
+        }
+        if self.source.password_file.as_deref() == Some("") {
+            return Err("source.password_file must not be empty when configured".to_owned());
+        }
+        Ok(())
+    }
+
     /// Rejects zero, contradictory, and ineffectively large runtime settings.
     pub fn validate_runtime(&self) -> std::result::Result<(), String> {
         let runtime = &self.runtime;
+        if runtime.data_dir.trim().is_empty() {
+            return Err("runtime.data_dir must not be empty".to_owned());
+        }
         let storage_file = Path::new(&runtime.storage_file);
         if runtime.storage_file.is_empty()
             || storage_file.is_absolute()
@@ -678,7 +731,11 @@ impl SourceConfig {
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={} password={}",
-            self.host, self.port, self.database, self.user, self.password
+            quote_postgres_parameter(&self.host),
+            self.port,
+            quote_postgres_parameter(&self.database),
+            quote_postgres_parameter(&self.user),
+            quote_postgres_parameter(&self.password)
         )
     }
 
@@ -689,6 +746,11 @@ impl SourceConfig {
             self.host, self.port, self.database, self.user
         )
     }
+}
+
+/// Quotes one libpq-style connection value so spaces cannot introduce options.
+fn quote_postgres_parameter(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 impl StreamConfig {
@@ -985,7 +1047,7 @@ fn default_retention_delete_batch_size() -> usize {
 mod tests {
     use crate::{Operation, SourceMetadata};
 
-    use super::{CapturePlanError, Config, StreamConfig};
+    use super::{CapturePlanError, Config, StreamConfig, quote_postgres_parameter};
     use tempfile::TempDir;
 
     #[test]
@@ -1039,6 +1101,14 @@ mod tests {
         assert_eq!(config.observability.metrics_addr, "127.0.0.1:9187");
         assert_eq!(config.observability.metrics_max_connections, 16);
         assert_eq!(config.observability.metrics_sample_interval_seconds, 15);
+    }
+
+    #[test]
+    fn postgres_connection_values_are_quoted() {
+        assert_eq!(
+            quote_postgres_parameter("a b'\\host=attacker"),
+            r#"'a b\'\\host=attacker'"#
+        );
     }
 
     #[test]
@@ -1181,6 +1251,38 @@ mod tests {
                 .validate_runtime()
                 .expect_err("contradictory transaction limits")
                 .contains("must not exceed")
+        );
+    }
+
+    #[test]
+    fn source_validation_rejects_unsafe_slot_and_inert_tls_values() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        config.source.slot = "slot; DROP DATABASE lightcdc".to_owned();
+        assert!(
+            config
+                .validate_source()
+                .expect_err("unsafe slot")
+                .contains("lowercase ASCII")
+        );
+
+        config.source.slot = "slot".to_owned();
+        config.source.tls_ca_file = Some("ca.pem".to_owned());
+        assert!(
+            config
+                .validate_source()
+                .expect_err("inert CA file")
+                .contains("verify_full")
+        );
+
+        config.source.tls_ca_file = None;
+        config.runtime.data_dir.clear();
+        assert_eq!(
+            config.validate_runtime(),
+            Err("runtime.data_dir must not be empty".to_owned())
         );
     }
 

@@ -1030,6 +1030,9 @@ mod tests {
         let outcome = store
             .persist_transaction_events(&eventless, "default", "0/10")
             .expect("persist checkpoint-only transaction");
+        store
+            .persist_transaction_events(&eventless, "default", "0/20")
+            .expect("advance checkpoint again");
 
         assert_eq!(outcome, PersistTransactionOutcome::Persisted);
         assert!(store.replay_from(1, 10).expect("replay").is_empty());
@@ -1037,8 +1040,11 @@ mod tests {
         assert_eq!(store.next_sequence().expect("next sequence"), 1);
         assert_eq!(
             store.source_offset("default").expect("source offset"),
-            Some("0/10".to_owned())
+            Some("0/20".to_owned())
         );
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.event_count, 0);
+        assert_eq!(stats.replay_id_count, 0);
     }
 
     #[test]

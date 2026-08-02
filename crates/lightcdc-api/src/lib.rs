@@ -327,42 +327,12 @@ struct ServiceParts {
 
 impl LightCdcService {
     /// Creates a gRPC service from configuration and a shared event store.
-    pub fn new(config: Config, store: RedbEventStore) -> Self {
+    pub fn new(config: Config, store: RedbEventStore) -> anyhow::Result<Self> {
         Self::new_with_notifier(config, store, EventNotifier::new())
     }
 
     /// Creates a standalone service that owns its storage writer thread.
     pub fn new_with_notifier(
-        config: Config,
-        store: RedbEventStore,
-        event_notifier: EventNotifier,
-    ) -> Self {
-        let (shutdown_owner, shutdown) = shutdown_channel();
-        let storage_writer_owner = Arc::new(
-            CaptureStorageWriter::start(store.clone(), config.source.name.clone())
-                .expect("failed to start the gRPC storage writer"),
-        );
-        let storage_writer = storage_writer_owner.handle();
-        let (storage_reader_owner, storage_reader) =
-            start_storage_readers(&config, &store).expect("failed to start gRPC storage readers");
-        Self::from_parts(
-            ServiceParts {
-                config,
-                store,
-                event_notifier,
-                storage_writer,
-                storage_writer_owner: Some(storage_writer_owner),
-                storage_reader,
-                storage_reader_owner,
-                shutdown,
-                shutdown_owner: Some(shutdown_owner),
-                metrics: None,
-            },
-            ApiAuthorizer::default(),
-        )
-    }
-
-    fn new_authorized(
         config: Config,
         store: RedbEventStore,
         event_notifier: EventNotifier,
@@ -399,11 +369,12 @@ impl LightCdcService {
         store: RedbEventStore,
         event_notifier: EventNotifier,
         storage_writer: CaptureStorageHandle,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let authorizer = ApiAuthorizer::from_config(&config.api)
+            .map_err(|error| error.context(ApiConfigurationFailure))?;
         let (shutdown_owner, shutdown) = shutdown_channel();
-        let (storage_reader_owner, storage_reader) =
-            start_storage_readers(&config, &store).expect("failed to start gRPC storage readers");
-        Self::from_parts(
+        let (storage_reader_owner, storage_reader) = start_storage_readers(&config, &store)?;
+        Ok(Self::from_parts(
             ServiceParts {
                 config,
                 store,
@@ -416,8 +387,8 @@ impl LightCdcService {
                 shutdown_owner: Some(shutdown_owner),
                 metrics: None,
             },
-            ApiAuthorizer::default(),
-        )
+            authorizer,
+        ))
     }
 
     /// Creates a service sharing capture storage and coordinated shutdown.
@@ -526,7 +497,7 @@ pub async fn serve(addr: SocketAddr, config: Config, store: RedbEventStore) -> a
     let (state, state_rx) = runtime_state_channel();
     state.transition(RuntimeState::Capturing, None);
     let (_shutdown, shutdown_rx) = shutdown_channel();
-    let service = LightCdcService::new_authorized(config, store, EventNotifier::new())?;
+    let service = LightCdcService::new(config, store)?;
     serve_service(addr, service, state_rx, shutdown_rx, tls).await
 }
 
@@ -1319,14 +1290,17 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_principals_enforce_stream_and_seek_permissions() {
-        let mut service = service_with_events(&[event(1, "public", "orders")]);
-        service.service.authorizer = Arc::new(ApiAuthorizer {
-            principals: vec![ApiPrincipal {
+        let secrets = TempDir::new().expect("secrets temp dir");
+        let token_file = secrets.path().join("api-token");
+        fs::write(&token_file, "secret-token\n").expect("write API token");
+        let service = service_with_events_config(&[event(1, "public", "orders")], |config| {
+            config.api.tokens.push(lightcdc_core::ApiTokenConfig {
                 name: "orders-reader".to_owned(),
-                token: b"secret-token".to_vec(),
-                streams: HashSet::from(["orders".to_owned()]),
+                token_env: None,
+                token_file: Some(token_file.display().to_string()),
+                streams: vec!["orders".to_owned()],
                 allow_seek: false,
-            }],
+            });
         });
 
         let missing = service
@@ -1904,6 +1878,13 @@ mod tests {
     }
 
     fn service_with_events(events: &[CoreChangeEvent]) -> TestService {
+        service_with_events_config(events, |_| {})
+    }
+
+    fn service_with_events_config(
+        events: &[CoreChangeEvent],
+        configure: impl FnOnce(&mut Config),
+    ) -> TestService {
         let temp = TempDir::new().expect("temp dir");
         let data_dir = temp.path().to_path_buf();
         let store = RedbEventStore::open_with_segment_options(
@@ -1924,8 +1905,9 @@ mod tests {
 
         let mut config = config();
         config.runtime.data_dir = data_dir.display().to_string();
+        configure(&mut config);
         TestService {
-            service: LightCdcService::new(config, store),
+            service: LightCdcService::new(config, store).expect("start test service"),
             _temp: temp,
         }
     }
