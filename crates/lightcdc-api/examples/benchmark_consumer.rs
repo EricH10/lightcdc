@@ -42,6 +42,10 @@ struct Args {
     #[arg(long, default_value_t = 5_000)]
     ack_every: u64,
 
+    /// Simulates per-event application work before the event can be acknowledged.
+    #[arg(long, default_value_t = 0)]
+    processing_delay_micros: u64,
+
     #[arg(long)]
     metrics_file: PathBuf,
 }
@@ -207,6 +211,10 @@ async fn main() -> Result<()> {
                 };
                 stats.record_event(&event);
                 unacknowledged += 1;
+
+                if args.processing_delay_micros > 0 {
+                    sleep(Duration::from_micros(args.processing_delay_micros)).await;
+                }
 
                 if unacknowledged >= args.ack_every {
                     let latency = acknowledge(

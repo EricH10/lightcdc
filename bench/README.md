@@ -13,14 +13,16 @@ versions.
 
 ## Instrumentation Overhead Policy
 
-Normal `lightcdc` runs do not create counters, histograms, clocks, channels, or
-metrics threads. They perform only predictable disabled `Option` checks at the
-committed-transaction boundary, with no per-event instrumentation.
+Normal `lightcdc` production runs maintain fixed-cardinality counters with
+relaxed atomics. Capture records one clock sample and fixed histogram bucket per
+durable group commit, not per event. One OS thread samples redb metadata and
+filesystem state at the configured interval; Prometheus rendering allocates
+only when scraped. There are no dynamic labels or per-event metric maps.
 
 Passing `--metrics-file` opts into capture instrumentation:
 
-- One `Instant` measurement and one nonblocking fixed-size channel send occur
-  per durable storage group commit, not per event.
+- One additional nonblocking fixed-size channel send occurs per durable storage
+  group commit, not per event.
 - A dedicated standard thread owns all counters, rate calculations, histogram
   updates, JSON serialization, and file I/O.
 - A bounded channel prevents instrumentation from applying backpressure.
@@ -69,6 +71,9 @@ Useful controls:
 | `ROWS_PER_TRANSACTION` | `1` | Inserted CDC events per source transaction |
 | `PAYLOAD_BYTES` | `256` | Text payload size |
 | `ACK_EVERY` | `5000` | Events processed per cumulative acknowledgement |
+| `CONSUMER_COUNT` | `1` | Independent named consumers replaying every event |
+| `SLOW_CONSUMER_DELAY_MICROS` | `0` | Per-event processing delay for the final consumer |
+| `EXPECTED_SLOW_CONSUMER_EXPIRATION` | `false` | Require only the delayed consumer to cross retention and fail explicitly |
 | `CAPTURE_BATCH_MAX_EVENTS` | `1000` | Soft event limit for one capture storage commit |
 | `CAPTURE_BATCH_MAX_DELAY_MS` | `20` | Maximum capture group-commit delay |
 | `WORKLOAD` | `insert` | `insert` or `update` |
@@ -82,6 +87,23 @@ redelivery window matters more than acknowledgement throughput.
 The generated payload is intentionally compressible. Add an incompressible
 payload scenario before using these results to size TOAST-heavy production
 traffic.
+
+To prove that a healthy consumer remains current while a slow consumer crosses
+the retained replay window, run a multi-consumer test with a processing delay:
+
+```bash
+CONSUMER_COUNT=2 \
+SLOW_CONSUMER_DELAY_MICROS=1000 \
+EXPECTED_SLOW_CONSUMER_EXPIRATION=true \
+ROWS_PER_TRANSACTION=100 \
+RATE=200 \
+bench/run-local.sh
+```
+
+The run succeeds only when the fast consumer finishes normally and the delayed
+consumer receives the API's actionable `consumer offset expired` error. This
+models an application processing delay before acknowledgement; it does not
+artificially delay network reads after processing.
 
 For the high-throughput capture profile, use:
 

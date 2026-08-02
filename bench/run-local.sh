@@ -12,6 +12,9 @@ RATE="${RATE:-0}"
 ROWS_PER_TRANSACTION="${ROWS_PER_TRANSACTION:-1}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-256}"
 ACK_EVERY="${ACK_EVERY:-5000}"
+CONSUMER_COUNT="${CONSUMER_COUNT:-1}"
+SLOW_CONSUMER_DELAY_MICROS="${SLOW_CONSUMER_DELAY_MICROS:-0}"
+EXPECTED_SLOW_CONSUMER_EXPIRATION="${EXPECTED_SLOW_CONSUMER_EXPIRATION:-false}"
 CAPTURE_BATCH_MAX_EVENTS="${CAPTURE_BATCH_MAX_EVENTS:-1000}"
 CAPTURE_BATCH_MAX_DELAY_MS="${CAPTURE_BATCH_MAX_DELAY_MS:-20}"
 WORKLOAD="${WORKLOAD:-insert}"
@@ -74,6 +77,26 @@ case "$WORKLOAD" in
         exit 1
         ;;
 esac
+if ! [[ "$CONSUMER_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CONSUMER_COUNT must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "$SLOW_CONSUMER_DELAY_MICROS" =~ ^[0-9]+$ ]]; then
+    echo "SLOW_CONSUMER_DELAY_MICROS must be a non-negative integer" >&2
+    exit 1
+fi
+case "$EXPECTED_SLOW_CONSUMER_EXPIRATION" in
+    true|false) ;;
+    *)
+        echo "EXPECTED_SLOW_CONSUMER_EXPIRATION must be true or false" >&2
+        exit 1
+        ;;
+esac
+if [[ "$EXPECTED_SLOW_CONSUMER_EXPIRATION" == "true" \
+    && "$SLOW_CONSUMER_DELAY_MICROS" -eq 0 ]]; then
+    echo "EXPECTED_SLOW_CONSUMER_EXPIRATION requires SLOW_CONSUMER_DELAY_MICROS > 0" >&2
+    exit 1
+fi
 
 mkdir -p "$RESULT_DIR"
 rm -rf "$DATA_DIR"
@@ -94,11 +117,11 @@ awk \
     bench/lightcdc.benchmark.toml >"$RUN_CONFIG"
 
 LIGHTCDC_PID=""
-CONSUMER_PID=""
+CONSUMER_PIDS=()
 SAMPLER_PID=""
 
 cleanup() {
-    for pid in "$SAMPLER_PID" "$CONSUMER_PID" "$LIGHTCDC_PID"; do
+    for pid in "$SAMPLER_PID" "${CONSUMER_PIDS[@]}" "$LIGHTCDC_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
@@ -124,6 +147,9 @@ rate=$RATE
 rows_per_transaction=$ROWS_PER_TRANSACTION
 payload_bytes=$PAYLOAD_BYTES
 ack_every=$ACK_EVERY
+consumer_count=$CONSUMER_COUNT
+slow_consumer_delay_micros=$SLOW_CONSUMER_DELAY_MICROS
+expected_slow_consumer_expiration=$EXPECTED_SLOW_CONSUMER_EXPIRATION
 capture_batch_max_events=$CAPTURE_BATCH_MAX_EVENTS
 capture_batch_max_delay_ms=$CAPTURE_BATCH_MAX_DELAY_MS
 workload=$WORKLOAD
@@ -239,16 +265,32 @@ if [[ "$CAUGHT_UP" != "t" ]]; then
     exit 1
 fi
 
-target/release/examples/benchmark_consumer \
-    --endpoint http://127.0.0.1:50051 \
-    --stream benchmark \
-    --consumer "benchmark-$RUN_ID" \
-    --seek latest \
-    --duration-seconds "$((DURATION_SECONDS + CONSUMER_EXTRA_SECONDS + 2))" \
-    --ack-every "$ACK_EVERY" \
-    --metrics-file "$RESULT_DIR/consumer.jsonl" \
-    >"$RESULT_DIR/consumer.log" 2>&1 &
-CONSUMER_PID=$!
+for consumer_index in $(seq 1 "$CONSUMER_COUNT"); do
+    if [[ "$consumer_index" -eq 1 ]]; then
+        consumer_metrics="$RESULT_DIR/consumer.jsonl"
+        consumer_log="$RESULT_DIR/consumer.log"
+    else
+        consumer_metrics="$RESULT_DIR/consumer-$consumer_index.jsonl"
+        consumer_log="$RESULT_DIR/consumer-$consumer_index.log"
+    fi
+    consumer_args=(
+        --endpoint http://127.0.0.1:50051
+        --stream benchmark
+        --consumer "benchmark-$RUN_ID-$consumer_index"
+        --seek latest
+        --duration-seconds "$((DURATION_SECONDS + CONSUMER_EXTRA_SECONDS + 2))"
+        --ack-every "$ACK_EVERY"
+        --metrics-file "$consumer_metrics"
+    )
+    if [[ "$consumer_index" -eq "$CONSUMER_COUNT" \
+        && "$SLOW_CONSUMER_DELAY_MICROS" -gt 0 ]]; then
+        consumer_args+=(--processing-delay-micros "$SLOW_CONSUMER_DELAY_MICROS")
+    fi
+    target/release/examples/benchmark_consumer \
+        "${consumer_args[@]}" \
+        >"$consumer_log" 2>&1 &
+    CONSUMER_PIDS+=("$!")
+done
 
 echo "timestamp_ms,current_wal_lsn,confirmed_flush_lsn,retained_wal_bytes,slot_active,postgres_spill_transactions,postgres_spill_count,postgres_spill_bytes" \
     >"$RESULT_DIR/postgres.csv"
@@ -316,8 +358,28 @@ fi
 db_pgbench "bench/sql/$WORKLOAD.sql" "${PGBENCH_ARGS[@]}" "$PGDATABASE" \
     >"$RESULT_DIR/pgbench.log" 2>&1
 
-wait "$CONSUMER_PID"
-CONSUMER_PID=""
+CONSUMER_FAILURES=0
+for consumer_pid in "${CONSUMER_PIDS[@]}"; do
+    if ! wait "$consumer_pid"; then
+        CONSUMER_FAILURES=$((CONSUMER_FAILURES + 1))
+    fi
+done
+CONSUMER_PIDS=()
+
+if [[ "$EXPECTED_SLOW_CONSUMER_EXPIRATION" == "true" ]]; then
+    slow_consumer_log="$RESULT_DIR/consumer-$CONSUMER_COUNT.log"
+    if [[ "$CONSUMER_COUNT" -eq 1 ]]; then
+        slow_consumer_log="$RESULT_DIR/consumer.log"
+    fi
+    if [[ "$CONSUMER_FAILURES" -ne 1 ]] \
+        || ! grep -q "consumer offset expired" "$slow_consumer_log"; then
+        echo "expected exactly the slow consumer to expire; inspect $RESULT_DIR/consumer*.log" >&2
+        exit 1
+    fi
+elif [[ "$CONSUMER_FAILURES" -ne 0 ]]; then
+    echo "$CONSUMER_FAILURES benchmark consumer(s) failed; inspect $RESULT_DIR/consumer*.log" >&2
+    exit 1
+fi
 
 kill "$SAMPLER_PID" 2>/dev/null || true
 wait "$SAMPLER_PID" 2>/dev/null || true
