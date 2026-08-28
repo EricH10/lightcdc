@@ -187,9 +187,10 @@ them has optional work remaining.
 
 - Establish a supported capacity envelope by payload size, source transaction
   size, retention window, consumer count, acknowledgement frequency, and disk.
-  DONE for the conservative single-node 10k events/second profile in
-  `docs/benchmarks/2026-08-02-production-capacity.md`; higher rates require
-  target-system validation.
+  DONE for the measured single-node 50k events/second profile in
+  `docs/benchmarks/2026-08-02-production-capacity.md`, with a confirming
+  bare-metal Linux probe in `docs/benchmarks/2026-08-28-linux-capacity.md`;
+  higher rates require target-system validation.
 - Run multi-hour soak tests with retention active and verify bounded memory,
   bounded allocated disk, stable latency, no sequence gaps, and no growing
   PostgreSQL WAL lag. ACCEPTED LIMITATION: the operator ended the sustained run
@@ -209,8 +210,10 @@ them has optional work remaining.
   zero markers, one 624 KiB segment, and bounded WAL lag.
 - Restore append-like sustained throughput while retention is active, or publish
   a lower measured limit. A production release needs predictable capacity, not
-  maximum possible benchmark throughput. DONE by publishing 10k events/second
-  as the initial continuous envelope with short-run headroom through 60k/s.
+  maximum possible benchmark throughput. DONE by publishing 50k events/second
+  as the measured single-consumer envelope. A 10-minute 60k/s boundary run
+  delivered every event but accumulated 16.2-second tail latency, while the
+  49-minute validation ran at 10k/s; neither boundary is the published rate.
 
 Production-ready means every item above is complete or has an explicit,
 documented limitation that does not permit silent data loss, unauthorized
@@ -379,7 +382,7 @@ slow consumer cannot stall capture or unrelated consumers.
   count-, byte-, and age-bounded redb segments now make retention a whole-file
   operation. Transaction-level replay markers now replace the per-event capture
   index and moved the short local benchmark boundary from about 80k to around
-  100k events/second, while the release envelope remains a conservative 10k/s.
+  100k events/second, while the measured release envelope is 50k/s.
   Consider encoded event blocks or multiple writable shards only when measured
   demand justifies their added ordering and replay complexity.
 - Warn and shed work safely before disk exhaustion. DONE by refusing the next

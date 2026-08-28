@@ -5,30 +5,38 @@ LightCDC. It is a conservative operating envelope, not a claim that the tested
 laptop is representative of a production server or that every workload with the
 same event count has the same cost.
 
-## Supported Baseline
+## Measured Capacity Envelope
 
-The initial supported continuous profile is:
+The initial measured single-consumer profile is:
 
-| Dimension | Supported value |
+| Dimension | Measured value |
 | --- | --- |
 | Source | One PostgreSQL 17 database and one logical replication slot |
 | LightCDC topology | One process, one local redb data directory, global event order |
-| Event rate | 10,000 events/second |
+| Event rate | 50,000 events/second |
 | Source transaction size | 100 captured rows per transaction |
 | Captured payload | 256-byte compressible text field plus benchmark row metadata |
 | Consumers | One ordered gRPC consumer |
 | Acknowledgement cadence | One cumulative ACK per 5,000 processed events |
-| Capture grouping | 1,000 events or 20 ms per durable group commit |
+| Capture grouping | 2,000 events or 40 ms per durable group commit |
 | Retention | 1,000,000 events and 10 GiB logical segment bytes |
 | Segment bounds | 1,000,000 events, 256 MiB, or 15 minutes |
 | Storage safety | 100 GiB data-directory ceiling and 1 GiB free-space reserve |
 
-The rate is supported only when the configured transaction, event, replay,
+The rate applies only when the configured transaction, event, replay,
 consumer, retention, and disk limits also fit the deployment. Workloads with
 larger or incompressible values, frequent TOAST values, one-row source
 transactions, more consumers, smaller ACK batches, or slower storage require a
 benchmark on the target system. Limits stop capture before acknowledging
 PostgreSQL; operators must monitor retained WAL while correcting the condition.
+
+The 50k/s envelope is supported by the complete 60-second run below and leaves
+operating margin below a later 10-minute Linux boundary run at 60k/s. That run
+delivered every event but accumulated 16.2-second tail latency and 432 MB of WAL
+lag before recovering. The 49-minute run used 10k/s to validate longer-running
+retention and resource behavior; 10k/s was the validation workload, not
+LightCDC's throughput ceiling. See
+`docs/benchmarks/2026-08-28-linux-capacity.md` for the Linux results.
 
 ## Test Environment
 
@@ -61,9 +69,11 @@ the benchmark metrics channel dropped no samples.
 | 60k/s | 100 rows | 59,519/s | 3,571,300 | 123.6 ms | 385.1 ms | 26.1 MB | 58.5% / 112.8% | 442 MB |
 
 The one-row case was limited by PostgreSQL in Docker producing source
-transactions, not by LightCDC capture. The 50k and 60k runs demonstrate useful
-headroom, but their tail latency is too variable to publish as the first
-continuous operating envelope.
+transactions, not by LightCDC capture. The 50k run establishes the initial
+measured capacity envelope. The 60k run demonstrates headroom, but its tail
+latency and the later 10-minute Linux result show why it is not the published
+continuous rate. Deployments should repeat the benchmark with their actual
+payload, storage, and latency objective.
 
 With retention active, physical data-directory usage approached roughly 1.7 to
 1.9 GiB rather than growing with total events produced. Whole sealed segments
@@ -86,9 +96,9 @@ fell outside retention; the API rejected sequence 27,073 when the first retained
 sequence was 138,701 and required an explicit seek. The abandoned consumer did
 not pin storage or block the healthy consumer.
 
-## Sustained Run
+## Long-Duration Validation
 
-The supported 10k/s profile ran for 2,929 seconds (48 minutes 49 seconds) with
+The 10k/s validation profile ran for 2,929 seconds (48 minutes 49 seconds) with
 retention active before an operator-requested shutdown. It captured and
 delivered exactly 29,208,400 events, averaging 9,971 events/second, with no
 capture reconnects, dropped metric samples, missing commit timestamps, or
@@ -148,20 +158,23 @@ consume retention capacity.
 
 ## Reproduction
 
-Start the benchmark PostgreSQL service, then run the supported profile:
+Start the benchmark PostgreSQL service, then run the measured 50k/s profile:
 
 ```bash
 docker compose up -d postgres
 
-RUN_ID=production-10k-49m \
-DURATION_SECONDS=3000 \
+RUN_ID=production-50k \
+DURATION_SECONDS=60 \
 ROWS_PER_TRANSACTION=100 \
-RATE=100 \
+RATE=500 \
 ACK_EVERY=5000 \
+CAPTURE_BATCH_MAX_EVENTS=2000 \
+CAPTURE_BATCH_MAX_DELAY_MS=40 \
 bench/run-local.sh
 ```
 
-Run the short 40k probe with `RATE=400` and `DURATION_SECONDS=60`. The harness
+The historical long-duration validation used `RATE=100` and
+`DURATION_SECONDS=3000`. The harness
 writes version, configuration, PostgreSQL, process, capture, consumer, and WAL
 measurements below `bench/results/<run-id>/`; those raw files are intentionally
 gitignored because they can be large and machine-specific.
