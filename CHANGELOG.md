@@ -10,7 +10,7 @@ All notable changes to this project will be documented here. The format follows
 
 - PostgreSQL 17 logical capture with atomic segmented redb persistence.
 - Ordered authenticated gRPC consumers with replay, acknowledgement, and seek.
-- Optional replay-safe Redis cache connector.
+- Optional replay-safe, in-process Redis cache sink.
 - Offline integrity check, checksummed backup, and verified restore commands.
 - TLS, source identity/gap protection, bounded resources, graceful shutdown,
   durable-format migrations, and production support validation.

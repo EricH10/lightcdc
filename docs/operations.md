@@ -22,7 +22,7 @@ docker run --rm lightcdc:0.1.0 --version
 docker run --rm --entrypoint id lightcdc:0.1.0
 ```
 
-Set `storage.data_dir = "/var/lib/lightcdc"` in the production config, then
+Set `runtime.data_dir = "/var/lib/lightcdc"` in the production config, then
 mount that path from persistent storage. Mount config and secrets read-only;
 the example below assumes the configured TLS and password files live under
 `/run/secrets`:

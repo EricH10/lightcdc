@@ -2,11 +2,13 @@
 
 `lightcdc` is a lightweight Rust CDC runtime for PostgreSQL. The long-term goal is to capture logical replication changes, persist them to a local embedded event store, replay them independently per consumer, and eventually run sandboxed WASM transforms before delivery.
 
-This repository currently has a local end-to-end MVP with PostgreSQL capture,
-durable redb replay, config-defined streams, and named gRPC consumers.
+This repository currently has a single-node release candidate with PostgreSQL
+capture, durable segmented redb replay, config-defined streams, named gRPC
+consumers, and in-process sinks. It is change-only: historical rows still need
+an externally coordinated snapshot or backfill.
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the ordered path from the current
-local MVP to a production-ready runtime.
+See [`docs/roadmap.md`](docs/roadmap.md) for the completed single-node release
+gate and the remaining product and scale milestones.
 
 See [`docs/debugging.md`](docs/debugging.md) for the project VS Code debugger
 setup and a Rust debugging walkthrough.
@@ -59,7 +61,7 @@ docker run --rm lightcdc:0.1.0 --version
 The image runs as UID/GID 10001 and includes built-in sink adapters in the
 `lightcdc` binary. Production deployment requires a read-only config mount,
 mounted secrets, and a persistent `/var/lib/lightcdc` volume. Set
-`storage.data_dir = "/var/lib/lightcdc"` in the mounted configuration. The
+`runtime.data_dir = "/var/lib/lightcdc"` in the mounted configuration. The
 complete command, signal, health, and supported-platform contract is in the
 operations runbook.
 

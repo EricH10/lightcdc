@@ -1,15 +1,16 @@
 # Roadmap
 
-`lightcdc` currently has an end-to-end local MVP:
+`lightcdc` currently has a single-node release candidate:
 
 ```text
 PostgreSQL -> logical replication -> pgoutput decoding -> redb
-    -> configured stream -> gRPC consumer -> acknowledgement
+    -> configured stream -> gRPC consumer or in-process sink
 ```
 
-The MVP proves the product path, but it is not production-ready yet. Work is
-ordered so correctness and recovery come before throughput and product
-features.
+The narrow production-readiness gate below is complete, with its documented
+change-only, single-node, and soak-test limitations. Remaining work expands the
+product beyond that first release boundary rather than repairing a known silent
+data-loss path.
 
 ## Production Readiness Gate
 
@@ -258,8 +259,8 @@ duplicates.
 
 ## Deferred Correctness and Recovery Edges
 
-These do not block the local MVP or Milestone 3, but should be covered before a
-production-stability claim:
+These do not block the documented first-release boundary, but remain useful
+hardening work:
 
 - Add a process-kill integration test while a spill file is actively being
   written before the source transaction commits. Source-scoped orphan cleanup is
@@ -271,8 +272,6 @@ production-stability claim:
 - Keep durable-format migration fixtures for every future format change. DONE
   for the first control, segment-event, and staging versions.
 - Test the configured byte and event limits at their exact boundary values.
-- Persist PostgreSQL source identity and reject source replacement, stale local
-  restore, or a slot checkpoint ahead of the durable local source LSN.
 - Add broader restart fixtures for migrations and local/source checkpoint
   divergence. Offline restore, compatible migration, incompatible-format, and
   corrupt-payload fixtures now exist.
@@ -313,19 +312,21 @@ intervention.
 
 ## Milestone 4: Health and Observability
 
-- Add gRPC health and readiness reporting. DONE for lifecycle/source state;
-  disk and detailed lag readiness remain.
-- Report PostgreSQL connection state and reconnect count.
-- Report received, persisted, and acknowledged positions.
-- Report slot `confirmed_flush_lsn`, retained WAL bytes, `wal_status`,
-  `safe_wal_size`, and source/local checkpoint divergence.
-- Report capture throughput, consumer lag, redb latency, and disk usage.
-  PARTIAL: the opt-in benchmark harness records capture and consumer throughput,
-  redb persistence latency, WAL lag, CPU, memory, and disk usage as JSONL/CSV;
-  production health endpoints and alerts remain.
-- Warn and report metrics when backfills or migrations create unusually large
-  transactions or sustained staging-disk growth.
-- Report active consumers and bounded-channel pressure.
+- Add gRPC health and readiness reporting. DONE with separate liveness and
+  storage/source-aware readiness services.
+- Report PostgreSQL connection state and reconnect count. DONE through runtime
+  state and the reconnect counter.
+- Report received, persisted, and acknowledged positions. DONE through capture,
+  durable source LSN, API delivery/ACK, and consumer-offset metrics.
+- Report source WAL progress and local checkpoint divergence. DONE with source
+  WAL end, durable source LSN, and byte-lag gauges. Detailed PostgreSQL slot
+  `wal_status` and `safe_wal_size` sampling remains a future enhancement.
+- Report capture throughput, consumer lag, redb latency, and disk usage. DONE
+  through the fixed-cardinality Prometheus endpoint and benchmark harness.
+- Warn and report metrics when large transactions use disk staging. DONE with
+  staged transaction/byte counters and current staging allocation.
+- Report active consumers and bounded-channel pressure. DONE with durable
+  consumer, active subscription, rejection, and backpressure metrics.
 
 Complete when an operator can distinguish a healthy, lagging, retrying, and
 disk-constrained runtime without reading debug logs.
@@ -344,10 +345,10 @@ per-consumer polling has been removed:
 - Batch redb reads, writes, and acknowledgements where safe. PARTIAL: capture
   now group-commits complete source transactions using count, event, byte, and
   time limits; consumer acknowledgement batching remains client-controlled.
-- Move synchronous storage work onto a dedicated blocking boundary. PARTIAL:
+- Move synchronous storage work onto a dedicated blocking boundary. DONE:
   capture pipelines one in-flight group through a long-lived redb writer thread
   while the Tokio replication task assembles the next group; gRPC mutations use
-  that writer and reads use a fixed bounded reader pool. DONE.
+  that writer and reads use a fixed bounded reader pool.
 - Limit active subscriptions to protect memory and file descriptors. DONE.
 - Define duplicate consumer-name and consumer-group behavior. DONE for the
   ordered-cursor mode; shared groups are deferred to leased-message delivery.
@@ -373,13 +374,14 @@ slow consumer cannot stall capture or unrelated consumers.
   fails explicitly and requires a seek to the retained prefix or latest.
 - Compact events that are no longer needed. DONE with immutable event segments
   and whole-file deletion; retained events are not rewritten.
-- Restore append-like sustained throughput while retention is active. PARTIAL:
+- Restore append-like sustained throughput while retention is active. DONE for
+  the published initial capacity profile:
   count-, byte-, and age-bounded redb segments now make retention a whole-file
   operation. Transaction-level replay markers now replace the per-event capture
   index and moved the short local benchmark boundary from about 80k to around
-  100k events/second. Longer sustained retention benchmarks remain. Consider
-  encoded event blocks or multiple writable shards only when measured demand
-  justifies their added ordering and replay complexity.
+  100k events/second, while the release envelope remains a conservative 10k/s.
+  Consider encoded event blocks or multiple writable shards only when measured
+  demand justifies their added ordering and replay complexity.
 - Warn and shed work safely before disk exhaustion. DONE by refusing the next
   source commit or staging record while preserving the configured free-space
   reserve; PostgreSQL WAL acknowledgement does not advance.
@@ -392,13 +394,11 @@ observable behavior.
 - Add PostgreSQL and gRPC TLS. DONE.
 - Add consumer authentication and per-stream authorization. DONE.
 - Load secrets from environment variables or secret files. DONE.
-- Enforce event, request, subscription, and connection limits.
+- Enforce event, request, subscription, and connection limits. DONE.
 - Sanitize public API errors and default to not logging captured row payloads.
-- Validate publications, slots, and configured tables at startup. PARTIAL:
-  `wal_level`, replication privilege, publication, slot type, `pgoutput` plugin,
-  slot database, configured stream/publication table alignment, and
-  unnecessary-table reporting are validated; broader supported-feature
-  validation remains.
+  DONE.
+- Validate publications, slots, configured tables, and the supported PostgreSQL
+  feature boundary at startup. DONE for the PostgreSQL 17 support matrix.
 
 ## Milestone 8: Product Features
 
@@ -406,16 +406,17 @@ observable behavior.
 - Add webhook delivery with retries and a dead-letter queue.
 - Add sandboxed WASM transforms with transform versioning and replay.
 - Add multiple PostgreSQL sources and additional output adapters.
-- Maintain the optional Redis cache connector and extend its explicit truncate,
+- Maintain the optional in-process Redis sink and extend its explicit truncate,
   TOAST-upsert, and Redis Cluster boundaries only with safe semantics. INITIAL
-  standalone connector DONE for ordered, retry-safe invalidation/upsert with
-  acknowledgement only after Redis success.
+  sink DONE for ordered, retry-safe invalidation/upsert with durable offset
+  advancement only after Redis success.
 - Keep the storage boundary replaceable if one-node redb storage is outgrown.
 
 ## Current Next Step
 
-Push the production-readiness branch after GitHub credentials include workflow
-permission, let required CI validate the release matrix, and cut the first
-release candidate. High availability, shared consumer groups, and further
-retention/partitioning performance work remain later milestones rather than
-release blockers.
+Prepare the first release candidate from `main`: reconcile the version and
+changelog, run the release workflow, and publish the documented single-node
+support boundary. Initial product work after that should prioritize an
+administrative sink replay/reset operation and sink-specific observability.
+Built-in snapshots, shared consumer groups, high availability, and further
+retention/partitioning performance remain later milestones.
