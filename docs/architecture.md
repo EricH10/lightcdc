@@ -12,9 +12,9 @@ PostgreSQL logical replication
     -> in-process sink or replay/gRPC consumer
 ```
 
-Milestone 0 established the workspace, local database, configuration model, and
-CLI entrypoint. The current decoder handles relation, insert, update, delete,
-and truncate messages.
+The current decoder handles relation, insert, update, delete, and truncate
+messages. The runtime adds durable replay, bounded retention, independent
+consumer offsets, and in-process sinks around that capture path.
 
 ## Crate Boundaries
 
@@ -184,15 +184,15 @@ durability boundary and avoids trying to resume a partially decoded transaction.
 After PostgreSQL commits a source transaction, capture may hold that complete
 transaction briefly while collecting more committed transactions. The group
 flushes when it reaches the configured transaction, event, decoded-byte, or
-time limit. Defaults are 100 transactions, 500 events, 4 MiB, and 20 ms.
+time limit. Defaults are 100 transactions, 1,000 events, 4 MiB, and 20 ms.
 
-One write transaction in the active segment streams every group member, updates
-the event-ID index, and advances the source offset to the final transaction's
-LSN. Only after that commit succeeds does capture acknowledge the final LSN to
-PostgreSQL. A crash before the segment commit replays the whole group; a crash
-afterward resumes from its final durable LSN. Grouping therefore changes
-visibility latency but not the no-loss boundary or individual transaction
-metadata.
+One write transaction in the active segment streams every group member, records
+one replay marker per source transaction, and advances the source offset to the
+final transaction's LSN. Only after that commit succeeds does capture
+acknowledge the final LSN to PostgreSQL. A crash before the segment commit
+replays the whole group; a crash afterward resumes from its final durable LSN.
+Grouping therefore changes visibility latency but not the no-loss boundary or
+individual transaction metadata.
 
 After reconnecting from an existing source offset, capture reconciles replayed
 transactions individually before group commits resume. This lets it reset

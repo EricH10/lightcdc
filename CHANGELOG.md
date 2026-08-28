@@ -6,6 +6,8 @@ All notable changes to this project will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-28
+
 ### Added
 
 - PostgreSQL 17 logical capture with atomic segmented redb persistence.
@@ -18,3 +20,4 @@ All notable changes to this project will be documented here. The format follows
   durable consumer identities.
 
 [Unreleased]: https://github.com/EricH10/lightcdc/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/EricH10/lightcdc/releases/tag/v0.1.0

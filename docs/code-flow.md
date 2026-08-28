@@ -7,11 +7,12 @@
 - `capture/mod.rs` wires configuration, storage, metrics, retention, and serving.
 - `capture/supervisor.rs` owns validation, reconnects, heartbeats, and session lifetime.
 - `capture/pipeline.rs` overlaps PostgreSQL reads with one in-flight redb write.
-- `capture/writer.rs` owns the dedicated synchronous redb thread.
 - `capture/metrics.rs` owns optional non-blocking benchmark metrics.
 - `commands.rs` implements replay, inspect, and serve-only commands.
 - `display.rs` formats events and inspector tables.
 - `store.rs` translates runtime configuration into redb open options.
+- `lightcdc-runtime` owns the dedicated synchronous storage writer, bounded
+  reader pool, sink workers, runtime state, and production metrics.
 
 ## Runtime Flow
 

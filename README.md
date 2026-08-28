@@ -1,412 +1,208 @@
 # lightcdc
 
-`lightcdc` is a lightweight Rust CDC runtime for PostgreSQL. The long-term goal is to capture logical replication changes, persist them to a local embedded event store, replay them independently per consumer, and eventually run sandboxed WASM transforms before delivery.
+[![CI](https://github.com/EricH10/lightcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/EricH10/lightcdc/actions/workflows/ci.yml)
+[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-000000?logo=rust)](rust-toolchain.toml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-This repository currently has a single-node release candidate with PostgreSQL
-capture, durable segmented redb replay, config-defined streams, named gRPC
-consumers, and in-process sinks. It is change-only: historical rows still need
-an externally coordinated snapshot or backfill.
+LightCDC is a single-node PostgreSQL change data capture runtime written in
+Rust. It durably moves committed logical-replication changes into a local event
+log, then lets independent consumers and built-in sinks process those changes
+at their own pace.
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the completed single-node release
-gate and the remaining product and scale milestones.
+The first release focuses on a dependable local CDC building block: global
+event order, atomic source checkpoints, bounded storage, crash recovery, and
+explicit consumer replay semantics without requiring Kafka or a second service
+for internal durability.
 
-See [`docs/debugging.md`](docs/debugging.md) for the project VS Code debugger
-setup and a Rust debugging walkthrough.
+## Highlights
 
-See [`docs/consumer-delivery.md`](docs/consumer-delivery.md) for the current
-ordered consumer and acknowledgement contract.
+- PostgreSQL 17 logical replication with `pgoutput` decoding.
+- Transaction-atomic persistence of events and source LSNs.
+- Segmented redb event log with count, byte, and age retention.
+- Named gRPC consumers with independent durable offsets, cumulative ACKs, and
+  explicit seek behavior.
+- Config-defined streams and capture-side table filtering.
+- Disk-backed staging for transactions that exceed the in-memory threshold.
+- In-process sink runtime with an optional replay-safe Redis connector.
+- TLS, bearer-token authentication, bounded API resources, graceful shutdown,
+  and stable operational exit codes.
+- Prometheus metrics, integrity checks, checksummed backup and restore, and
+  Docker-backed crash and recovery tests.
 
-See [`docs/redis-connector.md`](docs/redis-connector.md) for the optional,
-in-process Redis cache invalidation and update sink.
+## Architecture
 
-See [`docs/postgres-support.md`](docs/postgres-support.md) for the PostgreSQL 17
-feature matrix, change-only bootstrap boundary, and least-privilege role.
+```mermaid
+flowchart LR
+    PG["PostgreSQL WAL"] --> CAP["Capture and pgoutput decoder"]
+    CAP --> WRITER["Dedicated storage writer"]
+    WRITER --> LOG["Segmented redb event log"]
+    LOG --> API["gRPC consumer API"]
+    LOG --> SINKS["In-process sinks"]
+    API --> C1["Named consumer A"]
+    API --> C2["Named consumer B"]
+    SINKS --> REDIS["Redis"]
+    WRITER -. "durable LSN acknowledgement" .-> PG
+```
 
-See [`docs/operations.md`](docs/operations.md) for production deployment,
-health probes, backup, recovery, and upgrade procedures.
-The runbook defines stable configuration and data-safety exit codes so service
-managers can avoid unsafe restart loops.
+Capture acknowledges PostgreSQL only after a complete source transaction and
+its source LSN are durable. Consumers acknowledge their own ordered offsets
+independently, so a slow or disconnected consumer does not stop capture or
+another consumer.
 
-See [`docs/metrics.md`](docs/metrics.md) for the Prometheus metric contract and
-starting alert thresholds.
+See [Architecture](docs/architecture.md) and [Code Flow](docs/code-flow.md) for
+the detailed concurrency and data-flow model.
 
-## Prerequisites
+## Measured Capacity
+
+The initial measured single-consumer envelope is **50,000 events/second** for
+100-row source transactions, a 256-byte compressible payload, ACKs every 5,000
+events, active retention, and the documented high-throughput batching profile.
+
+A 10-minute 60k/s boundary run delivered all 35.7 million events, but periodic
+storage and retention stalls pushed worst one-second p99 latency to 16.2
+seconds. LightCDC therefore publishes 50k/s as the operating envelope and
+treats 60k/s as workload-specific headroom, not a universal guarantee.
+
+Capacity depends on transaction size, payload shape, storage, retention,
+consumer count, and acknowledgement cadence. Re-run the included harness on
+the target system before choosing a production rate. See the
+[production capacity baseline](docs/benchmarks/2026-08-02-production-capacity.md),
+[Linux boundary run](docs/benchmarks/2026-08-28-linux-capacity.md), and
+[benchmark guide](bench/README.md).
+
+## Quick Start
+
+Prerequisites:
 
 - Rust 1.89 or newer
-- Docker and Docker Compose
+- Docker with Docker Compose
 
-## Local Setup
-
-Start PostgreSQL with logical replication enabled:
+Start PostgreSQL and Redis:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d --wait postgres redis
 ```
 
-Run the CLI:
+Run capture, the gRPC API, and configured sinks in one process:
 
 ```bash
-cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml
+cargo run -p lightcdc-cli -- run --config lightcdc.example.toml
 ```
+
+In another terminal, subscribe a named consumer and generate a 32-event demo
+transaction:
+
+```bash
+cargo run -p lightcdc-api --example consumer -- \
+  --stream orders \
+  --consumer example-printer \
+  --seed-sql sql/demo_orders.sql \
+  --limit 32
+```
+
+The consumer prints inserts, updates, and deletes as they arrive and
+cumulatively acknowledges its durable position. Stop LightCDC with `Ctrl-C`;
+the runtime drains bounded in-flight work before exiting.
+
+## Configuration
+
+[lightcdc.example.toml](lightcdc.example.toml) documents the complete local
+configuration, including:
+
+- PostgreSQL connection, publication, slot, and TLS settings.
+- Runtime, transaction, storage, retention, and disk-safety limits.
+- gRPC authentication and transport limits.
+- Stream-to-table selection.
+- Redis sink routing and key mapping.
+- Logging and Prometheus metrics.
+
+Production credentials can come from environment variables or mounted files.
+Plaintext unauthenticated gRPC is accepted only on a loopback bind. The
+[operations runbook](docs/operations.md) covers least-privilege roles, secret
+handling, deployment, health probes, backup, restore, failover boundaries, WAL
+growth, and disk pressure.
+
+## Delivery Contract
+
+LightCDC provides ordered, at-least-once delivery from its durable local log:
+
+- A consumer name identifies one durable cursor within one stream.
+- `Subscribe` starts at that cursor unless the consumer explicitly seeks.
+- `Ack` advances monotonically and never moves a cursor backward.
+- Redelivery is possible after a consumer processes an event but crashes before
+  acknowledging it.
+- Retention does not wait forever for abandoned consumers; an expired cursor
+  fails explicitly and requires an operator-selected seek.
+
+The protobuf contract is in
+[lightcdc.proto](crates/lightcdc-api/proto/lightcdc/v1/lightcdc.proto). Any gRPC
+language can generate a compatible client; the Rust example is only a reference
+consumer. See [Consumer Delivery](docs/consumer-delivery.md) for the complete
+contract.
+
+## Current Boundaries
+
+- PostgreSQL 17 is the validated source version.
+- Capture is change-only; an initial snapshot or backfill must be coordinated
+  externally.
+- One LightCDC process owns one data directory. Host loss requires restart or
+  offline restore; there is no automatic active-active failover.
+- The local event log preserves one global sequence. Writer partitioning and
+  shared leased-consumer groups are future scale features.
+- Supported `pgoutput` behavior and known schema limitations are listed in
+  [PostgreSQL Support](docs/postgres-support.md).
+- WASM transforms and webhook destinations are roadmap items, not current
+  release features.
 
 ## Production Image
 
-Build the pinned Debian Bookworm image and verify its CLI:
+Build and verify the pinned Debian Bookworm image:
 
 ```bash
 docker build -t lightcdc:0.1.0 .
 docker run --rm lightcdc:0.1.0 --version
 ```
 
-The image runs as UID/GID 10001 and includes built-in sink adapters in the
-`lightcdc` binary. Production deployment requires a read-only config mount,
-mounted secrets, and a persistent `/var/lib/lightcdc` volume. Set
-`runtime.data_dir = "/var/lib/lightcdc"` in the mounted configuration. The
-complete command, signal, health, and supported-platform contract is in the
-operations runbook.
+The image runs as UID/GID 10001. Production deployment requires a read-only
+configuration mount, mounted secrets, and a persistent `/var/lib/lightcdc`
+volume.
 
-Capture does not print row payloads by default. Add `--output json` only for
-local debugging when stdout is approved to contain source data.
+## Development
 
-For a bounded local smoke test:
+Run the local quality suite:
 
 ```bash
-cargo run -p lightcdc-cli -- capture --config lightcdc.example.toml --stop-after-events 3
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check
 ```
 
-Capture keeps the union of tables selected by configured durable streams, even
-when no consumer is currently connected:
-
-```toml
-[[streams]]
-name = "orders"
-source = "default"
-tables = ["public.orders"]
-```
-
-The PostgreSQL publication must contain every table matched by the stream
-configuration. Startup fails when a required table is missing and warns when
-the publication contains unnecessary tables. The publication remains
-operator-managed; LightCDC also filters unmatched published tables before they
-receive local event sequences or enter redb.
-
-Transactional logical heartbeats advance the replication slot safely while
-only unpublished or filtered tables are changing:
-
-```toml
-heartbeat_interval_ms = 10000
-```
-
-Heartbeat transactions persist only the source checkpoint and do not create
-consumer events. Changing a stream's tables affects future capture only;
-historical rows and changes require a snapshot or backfill.
-
-Consumer resource limits are validated at startup and applied by the gRPC
-service:
-
-```toml
-channel_capacity = 1024
-max_active_subscriptions = 1024
-max_durable_consumers = 10000
-max_consumer_name_bytes = 128
-max_outbound_event_bytes = 16777216
-max_inbound_request_bytes = 65536
-max_requests_per_connection = 128
-max_api_connections = 1024
-max_header_list_bytes = 32768
-replay_reader_threads = 2
-replay_reader_queue_capacity = 1024
-replay_batch_events = 256
-replay_batch_max_bytes = 67108864
-max_storage_bytes = 107374182400
-min_free_disk_bytes = 1073741824
-shutdown_timeout_ms = 10000
-```
-
-Production metrics use fixed atomics and a separate storage-sampling thread:
-
-```toml
-[observability]
-metrics_enabled = true
-metrics_addr = "127.0.0.1:9187"
-metrics_sample_interval_seconds = 15
-metrics_max_connections = 16
-```
-
-`GET /metrics` is plaintext and contains no table, stream, consumer, or row
-labels. Bind it only to loopback or a trusted monitoring network. Filesystem
-sampling remains active when the listener is disabled because gRPC readiness
-uses it to detect storage pressure.
-
-`channel_capacity` is the bounded per-subscription event queue. An oversized
-event or exhausted subscription limit returns `RESOURCE_EXHAUSTED` without
-advancing the consumer offset. Synchronous redb replay runs on a fixed reader
-pool, not Tokio workers. Its command queue, event count, byte size, and
-simultaneous completed batches are bounded. Tonic also enforces request,
-header-list, TCP connection, and per-connection concurrent-request limits.
-Creating an offset with ACK or seek is also rejected once
-`max_durable_consumers` distinct `(stream, consumer)` identities exist; existing
-identities can continue advancing.
-
-Transaction buffering is bounded by three `[runtime]` settings:
-
-```toml
-transaction_memory_threshold_bytes = 16777216
-max_transaction_bytes = 1073741824
-max_transaction_events = 1000000
-```
-
-Transactions stay in memory through the threshold, then spill to
-`data_dir/staging/<source>/`. The staged file is scratch space: redb stores the
-committed transaction and source LSN atomically, PostgreSQL is acknowledged only
-after that commit, and source-scoped leftovers from an abrupt exit are removed
-after the replacement capture acquires the replication slot.
-
-Complete source transactions are grouped into one durable redb commit using:
-
-```toml
-capture_batch_max_transactions = 100
-capture_batch_max_events = 1000
-capture_batch_max_bytes = 4194304
-capture_batch_max_delay_ms = 20
-```
-
-The first reached limit flushes the group. A source transaction is never split,
-and PostgreSQL is acknowledged only through the final LSN committed with the
-whole group. A dedicated `lightcdc-redb-writer` OS thread owns capture writes.
-While it commits one group, the Tokio replication task can decode the next
-group. Capture permits only one in-flight write and waits for its successful
-completion before submitting another group or acknowledging PostgreSQL.
-For sustained high-throughput workloads, `capture_batch_max_events = 2000`
-with `capture_batch_max_delay_ms = 40` further reduces durable commit
-frequency at the cost of additional batching latency.
-
-The event log uses one writable segment plus immutable sealed segments. Rotation
-is checked between capture groups, so a PostgreSQL transaction is never split
-between files:
-
-```toml
-segment_max_events = 1000000
-segment_max_bytes = 268435456
-segment_max_age_seconds = 900
-```
-
-The limits are preferred boundaries: a capture group that crosses one stays
-whole, then seals the segment. The active segment is immediately readable by
-replay and gRPC consumers; consumers do not wait for it to seal.
-
-Event-log retention is optional and targets a maximum retained event count,
-logical segment bytes, event age, or whichever boundary is reached first:
-
-```toml
-retention_max_events = 10000000
-retention_max_bytes = 10737418240
-retention_max_age_seconds = 604800
-retention_check_interval_ms = 1000
-retention_delete_batch_size = 100000
-```
-
-Omit both maximum settings to disable retention. Sweeps run on the dedicated
-redb writer thread so they cannot overlap capture commits. They delete whole
-sealed segment files, returning their disk space without rewriting retained
-events. Limits are segment-granular: the active segment and sweep interval can
-temporarily exceed a boundary, count retention may then keep up to one segment
-less than the configured maximum, and age retention waits until every event in
-a sealed segment has expired. Keep segment limits comfortably below the
-retention window. `retention_delete_batch_size` is a target work budget measured
-in events; one indivisible segment may exceed it. A retention I/O failure stops
-capture without acknowledging the current PostgreSQL transaction, rather than
-allowing storage to grow while sweeps silently fail.
-
-`max_storage_bytes` is a hard pre-commit ceiling across the data directory.
-`min_free_disk_bytes` reserves filesystem space both while spilling a large
-source transaction and before committing its redb batch. The writer reserves
-additional copy-on-write headroom. Reaching either boundary stops capture
-without advancing PostgreSQL acknowledgement, so an operator can free space or
-raise a deliberately sized limit and resume without losing the transaction.
-
-Retention is a hard log boundary: a durable consumer that falls behind receives
-an explicit expired offset error and must seek to `earliest` or `latest`.
-`earliest` means the oldest payload still retained.
-
-Run capture and the gRPC API together:
+Run Docker-backed PostgreSQL and Redis integration tests:
 
 ```bash
-cargo run -p lightcdc-cli -- run --config lightcdc.example.toml --addr 127.0.0.1:50051
+docker compose up -d --wait postgres redis
+cargo test -p lightcdc-cli --test capture_integration --locked -- --ignored --test-threads=1
+cargo test -p lightcdc-redis --locked -- --ignored --test-threads=1
 ```
 
-Production PostgreSQL connections default to certificate and hostname
-verification. Load the password from a mounted secret and configure a private
-CA only when platform trust roots do not contain it:
+See [Local Development](docs/local-development.md),
+[Debugging](docs/debugging.md), and [Contributing](CONTRIBUTING.md) before making
+larger changes.
 
-```toml
-[source]
-password_file = "/run/secrets/postgres-password"
-tls_mode = "verify_full"
-# tls_ca_file = "/run/secrets/postgres-ca.pem"
-```
+## Documentation
 
-A non-loopback gRPC bind requires TLS and at least one bearer principal:
+| Document | Purpose |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Component boundaries, concurrency, and durable data flow |
+| [Operations](docs/operations.md) | Deployment, health, recovery, backup, upgrades, and failure handling |
+| [Consumer Delivery](docs/consumer-delivery.md) | Subscribe, ACK, seek, replay, and expiration semantics |
+| [PostgreSQL Support](docs/postgres-support.md) | Source setup, feature matrix, schema behavior, and bootstrap boundary |
+| [Redis Connector](docs/redis-connector.md) | Built-in sink configuration and replay-safe behavior |
+| [Metrics](docs/metrics.md) | Prometheus contract and starting alert thresholds |
+| [Roadmap](docs/roadmap.md) | Completed release gate and remaining product and scale milestones |
 
-```toml
-[api]
-tls_cert_file = "/run/secrets/lightcdc-server.pem"
-tls_key_file = "/run/secrets/lightcdc-server-key.pem"
+## License
 
-[[api.tokens]]
-name = "orders-reader"
-token_file = "/run/secrets/orders-reader-token"
-streams = ["orders"]
-allow_seek = false
-```
-
-Bearer tokens authorize `Subscribe` and `Ack` for their configured streams;
-`Seek` additionally requires `allow_seek = true`. Plaintext unauthenticated
-serving is restricted to loopback and must be explicitly enabled with
-`api.allow_insecure_localhost = true` for local development.
-
-Replay captured events from the local redb store:
-
-```bash
-cargo run -p lightcdc-cli -- replay --config lightcdc.example.toml --from 1 --limit 10
-cargo run -p lightcdc-cli -- replay --config lightcdc.example.toml --stream orders --from 1 --limit 10
-```
-
-Use pretty JSON for interactive inspection:
-
-```bash
-cargo run -p lightcdc-cli -- replay --config lightcdc.example.toml --from 1 --limit 1 --pretty
-```
-
-Inspect the redb tables, source checkpoints, consumer offsets, lag, and recent
-events:
-
-```bash
-cargo run -p lightcdc-cli -- inspect --config lightcdc.example.toml
-cargo run -p lightcdc-cli -- inspect --config lightcdc.example.toml --sequence 42
-```
-
-The second command also prints the full decoded event at sequence 42. Stop
-`capture`, `run`, or `serve` before inspecting because redb allows only one
-process to open the control and active segment files.
-
-Run a deep offline integrity traversal, or create and restore a checksummed
-backup directory:
-
-```bash
-cargo run -p lightcdc-cli -- check --config lightcdc.example.toml
-cargo run -p lightcdc-cli -- backup --config lightcdc.example.toml \
-  --output /backups/lightcdc-2026-08-01
-cargo run -p lightcdc-cli -- restore --config lightcdc.example.toml \
-  --input /backups/lightcdc-2026-08-01
-```
-
-Stop every LightCDC command using the store first. Backup holds redb's process
-lock, verifies every retained event and metadata table, copies only durable
-control/segment files, records SHA-256 checksums and source recovery metadata,
-then atomically publishes the destination. Restore requires an empty configured
-data directory and verifies checksums plus the complete temporary store before
-publishing it. See [`docs/operations.md`](docs/operations.md) for the required
-PostgreSQL slot/WAL coordination and recovery boundaries.
-
-Serve the gRPC API:
-
-```bash
-cargo run -p lightcdc-cli -- serve --config lightcdc.example.toml --addr 127.0.0.1:50051
-```
-
-Use `serve` when capture is not running. For live capture plus streaming
-consumers, use `run` so both paths share one segmented store inside the same
-process.
-
-The server implements the standard gRPC health protocol. Check
-`lightcdc.liveness` for process liveness and `lightcdc.readiness` for capture
-readiness. Readiness is serving only in the `capturing` state; startup,
-PostgreSQL reconnect, draining, and terminal states report not serving while
-retained-event APIs remain available until shutdown begins.
-
-Run an example gRPC consumer that prints and acks events:
-
-```bash
-cargo run -p lightcdc-api --example consumer -- \
-  --endpoint http://127.0.0.1:50051 \
-  --stream orders \
-  --consumer example-printer \
-  --seek latest \
-  --seed-sql sql/demo_orders.sql \
-  --limit 32
-```
-
-Run capture, gRPC, and the configured Redis sink in one process:
-
-```bash
-docker compose up -d redis
-cargo run -p lightcdc-cli -- run --config lightcdc.example.toml
-```
-
-The sink applies ordered, retry-safe Redis mutations before advancing its
-durable offset. See the sink guide for configuration, invalidation, upsert,
-redelivery, and retention behavior.
-
-Run checks:
-
-```bash
-cargo fmt --all
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Run Docker-backed integration tests:
-
-```bash
-docker compose up -d postgres
-cargo test -p lightcdc-cli --test capture_integration -- --ignored --test-threads=1
-```
-
-Run a short end-to-end load test:
-
-```bash
-docker compose up -d postgres
-DURATION_SECONDS=10 CLIENTS=4 THREADS=2 bench/run-local.sh
-```
-
-The harness uses release binaries, disables per-event output, drives PostgreSQL
-with a parameterized `pgbench` workload, and records capture, redb, gRPC,
-acknowledgement, WAL, CPU, memory, and disk measurements. See
-[`bench/README.md`](bench/README.md) for fixed-rate limit discovery, environment
-guidance, and the instrumentation overhead policy.
-
-## Current Scope
-
-Implemented basics:
-
-- Cargo workspace
-- Core event and config types
-- CLI command shape
-- PostgreSQL connectivity check
-- Segmented redb event store with atomic source checkpoints
-- Logical replication stream connection
-- Combined capture plus gRPC serving command
-- `pgoutput` relation, insert, update, delete, and truncate decoding
-- Source offset persistence and idempotent duplicate replay handling
-- Configured-stream capture planning, publication-table validation,
-  capture-side filtering, and logical heartbeat checkpoints
-- Whole-segment count and age retention with explicit stale-consumer behavior
-- Bounded transaction accounting with disk-backed spill staging and crash cleanup
-- Opt-in capture group-commit metrics and an end-to-end load-test harness
-- Docker-backed integration tests for capture, abrupt process recovery,
-  PostgreSQL reconnect, large transactions, delete identities, TOAST values,
-  truncates, and relation refresh after schema changes
-- Config-defined streams
-- Stream-filtered replay
-- gRPC `Subscribe`, `Ack`, and `Seek`
-- Local Docker Compose PostgreSQL
-- Optional Redis cache invalidation and JSON-row upsert connector
-- Init SQL for a demo table and publication
-- Architecture and local development notes
-
-Not implemented yet:
-
-- Complete `pgoutput` coverage
-- WASM transform runtime
-- Webhook destinations
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.
