@@ -440,9 +440,11 @@ impl ReplicationReader {
 
         ChangeEvent {
             sequence: self.sequence,
-            event_id: format!(
-                "postgres:{}:{}:{}",
-                self.source.database, self.source.slot, wal_start
+            event_id: row_event_id(
+                &self.source.database,
+                &self.source.slot,
+                wal_start,
+                self.sequence,
             ),
             source: SourceMetadata {
                 database: self.source.database.clone(),
@@ -496,7 +498,15 @@ impl PostgresError {
                 .is_none_or(|code| is_retryable_sqlstate(code.code())),
             Self::Replication(error) if error.is_transient() => true,
             Self::Replication(PgWireError::Server(message)) => {
-                replication_server_sqlstate(message).is_some_and(is_retryable_sqlstate)
+                match replication_server_sqlstate(message) {
+                    Some(code) => is_retryable_sqlstate(code),
+                    // A server error without a parseable SQLSTATE is not one
+                    // of the configuration classes above — PostgreSQL always
+                    // sends a code with auth/config failures — so treat it as
+                    // transient: reconnect from the durable LSN instead of
+                    // stopping capture on an unclassifiable message.
+                    None => true,
+                }
             }
             Self::Configuration(_)
             | Self::ResumeLsnGap { .. }
@@ -1066,6 +1076,17 @@ fn pg_time_to_unix_ms(pg_micros: i64) -> i64 {
     POSTGRES_EPOCH_UNIX_MS + (pg_micros / 1_000)
 }
 
+/// Formats the opaque event id for one decoded row change.
+///
+/// The id embeds the locally assigned sequence because pgoutput decodes
+/// every row of one multi-insert (COPY) WAL record from the same
+/// `wal_start`; without the sequence every row of that record would share
+/// an id and collide in downstream idempotency tracking. The storage layer
+/// treats the id as an opaque string, so the format may evolve freely.
+fn row_event_id(database: &str, slot: &str, wal_start: Lsn, sequence: u64) -> String {
+    format!("postgres:{database}:{slot}:{wal_start}:{sequence}")
+}
+
 /// Classifies SQLSTATE families that can recover without configuration changes.
 fn is_retryable_sqlstate(code: &str) -> bool {
     code.starts_with("08")
@@ -1085,11 +1106,12 @@ mod tests {
 
     use lightcdc_core::{PostgresTlsMode, SourceConfig};
     use pgwire_replication::error::PgWireError;
+    use pgwire_replication::lsn::Lsn;
     use tempfile::TempDir;
 
     use super::{
-        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, sql_config,
-        sql_tls_connector, validate_resume_lsn,
+        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, row_event_id,
+        sql_config, sql_tls_connector, validate_resume_lsn,
     };
 
     #[test]
@@ -1177,6 +1199,48 @@ mod tests {
         assert_eq!(
             replication_server_sqlstate("malformed (SQLSTATE 123)"),
             None
+        );
+    }
+
+    #[test]
+    fn row_event_ids_are_unique_across_rows_of_one_wal_record() {
+        let wal_start = Lsn::from(0x0f00);
+        let first = row_event_id("postgres", "lightcdc_slot", wal_start, 1);
+        let second = row_event_id("postgres", "lightcdc_slot", wal_start, 2);
+
+        // Two rows decoded from the same multi-insert WAL record share
+        // wal_start but receive distinct locally assigned sequences.
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            format!("postgres:postgres:lightcdc_slot:{wal_start}:1")
+        );
+    }
+
+    #[test]
+    fn retries_server_errors_without_a_parseable_sqlstate() {
+        // A server message without a SQLSTATE is not an auth/config failure
+        // (those always carry their code), so capture reconnects from the
+        // durable LSN instead of stopping.
+        assert!(
+            PostgresError::Replication(PgWireError::Server(
+                "terminating connection due to administrator command".to_owned()
+            ))
+            .is_retryable()
+        );
+        assert!(
+            PostgresError::Replication(PgWireError::Server(
+                "unknown server error".to_owned()
+            ))
+            .is_retryable()
+        );
+        // Configuration failures still carry explicit SQLSTATE codes and
+        // remain fatal.
+        assert!(
+            !PostgresError::Replication(PgWireError::Server(
+                "publication does not exist (SQLSTATE 42704)".to_owned()
+            ))
+            .is_retryable()
         );
     }
 

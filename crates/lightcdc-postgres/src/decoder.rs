@@ -1,6 +1,6 @@
 //! Decodes stateful PostgreSQL `pgoutput` messages into relation-aware row changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -89,10 +89,25 @@ pub struct RowChange {
     pub new: Option<Vec<u8>>,
 }
 
+/// Maximum number of relation metadata entries cached per session.
+///
+/// pgoutput re-announces relation metadata on demand, so when the cache
+/// exceeds this cap the least-recently-announced entry can be evicted
+/// safely: a row message for an evicted relation is always preceded by a
+/// fresh Relation message. Evicting the oldest entry (rather than clearing
+/// the whole map) keeps every relation announced by the current transaction,
+/// which a later Truncate message in the same transaction may still
+/// reference. The cap bounds decoder memory under sustained schema churn
+/// (e.g. many short-lived tables).
+const RELATION_CACHE_CAP: usize = 4096;
+
 /// Decodes pgoutput messages while remembering relation metadata.
 #[derive(Debug, Default)]
 pub struct PgOutputDecoder {
     relations: HashMap<u32, Relation>,
+    /// Announcement order of cached relation ids; the front is the eviction
+    /// candidate when the cache exceeds its cap.
+    relation_order: VecDeque<u32>,
 }
 
 impl PgOutputDecoder {
@@ -104,7 +119,23 @@ impl PgOutputDecoder {
         match tag {
             'R' => {
                 let relation = decode_relation(&mut reader)?;
+                // pgoutput re-announces relation metadata on demand, so the
+                // cache can be bounded: evict the least-recently-announced
+                // relation when the cap is exceeded. Relations announced by
+                // the current transaction are the newest entries and survive
+                // eviction, so Truncate resolution (which references every
+                // affected relation at once) keeps working.
+                if !self.relations.contains_key(&relation.id) {
+                    self.relation_order.push_back(relation.id);
+                }
                 self.relations.insert(relation.id, relation.clone());
+                while self.relations.len() > RELATION_CACHE_CAP {
+                    let id = self
+                        .relation_order
+                        .pop_front()
+                        .expect("eviction order tracks cached relations");
+                    self.relations.remove(&id);
+                }
                 Ok(PgOutputMessage::Relation(relation))
             }
             'I' => self.decode_insert(&mut reader),
@@ -393,5 +424,116 @@ impl Relation {
                 .map(|column| column.name.as_str())
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeError, PgOutputDecoder, PgOutputMessage, RELATION_CACHE_CAP};
+
+    /// Builds a pgoutput Relation message announcing `id` with one column.
+    fn relation_message(id: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(b'R');
+        bytes.extend_from_slice(&id.to_be_bytes());
+        bytes.extend_from_slice(b"public\0");
+        bytes.extend_from_slice(b"events\0");
+        bytes.push(0); // replica identity: default
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // one column
+        bytes.push(0); // column flags: none
+        bytes.extend_from_slice(b"id\0");
+        bytes.extend_from_slice(&23u32.to_be_bytes()); // int4 type oid
+        bytes.extend_from_slice(&(-1i32).to_be_bytes()); // no type modifier
+        bytes
+    }
+
+    /// Builds a pgoutput Insert message for `relation_id` with one null column.
+    fn insert_message(relation_id: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(b'I');
+        bytes.extend_from_slice(&relation_id.to_be_bytes());
+        bytes.push(b'N');
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.push(b'n');
+        bytes
+    }
+
+    #[test]
+    fn relation_cache_stays_bounded_under_schema_churn() {
+        let mut decoder = PgOutputDecoder::default();
+
+        for id in 0..RELATION_CACHE_CAP as u32 {
+            decoder.decode(&relation_message(id)).expect("relation decodes");
+        }
+        assert_eq!(decoder.relations.len(), RELATION_CACHE_CAP);
+
+        // One more announcement evicts the least-recently-announced relation
+        // and keeps the cache within its cap.
+        decoder
+            .decode(&relation_message(RELATION_CACHE_CAP as u32))
+            .expect("relation decodes");
+        assert_eq!(decoder.relations.len(), RELATION_CACHE_CAP);
+        assert!(!decoder.relations.contains_key(&0));
+        assert!(decoder.relations.contains_key(&(RELATION_CACHE_CAP as u32)));
+    }
+
+    #[test]
+    fn reannounced_relation_decodes_rows_after_eviction() {
+        let mut decoder = PgOutputDecoder::default();
+
+        for id in 0..RELATION_CACHE_CAP as u32 {
+            decoder.decode(&relation_message(id)).expect("relation decodes");
+        }
+        // Evicts relation 0.
+        decoder
+            .decode(&relation_message(RELATION_CACHE_CAP as u32))
+            .expect("relation decodes");
+
+        // Row messages for an evicted relation fail until pgoutput
+        // re-announces it.
+        assert!(matches!(
+            decoder.decode(&insert_message(0)),
+            Err(DecodeError::MissingRelation(0))
+        ));
+
+        // Re-announcing the relation makes its rows decodable again, and the
+        // cache stays within its cap.
+        decoder
+            .decode(&relation_message(0))
+            .expect("re-announced relation decodes");
+        assert!(matches!(
+            decoder.decode(&insert_message(0)),
+            Ok(PgOutputMessage::Insert(_))
+        ));
+        assert_eq!(decoder.relations.len(), RELATION_CACHE_CAP);
+    }
+
+    #[test]
+    fn truncate_resolves_relations_announced_by_the_current_transaction() {
+        let mut decoder = PgOutputDecoder::default();
+        // Fill the cache so the next announcements force evictions.
+        for id in 0..RELATION_CACHE_CAP as u32 {
+            decoder.decode(&relation_message(id)).expect("relation decodes");
+        }
+
+        // One transaction truncates two tables: both relations are announced
+        // (evicting only pre-transaction entries) and then referenced by one
+        // Truncate message, which must resolve both.
+        let a = RELATION_CACHE_CAP as u32;
+        let b = RELATION_CACHE_CAP as u32 + 1;
+        decoder.decode(&relation_message(a)).expect("relation decodes");
+        decoder.decode(&relation_message(b)).expect("relation decodes");
+
+        let mut truncate = Vec::new();
+        truncate.push(b'T');
+        truncate.extend_from_slice(&2u32.to_be_bytes());
+        truncate.push(0); // truncate options
+        truncate.extend_from_slice(&a.to_be_bytes());
+        truncate.extend_from_slice(&b.to_be_bytes());
+
+        assert!(matches!(
+            decoder.decode(&truncate),
+            Ok(PgOutputMessage::Truncate(relations)) if relations.len() == 2
+        ));
     }
 }
