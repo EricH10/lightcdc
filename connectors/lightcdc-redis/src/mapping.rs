@@ -73,7 +73,15 @@ pub(crate) fn map_event(
                     ));
                 }
                 let target_key = render_key(&rule.key, after_row)?;
-                for old_key in render_distinct_keys(rule, [&key, &before])? {
+                let old_keys = render_distinct_keys(rule, [&key, &before])?;
+                if operation == Operation::Update && old_keys.is_empty() {
+                    return Err(anyhow!(
+                        "event {} cannot render the previous Redis key {:?}; include every key-template column in the table replica identity before using upsert",
+                        event.sequence,
+                        rule.key
+                    ));
+                }
+                for old_key in old_keys {
                     if old_key != target_key {
                         output.push(CacheMutation::Delete { key: old_key });
                     }
@@ -260,6 +268,20 @@ mod tests {
             CacheMutation::Set { key, ttl_seconds: Some(60), .. }
                 if key == "tenant:a:order:2"
         ));
+    }
+
+    #[test]
+    fn upsert_rejects_an_update_without_the_previous_key_columns() {
+        let event = event(
+            Operation::Update,
+            Some(r#"{"id":"1"}"#),
+            None,
+            Some(r#"{"tenant_id":"a","id":"1","status":"paid"}"#),
+        );
+
+        let error = map_event(&[rule(RedisCacheAction::Upsert)], &event)
+            .expect_err("an update must not leave an old Redis key behind");
+        assert!(error.to_string().contains("replica identity"), "{error}");
     }
 
     #[test]

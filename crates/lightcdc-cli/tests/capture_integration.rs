@@ -17,7 +17,7 @@ use lightcdc_storage::{
 };
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, binary_copy::BinaryCopyInWriter, types::Type};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CRASH_WORKER_ENV: &str = "LIGHTCDC_CRASH_CAPTURE_WORKER";
@@ -89,6 +89,58 @@ async fn captures_insert_update_delete_into_redb() -> anyhow::Result<()> {
     assert_json_field(events[1].after.as_deref(), "status", "paid")?;
     assert_json_field(events[2].before.as_deref(), "status", "paid")?;
     assert!(store.source_offset(&fixture.source_name)?.is_some());
+
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker compose postgres on localhost:5432"]
+async fn copy_rows_with_shared_wal_positions_have_unique_event_ids() -> anyhow::Result<()> {
+    const ROWS: usize = 100;
+
+    let fixture = PgFixture::create().await?;
+    let temp = TempDir::new()?;
+    let store = open_store(temp.path().to_path_buf())?;
+    let mut reader = ReplicationReader::connect(fixture.source.clone()).await?;
+    reader.set_next_sequence(store.next_sequence()?);
+
+    let sink = fixture
+        .client
+        .copy_in(&format!(
+            "COPY public.{} (customer_email, total_cents) FROM STDIN BINARY",
+            fixture.table
+        ))
+        .await?;
+    let writer = BinaryCopyInWriter::new(sink, &[Type::TEXT, Type::INT8]);
+    tokio::pin!(writer);
+    for value in 1..=ROWS as i64 {
+        let email = format!("bulk-{value}@example.com");
+        writer.as_mut().write(&[&email, &value]).await?;
+    }
+    assert_eq!(writer.as_mut().finish().await?, ROWS as u64);
+
+    let events = capture_new_events(&mut reader, &store, &fixture.source_name, ROWS).await?;
+    reader.shutdown().await?;
+
+    let mut event_ids = events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect::<Vec<_>>();
+    event_ids.sort_unstable();
+    event_ids.dedup();
+    assert_eq!(event_ids.len(), ROWS);
+
+    let mut source_lsns = events
+        .iter()
+        .map(|event| event.source.lsn.as_str())
+        .collect::<Vec<_>>();
+    source_lsns.sort_unstable();
+    source_lsns.dedup();
+    assert!(
+        source_lsns.len() < ROWS,
+        "the fixture must exercise multiple rows sharing a source WAL position"
+    );
 
     fixture.cleanup().await?;
     Ok(())

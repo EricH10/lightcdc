@@ -80,6 +80,8 @@ pub struct ReplicationReader {
     latest_wal_end: Lsn,
     /// Metadata for the source transaction currently being decoded.
     transaction: Option<TransactionMetadata>,
+    /// Stable position of the next captured event within the source transaction.
+    transaction_event_ordinal: u64,
     /// Commit timestamp announced for the current source transaction.
     commit_timestamp_ms: Option<i64>,
     /// Events held until PostgreSQL sends the matching commit.
@@ -232,6 +234,7 @@ impl ReplicationReader {
             sequence: 0,
             latest_wal_end: start_lsn,
             transaction: None,
+            transaction_event_ordinal: 0,
             commit_timestamp_ms: None,
             pending_events,
             capture_plan,
@@ -313,6 +316,7 @@ impl ReplicationReader {
                         begin_lsn: None,
                         commit_lsn: Some(final_lsn.to_string()),
                     });
+                    self.transaction_event_ordinal = 0;
                     self.pending_events.begin(xid as u64)?;
                     self.commit_timestamp_ms = Some(pg_time_to_unix_ms(commit_time_micros));
 
@@ -343,6 +347,7 @@ impl ReplicationReader {
                         "finished decoded source transaction"
                     );
                     self.transaction = None;
+                    self.transaction_event_ordinal = 0;
                     self.commit_timestamp_ms = None;
                     return Ok(TransactionRead::Transaction(CapturedTransaction {
                         events,
@@ -437,12 +442,18 @@ impl ReplicationReader {
     /// Converts one decoded row change into a normalized captured event.
     fn row_change(&mut self, operation: Operation, row: RowChange, wal_start: Lsn) -> ChangeEvent {
         self.sequence += 1;
+        self.transaction_event_ordinal += 1;
 
         ChangeEvent {
             sequence: self.sequence,
-            event_id: format!(
-                "postgres:{}:{}:{}",
-                self.source.database, self.source.slot, wal_start
+            event_id: source_event_id(
+                &self.source.database,
+                &self.source.slot,
+                self.transaction
+                    .as_ref()
+                    .and_then(|transaction| transaction.transaction_id),
+                wal_start,
+                self.transaction_event_ordinal,
             ),
             source: SourceMetadata {
                 database: self.source.database.clone(),
@@ -463,12 +474,18 @@ impl ReplicationReader {
     /// Converts one truncated relation into a normalized captured event.
     fn truncate_change(&mut self, relation: Relation, wal_start: Lsn) -> ChangeEvent {
         self.sequence += 1;
+        self.transaction_event_ordinal += 1;
 
         ChangeEvent {
             sequence: self.sequence,
-            event_id: format!(
-                "postgres:{}:{}:{}:truncate:{}",
-                self.source.database, self.source.slot, wal_start, relation.id
+            event_id: source_event_id(
+                &self.source.database,
+                &self.source.slot,
+                self.transaction
+                    .as_ref()
+                    .and_then(|transaction| transaction.transaction_id),
+                wal_start,
+                self.transaction_event_ordinal,
             ),
             source: SourceMetadata {
                 database: self.source.database.clone(),
@@ -485,6 +502,18 @@ impl ReplicationReader {
             commit_timestamp_ms: self.commit_timestamp_ms,
         }
     }
+}
+
+/// Builds a replay-stable identity for one captured event within a source transaction.
+fn source_event_id(
+    database: &str,
+    slot: &str,
+    transaction_id: Option<u64>,
+    wal_start: Lsn,
+    transaction_event_ordinal: u64,
+) -> String {
+    let transaction_id = transaction_id.unwrap_or_default();
+    format!("postgres:{database}:{slot}:{transaction_id}:{wal_start}:{transaction_event_ordinal}")
 }
 
 impl PostgresError {
@@ -1085,12 +1114,26 @@ mod tests {
 
     use lightcdc_core::{PostgresTlsMode, SourceConfig};
     use pgwire_replication::error::PgWireError;
+    use pgwire_replication::lsn::Lsn;
     use tempfile::TempDir;
 
     use super::{
-        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, sql_config,
-        sql_tls_connector, validate_resume_lsn,
+        PostgresError, is_retryable_sqlstate, replication_server_sqlstate, source_event_id,
+        sql_config, sql_tls_connector, validate_resume_lsn,
     };
+
+    #[test]
+    fn source_event_ids_are_unique_and_replay_stable_within_one_wal_record() {
+        let wal_start = Lsn::from(0x0f00);
+        let first = source_event_id("postgres", "lightcdc", Some(42), wal_start, 1);
+        let second = source_event_id("postgres", "lightcdc", Some(42), wal_start, 2);
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            source_event_id("postgres", "lightcdc", Some(42), wal_start, 1)
+        );
+    }
 
     #[test]
     fn retries_transient_replication_failures() {

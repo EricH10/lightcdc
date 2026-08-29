@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        mpsc::{self, Sender},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
 };
@@ -15,13 +15,15 @@ use redb::Database;
 
 use super::{StorageError, mutex};
 
+const REAPER_QUEUE_CAPACITY: usize = 64;
+
 pub(super) type SegmentDatabase = Arc<DeferredDatabase>;
 
 /// Defers redb's close-time allocator commit and flush to the reaper thread.
 pub(super) struct DeferredDatabase {
     database: Option<Database>,
     path: PathBuf,
-    reaper: Sender<RetiredDatabase>,
+    reaper: SyncSender<RetiredDatabase>,
     pending_closes: Arc<PendingCloses>,
 }
 
@@ -32,7 +34,7 @@ pub(super) struct SegmentCache {
 }
 
 pub(super) struct DatabaseReaper {
-    sender: Option<Sender<RetiredDatabase>>,
+    sender: Option<SyncSender<RetiredDatabase>>,
     pending_closes: Arc<PendingCloses>,
     thread: Option<JoinHandle<()>>,
 }
@@ -97,11 +99,16 @@ impl Drop for DeferredDatabase {
             return;
         };
         mutex(&self.pending_closes.paths).insert(self.path.clone());
-        if let Err(error) = self.reaper.send(RetiredDatabase {
+        if let Err(error) = self.reaper.try_send(RetiredDatabase {
             path: self.path.clone(),
             database,
         }) {
-            drop(error.0.database);
+            let retired = match error {
+                mpsc::TrySendError::Full(retired) | mpsc::TrySendError::Disconnected(retired) => {
+                    retired
+                }
+            };
+            drop(retired.database);
             self.pending_closes.finish(&self.path);
         }
     }
@@ -109,7 +116,7 @@ impl Drop for DeferredDatabase {
 
 impl DatabaseReaper {
     pub(super) fn start() -> Result<Self, StorageError> {
-        let (sender, receiver) = mpsc::channel::<RetiredDatabase>();
+        let (sender, receiver) = mpsc::sync_channel::<RetiredDatabase>(REAPER_QUEUE_CAPACITY);
         let pending_closes = Arc::new(PendingCloses::default());
         let thread_pending_closes = Arc::clone(&pending_closes);
         let thread = thread::Builder::new()

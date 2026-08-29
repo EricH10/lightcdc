@@ -69,23 +69,32 @@ pub(super) async fn supervise_capture(context: CaptureContext<'_>) -> anyhow::Re
     let mut reconnect_count = 0u64;
 
     validate_source_until_ready(&context, &mut retry_attempt, &mut reconnect_count).await?;
-    let heartbeat_task = AbortTask::new(tokio::spawn(run_logical_heartbeats(
+    let mut heartbeat_task = AbortTask::new(tokio::spawn(run_logical_heartbeats(
         context.config.source.clone(),
         context.heartbeat_interval,
     )));
-    let capture_result = supervise_capture_sessions(
-        &context,
-        &mut captured,
-        &mut retry_attempt,
-        &mut reconnect_count,
-    )
-    .await;
-    if let Err(error) = heartbeat_task.abort_and_wait().await
-        && !error.is_cancelled()
-    {
-        warn!(%error, "logical heartbeat task stopped unexpectedly");
+    tokio::select! {
+        capture_result = supervise_capture_sessions(
+            &context,
+            &mut captured,
+            &mut retry_attempt,
+            &mut reconnect_count,
+        ) => {
+            if let Err(error) = heartbeat_task.abort_and_wait().await
+                && !error.is_cancelled()
+            {
+                warn!(%error, "logical heartbeat task stopped unexpectedly");
+            }
+            capture_result
+        }
+        heartbeat_result = heartbeat_task.wait() => {
+            match heartbeat_result {
+                Ok(Ok(())) => Err(anyhow!("logical heartbeat task stopped unexpectedly")),
+                Ok(Err(error)) => Err(error).context("logical heartbeat task failed"),
+                Err(error) => Err(error).context("logical heartbeat task panicked"),
+            }
+        }
     }
-    capture_result
 }
 
 /// Reconnects replication sessions until capture completes or a fatal error occurs.
@@ -316,7 +325,7 @@ pub(super) fn capture_heartbeat_interval(config: &Config) -> anyhow::Result<Dura
 }
 
 /// Emits transactional logical messages and reconnects its ordinary SQL client.
-async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
+async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) -> anyhow::Result<()> {
     let content = format!("source={};slot={}", source.name, source.slot);
     loop {
         match LogicalHeartbeatEmitter::connect(&source).await {
@@ -333,6 +342,9 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
                             tracing::debug!(%lsn, "emitted PostgreSQL logical heartbeat");
                         }
                         Err(error) => {
+                            if error.is_fatal_capture_error() {
+                                return Err(error.into());
+                            }
                             warn!(%error, "logical heartbeat connection failed; reconnecting");
                             break;
                         }
@@ -340,6 +352,9 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
                 }
             }
             Err(error) => {
+                if error.is_fatal_capture_error() {
+                    return Err(error.into());
+                }
                 warn!(%error, "failed to connect PostgreSQL logical heartbeat; retrying");
             }
         }
