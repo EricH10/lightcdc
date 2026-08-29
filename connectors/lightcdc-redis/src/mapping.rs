@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use anyhow::{Context, anyhow};
 use lightcdc_core::{ChangeEvent, Operation, RedisCacheAction, RedisCacheRule};
 use serde_json::{Map, Value};
+use tracing::warn;
 
 /// One retry-safe Redis key mutation performed before LightCDC is acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +74,18 @@ pub(crate) fn map_event(
                     ));
                 }
                 let target_key = render_key(&rule.key, after_row)?;
-                for old_key in render_distinct_keys(rule, [&key, &before])? {
+                let old_keys = render_distinct_keys(rule, [&key, &before])?;
+                if old_keys.is_empty() {
+                    warn!(
+                        rule_key = %rule.key,
+                        table = %qualified_table,
+                        sequence = event.sequence,
+                        "Redis upsert rule rendered no old key from the event key/before payloads; \
+                         the key template references columns absent from the table's replica \
+                         identity, so stale cache entries are not deleted"
+                    );
+                }
+                for old_key in old_keys {
                     if old_key != target_key {
                         output.push(CacheMutation::Delete { key: old_key });
                     }
@@ -259,6 +271,28 @@ mod tests {
             &mutations[1],
             CacheMutation::Set { key, ttl_seconds: Some(60), .. }
                 if key == "tenant:a:order:2"
+        ));
+    }
+
+    #[test]
+    fn upsert_sets_target_when_key_payload_lacks_template_column() {
+        // REPLICA IDENTITY DEFAULT only carries primary-key columns in the key
+        // payload, so a template referencing a non-key column cannot render an
+        // old key to delete; the after row still renders the target.
+        let event = event(
+            Operation::Update,
+            Some(r#"{"id":"1"}"#),
+            None,
+            Some(r#"{"tenant_id":"a","id":"1","status":"paid"}"#),
+        );
+
+        let mutations = map_event(&[rule(RedisCacheAction::Upsert)], &event).expect("map event");
+        assert_eq!(mutations.len(), 1);
+        assert!(matches!(
+            &mutations[0],
+            CacheMutation::Set { key, value, ttl_seconds: Some(60) }
+                if key == "tenant:a:order:1"
+                    && value == br#"{"tenant_id":"a","id":"1","status":"paid"}"#
         ));
     }
 
