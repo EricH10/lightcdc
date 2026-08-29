@@ -64,6 +64,10 @@ impl<T> AbortTask<T> {
         task.abort();
         task.await
     }
+
+    async fn wait(&mut self) -> Result<T, tokio::task::JoinError> {
+        self.task.as_mut().expect("abort task is present").await
+    }
 }
 
 impl<T> Drop for AbortTask<T> {

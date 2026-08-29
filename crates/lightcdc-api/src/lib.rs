@@ -20,7 +20,7 @@ use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 use tokio_stream::{
     StreamExt,
@@ -70,6 +70,8 @@ pub struct LightCdcService {
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
     /// Bounds acknowledgements to sequences this process actually delivered.
     delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
+    /// Serializes ACK and seek writes so a late ACK cannot overwrite a seek.
+    offset_mutations: Arc<AsyncMutex<()>>,
     /// Resolved bearer principals and per-stream permissions.
     authorizer: Arc<ApiAuthorizer>,
     /// Fixed-cardinality counters and health signals in production runtimes.
@@ -283,6 +285,18 @@ impl Drop for ActiveSubscription {
     }
 }
 
+/// Keeps a consumer unavailable to subscriptions until a seek is durable.
+struct OffsetMutationClaim {
+    key: SubscriptionKey,
+    active: Arc<Mutex<HashSet<SubscriptionKey>>>,
+}
+
+impl Drop for OffsetMutationClaim {
+    fn drop(&mut self) {
+        active_subscriptions(&self.active).remove(&self.key);
+    }
+}
+
 /// Groups constructor-only dependencies so service ownership remains explicit.
 struct ServiceParts {
     config: Config,
@@ -408,6 +422,7 @@ impl LightCdcService {
             event_notifier: parts.event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            offset_mutations: Arc::new(AsyncMutex::new(())),
             authorizer: Arc::new(authorizer),
             metrics: parts.metrics,
         }
@@ -804,9 +819,16 @@ impl LightCdc for LightCdcService {
         )?;
         let stream = self.stream(&request.stream)?;
         let key = (stream.name.clone(), consumer.to_owned());
+        if request.sequence == 0 {
+            return Err(Status::invalid_argument(
+                "sequence must be greater than zero",
+            ));
+        }
+        let _mutation = self.offset_mutations.lock().await;
         let highest_delivered = delivery_high_watermarks(&self.delivery_high_watermarks)
             .get(&key)
             .copied()
+            .filter(|sequence| *sequence > 0)
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
                     "consumer {consumer:?} has not been delivered an event from stream {:?}",
@@ -852,6 +874,9 @@ impl LightCdc for LightCdcService {
             self.config.runtime.max_consumer_name_bytes,
         )?;
         let stream = self.stream(&request.stream)?;
+        let key = (stream.name.clone(), consumer.to_owned());
+        let _mutation = self.offset_mutations.lock().await;
+        let _claim = self.claim_offset_mutation(key.clone(), consumer)?;
         let position =
             SeekPosition::try_from(request.position).unwrap_or(SeekPosition::Unspecified);
 
@@ -882,8 +907,7 @@ impl LightCdc for LightCdcService {
             )
             .await
             .map_err(|error| consumer_write_status(&self.metrics, error))?;
-        delivery_high_watermarks(&self.delivery_high_watermarks)
-            .remove(&(stream.name.clone(), consumer.to_owned()));
+        delivery_high_watermarks(&self.delivery_high_watermarks).remove(&key);
         if let Some(metrics) = &self.metrics {
             metrics.record_seek();
         }
@@ -916,6 +940,20 @@ impl LightCdcService {
                 "active subscription limit reached",
             ));
         }
+        let mut watermarks = delivery_high_watermarks(&self.delivery_high_watermarks);
+        if !watermarks.contains_key(&key)
+            && watermarks.len() >= self.config.runtime.max_durable_consumers
+        {
+            active.remove(&key);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_durable_consumer_limit_rejection();
+            }
+            return Err(Status::resource_exhausted(
+                "consumer identity limit reached",
+            ));
+        }
+        watermarks.entry(key.clone()).or_insert(0);
+        drop(watermarks);
         drop(active);
         if let Some(metrics) = &self.metrics {
             metrics.record_subscription_started();
@@ -925,6 +963,25 @@ impl LightCdcService {
             key,
             active: Arc::clone(&self.active_subscriptions),
             metrics: self.metrics.clone(),
+        })
+    }
+
+    /// Reserves an inactive consumer identity for one offset mutation.
+    fn claim_offset_mutation(
+        &self,
+        key: SubscriptionKey,
+        consumer: &str,
+    ) -> Result<OffsetMutationClaim, Status> {
+        let mut active = active_subscriptions(&self.active_subscriptions);
+        if !active.insert(key.clone()) {
+            return Err(Status::failed_precondition(format!(
+                "consumer {consumer:?} has an active subscription; end it before seeking"
+            )));
+        }
+        drop(active);
+        Ok(OffsetMutationClaim {
+            key,
+            active: Arc::clone(&self.active_subscriptions),
         })
     }
 
@@ -1534,6 +1591,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_rejects_sequence_zero() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: 0,
+            }))
+            .await
+            .expect_err("sequence zero must not become a durable offset");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn rejects_a_second_active_subscription_for_the_same_consumer() {
         let service = service_with_events(&[event(1, "public", "orders")]);
         let mut first = service
@@ -1743,6 +1826,67 @@ mod tests {
             .expect("stream item")
             .expect("retained event");
         assert_eq!(event.sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn seek_rejects_an_active_subscription() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .seek(Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                position: SeekPosition::Earliest as i32,
+                sequence: 0,
+            }))
+            .await
+            .expect_err("seek must not race an active subscription");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_bound_in_memory_delivery_identities_without_eviction() {
+        let mut service = service_with_events(&[event(1, "public", "orders")]);
+        config_for_service(&mut service)
+            .runtime
+            .max_durable_consumers = 1;
+
+        let mut first = service
+            .subscribe(Request::new(subscription("first", 1)))
+            .await
+            .expect("first subscription")
+            .into_inner();
+        first
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .subscribe(Request::new(subscription("second", 1)))
+            .await
+            .expect_err("a second delivery identity must be rejected at capacity");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "first".to_owned(),
+                sequence: 1,
+            }))
+            .await
+            .expect("the retained watermark remains acknowledgeable");
     }
 
     #[tokio::test]
