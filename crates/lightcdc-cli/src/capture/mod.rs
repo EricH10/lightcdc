@@ -381,23 +381,40 @@ async fn capture_with_store(
         transaction_buffer_options,
         state,
     };
+    let capture = supervise_capture(capture_context);
+    tokio::pin!(capture);
+    let metrics_stopped = async {
+        match metrics.as_ref() {
+            Some(metrics) => metrics.stopped().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(metrics_stopped);
+    let metrics_failed = |result: std::io::Result<()>| -> anyhow::Result<()> {
+        match result {
+            Ok(()) => Err(anyhow::anyhow!("capture metrics writer stopped unexpectedly")),
+            Err(error) => Err(error).context("capture metrics writer failed"),
+        }
+    };
     if let Some(retention) = retention {
-        let capture = supervise_capture(capture_context);
         let sweeps = run_retention_sweeps(
             storage_writer.handle(),
             retention,
             production_metrics.clone(),
         );
-        tokio::pin!(capture);
         tokio::pin!(sweeps);
         tokio::select! {
             result = &mut capture => result,
             result = &mut sweeps => result.context(
                 "retention stopped capture before disk growth could continue unchecked"
             ),
+            result = &mut metrics_stopped => metrics_failed(result),
         }
     } else {
-        supervise_capture(capture_context).await
+        tokio::select! {
+            result = &mut capture => result,
+            result = &mut metrics_stopped => metrics_failed(result),
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 use anyhow::Context;
 use lightcdc_postgres::{CapturedTransaction, PostgresError, ReplicationReader, TransactionRead};
 use lightcdc_runtime::{CaptureBatch, CaptureBatchLimits, PendingCaptureWrite, StorageCompletion};
-use lightcdc_storage::PersistTransactionOutcome;
+use lightcdc_storage::{PersistTransactionOutcome, StorageError};
 use tracing::warn;
 
 use super::CaptureContext;
@@ -103,9 +103,11 @@ pub(super) async fn run_capture_session(
         }
 
         let progress = wait_for_capture_progress(context, reader, &mut pipeline).await;
-        context
-            .production_metrics
-            .record_source_wal_end(reader.latest_wal_end().as_u64());
+        if context.config.observability.metrics_enabled {
+            context
+                .production_metrics
+                .record_source_wal_end(reader.latest_wal_end().as_u64());
+        }
         match progress {
             CaptureProgress::Storage(completion) => {
                 let replayed = complete_pipelined_capture_write(
@@ -290,6 +292,29 @@ async fn finish_capture_read_error(
     Ok(CaptureSessionExit::Disconnected(error.to_string()))
 }
 
+/// Returns whether a session failure is a retryable storage persistence error
+/// (capacity or disk-space pressure) whose unacknowledged batch is safe to
+/// replay from the durable source LSN after reconnecting.
+pub(super) fn is_retryable_persist_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<StorageError>()
+            .is_some_and(is_retryable_storage_error)
+    })
+}
+
+/// Classifies one storage persistence failure as retryable pressure or fatal corruption.
+fn is_retryable_storage_error(error: &StorageError) -> bool {
+    match error {
+        StorageError::ResourceLimit(_) => true,
+        StorageError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::OutOfMemory
+        ),
+        _ => false,
+    }
+}
+
 /// Moves the queued batch into the dedicated writer without awaiting its commit.
 async fn submit_capture_batch(
     context: &CaptureContext<'_>,
@@ -302,7 +327,7 @@ async fn submit_capture_batch(
             .storage_writer
             .submit(
                 std::mem::take(&mut pipeline.batch),
-                true,
+                context.config.observability.metrics_enabled,
                 !pipeline.replay_reconciled,
             )
             .await?,
@@ -450,17 +475,19 @@ fn complete_capture_write(
                     batch.staged_transaction_count,
                 );
             }
-            context.production_metrics.record_capture_persisted(
-                transaction_count,
-                batch.event_count,
-                batch.decoded_bytes,
-                batch.staged_bytes,
-                batch.staged_transaction_count,
-                completion
-                    .persist_latency
-                    .expect("production capture always measures storage latency"),
-                ack_lsn.as_u64(),
-            );
+            if context.config.observability.metrics_enabled {
+                context.production_metrics.record_capture_persisted(
+                    transaction_count,
+                    batch.event_count,
+                    batch.decoded_bytes,
+                    batch.staged_bytes,
+                    batch.staged_transaction_count,
+                    completion
+                        .persist_latency
+                        .expect("metrics-enabled capture always measures storage latency"),
+                    ack_lsn.as_u64(),
+                );
+            }
             if matches!(context.options.output, CaptureOutput::Json) {
                 for transaction in &batch.transactions {
                     for event in transaction
@@ -602,6 +629,42 @@ mod tests {
 
         assert_eq!(captured, 5);
         assert!(pipeline.replay_reconciled);
+    }
+
+    #[test]
+    fn classifies_retryable_storage_persistence_errors() {
+        assert!(is_retryable_storage_error(&StorageError::ResourceLimit(
+            "storage ceiling reached".to_owned()
+        )));
+        assert!(is_retryable_storage_error(&StorageError::Io(
+            std::io::Error::from(std::io::ErrorKind::StorageFull)
+        )));
+        assert!(!is_retryable_storage_error(&StorageError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!is_retryable_storage_error(&StorageError::Integrity(
+            "checksum mismatch".to_owned()
+        )));
+        assert!(!is_retryable_storage_error(&StorageError::InvalidFormatMarker(
+            "lightcdc.redb.format".into()
+        )));
+    }
+
+    #[test]
+    fn detects_retryable_persist_failure_across_anyhow_context() {
+        let error =
+            Err::<(), StorageError>(StorageError::ResourceLimit("disk full".to_owned()))
+                .context("failed to persist captured transaction batch to redb")
+                .context("outer context")
+                .unwrap_err();
+        assert!(is_retryable_persist_error(&error));
+
+        let fatal = Err::<(), StorageError>(StorageError::Integrity(
+            "checksum mismatch".to_owned(),
+        ))
+        .context("failed to persist captured transaction batch to redb")
+        .unwrap_err();
+        assert!(!is_retryable_persist_error(&fatal));
     }
 
     fn captured_transaction(

@@ -17,7 +17,7 @@ use crate::{failure, store::storage_options};
 /// Keeps every observability worker alive until coordinated process shutdown.
 pub(crate) struct ObservabilityRuntime {
     metrics: ProductionMetrics,
-    _sampler: StorageMetricsSampler,
+    _sampler: Option<StorageMetricsSampler>,
     server: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -38,13 +38,17 @@ impl ObservabilityRuntime {
             config.observability.metrics_max_connections,
         );
         let storage = storage_options(config);
-        let sampler = StorageMetricsSampler::start(
-            metrics.clone(),
-            store,
-            storage.data_dir,
-            config.source.name.clone(),
-            Duration::from_secs(config.observability.metrics_sample_interval_seconds),
-        )?;
+        let sampler = if config.observability.metrics_enabled {
+            Some(StorageMetricsSampler::start(
+                metrics.clone(),
+                store,
+                storage.data_dir,
+                config.source.name.clone(),
+                Duration::from_secs(config.observability.metrics_sample_interval_seconds),
+            )?)
+        } else {
+            None
+        };
 
         let server = if config.observability.metrics_enabled {
             let metrics_addr = config.metrics_addr().map_err(anyhow::Error::msg)?;

@@ -11,11 +11,17 @@ use tracing::{info, warn};
 
 use super::{
     AbortTask, CaptureContext,
-    pipeline::{CaptureSessionExit, requested_event_count_reached, run_capture_session},
+    pipeline::{
+        CaptureSessionExit, is_retryable_persist_error, requested_event_count_reached,
+        run_capture_session,
+    },
 };
 
 const RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const RECONNECT_MAX_DELAY_MS: u64 = 15_000;
+
+/// A session that stays connected at least this long resets the reconnect backoff.
+const STABLE_SESSION_RESET_MS: u64 = 30_000;
 
 /// Combines a retention policy with its background sweep interval.
 #[derive(Clone, Copy)]
@@ -104,19 +110,45 @@ async fn supervise_capture_sessions(
             connect_capture_reader(context, retry_attempt, reconnect_count)
                 .await
                 .context("failed to connect PostgreSQL capture")?;
+        let session_started = tokio::time::Instant::now();
 
         let session_result =
             run_capture_session(context, &mut reader, captured, replay_reconciled).await;
         shutdown_capture_reader(&mut reader).await;
 
-        match session_result? {
+        let session_exit = match session_result {
+            Ok(exit) => exit,
+            Err(error) if is_retryable_persist_error(&error) => {
+                context
+                    .state
+                    .transition(RuntimeState::Retrying, Some(error.to_string()));
+                wait_before_session_reconnect(
+                    context,
+                    retry_attempt,
+                    reconnect_count,
+                    &error.to_string(),
+                    session_started,
+                )
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        match session_exit {
             CaptureSessionExit::RequestedEventCountReached => return Ok(()),
             CaptureSessionExit::Disconnected(reason) => {
                 context
                     .state
                     .transition(RuntimeState::Retrying, Some(reason.clone()));
-                wait_before_session_reconnect(context, retry_attempt, reconnect_count, &reason)
-                    .await;
+                wait_before_session_reconnect(
+                    context,
+                    retry_attempt,
+                    reconnect_count,
+                    &reason,
+                    session_started,
+                )
+                .await;
             }
         }
     }
@@ -208,7 +240,6 @@ async fn connect_capture_reader(
         {
             Ok(mut reader) => {
                 reader.set_next_sequence(next_sequence);
-                *retry_attempt = 0;
                 info!(
                     reconnect_count = *reconnect_count,
                     next_sequence,
@@ -246,8 +277,10 @@ async fn wait_before_session_reconnect(
     retry_attempt: &mut u32,
     reconnect_count: &mut u64,
     reason: &str,
+    session_started: tokio::time::Instant,
 ) {
     record_capture_reconnect(context);
+    *retry_attempt = session_reconnect_attempt(*retry_attempt, session_started.elapsed());
     let delay = reconnect_delay(*retry_attempt);
     warn!(
         %reason,
@@ -257,6 +290,16 @@ async fn wait_before_session_reconnect(
     );
     tokio::time::sleep(delay).await;
     advance_reconnect_state(retry_attempt, reconnect_count);
+}
+
+/// Returns the backoff attempt for a session reconnect, resetting the counter
+/// after a session that ran long enough to be considered stable.
+fn session_reconnect_attempt(retry_attempt: u32, session_duration: Duration) -> u32 {
+    if session_duration >= Duration::from_millis(STABLE_SESSION_RESET_MS) {
+        0
+    } else {
+        retry_attempt
+    }
 }
 
 /// Records a reconnect only when opt-in metrics are active.
@@ -318,6 +361,7 @@ pub(super) fn capture_heartbeat_interval(config: &Config) -> anyhow::Result<Dura
 /// Emits transactional logical messages and reconnects its ordinary SQL client.
 async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
     let content = format!("source={};slot={}", source.name, source.slot);
+    let mut retry_attempt = 0u32;
     loop {
         match LogicalHeartbeatEmitter::connect(&source).await {
             Ok(emitter) => {
@@ -326,6 +370,7 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
                 // Tokio's first interval tick is immediate; consume it so the
                 // configured idle period elapses before emitting a heartbeat.
                 ticker.tick().await;
+                let session_started = tokio::time::Instant::now();
                 loop {
                     ticker.tick().await;
                     match emitter.emit(LIGHTCDC_HEARTBEAT_PREFIX, &content).await {
@@ -333,17 +378,34 @@ async fn run_logical_heartbeats(source: SourceConfig, interval: Duration) {
                             tracing::debug!(%lsn, "emitted PostgreSQL logical heartbeat");
                         }
                         Err(error) => {
+                            if error.is_fatal_capture_error() {
+                                warn!(
+                                    %error,
+                                    "logical heartbeat failed with a fatal error; stopping heartbeat task"
+                                );
+                                return;
+                            }
                             warn!(%error, "logical heartbeat connection failed; reconnecting");
                             break;
                         }
                     }
                 }
+                retry_attempt = session_reconnect_attempt(retry_attempt, session_started.elapsed());
             }
             Err(error) => {
+                if error.is_fatal_capture_error() {
+                    warn!(
+                        %error,
+                        "logical heartbeat connection failed with a fatal error; stopping heartbeat task"
+                    );
+                    return;
+                }
                 warn!(%error, "failed to connect PostgreSQL logical heartbeat; retrying");
             }
         }
-        tokio::time::sleep(Duration::from_millis(RECONNECT_INITIAL_DELAY_MS)).await;
+        let delay = reconnect_delay(retry_attempt);
+        tokio::time::sleep(delay).await;
+        retry_attempt = retry_attempt.saturating_add(1);
     }
 }
 
@@ -447,5 +509,17 @@ mod tests {
         assert!(second >= Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 2));
         assert!(second < Duration::from_millis(RECONNECT_INITIAL_DELAY_MS * 4));
         assert_eq!(capped, Duration::from_millis(RECONNECT_MAX_DELAY_MS));
+    }
+
+    #[test]
+    fn session_backoff_resets_only_after_a_stable_session() {
+        assert_eq!(
+            session_reconnect_attempt(4, Duration::from_millis(STABLE_SESSION_RESET_MS - 1)),
+            4
+        );
+        assert_eq!(
+            session_reconnect_attempt(4, Duration::from_millis(STABLE_SESSION_RESET_MS)),
+            0
+        );
     }
 }

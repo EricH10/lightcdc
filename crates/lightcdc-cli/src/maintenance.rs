@@ -94,6 +94,15 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("could not load config from {}", path.display()))
 }
 
+/// Returns the directory that must be synced after an atomic publish, falling
+/// back to the current directory for single-component relative paths whose
+/// `parent()` is an empty path.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn create_backup(
     options: &LogOpenOptions,
     segment_options: SegmentOptions,
@@ -107,7 +116,7 @@ fn create_backup(
     if output.starts_with(&options.data_dir) {
         anyhow::bail!("backup output must be outside the LightCDC data directory");
     }
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_dir(output);
     fs::create_dir_all(parent)
         .with_context(|| format!("create backup parent {}", parent.display()))?;
     let mut partial = PartialDirectory::create(parent, "lightcdc-backup")?;
@@ -174,7 +183,7 @@ fn restore_backup(
         verify_file(&input.join(&file.path), file)?;
     }
 
-    let parent = options.data_dir.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_dir(&options.data_dir);
     fs::create_dir_all(parent)
         .with_context(|| format!("create restore parent {}", parent.display()))?;
     let mut partial = PartialDirectory::create(parent, "lightcdc-restore")?;
@@ -552,6 +561,61 @@ mod tests {
             .is_err()
         );
         assert!(!tampered_target.exists());
+    }
+
+    /// Serializes tests that change the process-global working directory.
+    static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the process working directory when dropped.
+    struct CwdGuard(PathBuf);
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn backup_and_restore_with_single_component_relative_paths() {
+        let _lock = CHDIR_LOCK.lock().expect("chdir lock");
+        let temp = TempDir::new().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let source_options = LogOpenOptions {
+            data_dir: source_dir,
+            database_file: "lightcdc.redb".to_owned(),
+        };
+        let store = RedbEventStore::open(&source_options).expect("source store");
+        store.append_event(&event(1)).expect("append event");
+        drop(store);
+
+        let original_cwd = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(temp.path()).expect("change cwd");
+        let guard = CwdGuard(original_cwd);
+
+        create_backup(
+            &source_options,
+            SegmentOptions::default(),
+            "default",
+            Path::new("backup"),
+        )
+        .expect("create backup with single-component relative output");
+
+        let restored_options = LogOpenOptions {
+            data_dir: PathBuf::from("restored"),
+            database_file: "lightcdc.redb".to_owned(),
+        };
+        restore_backup(
+            &restored_options,
+            SegmentOptions::default(),
+            "default",
+            Path::new("backup"),
+        )
+        .expect("restore into single-component relative data dir");
+        let restored = RedbEventStore::open(&restored_options).expect("restored store");
+        assert_eq!(restored.replay_from(1, 10).expect("replay"), [event(1)]);
+        drop(restored);
+
+        drop(guard);
     }
 
     fn event(sequence: u64) -> ChangeEvent {
