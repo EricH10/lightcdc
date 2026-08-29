@@ -5,7 +5,7 @@ use std::{
     io::{self, BufWriter, Write},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
@@ -23,6 +23,7 @@ pub(super) struct CaptureMetrics {
     sender: Option<SyncSender<CaptureSample>>,
     dropped_samples: Arc<AtomicU64>,
     worker: Option<JoinHandle<io::Result<()>>>,
+    exit: Mutex<Option<tokio::sync::oneshot::Receiver<Option<io::ErrorKind>>>>,
 }
 
 /// Represents one lightweight observation sent to the aggregation thread.
@@ -80,17 +81,37 @@ impl CaptureMetrics {
         let (sender, receiver) = sync_channel(SAMPLE_CHANNEL_CAPACITY);
         let dropped_samples = Arc::new(AtomicU64::new(0));
         let worker_dropped_samples = Arc::clone(&dropped_samples);
+        let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
         let worker = thread::Builder::new()
             .name("lightcdc-capture-metrics".to_owned())
             .spawn(move || {
-                aggregate_metrics(receiver, file, report_interval, worker_dropped_samples)
+                let result =
+                    aggregate_metrics(receiver, file, report_interval, worker_dropped_samples);
+                let _ = exit_sender.send(result.as_ref().err().map(|error| error.kind()));
+                result
             })?;
 
         Ok(Self {
             sender: Some(sender),
             dropped_samples,
             worker: Some(worker),
+            exit: Mutex::new(Some(exit_receiver)),
         })
+    }
+
+    /// Resolves when the aggregation thread exits, returning its I/O result so
+    /// a metrics-file write failure can fail the capture run instead of being
+    /// reported only on drop.
+    pub(super) async fn stopped(&self) -> io::Result<()> {
+        let receiver = self.exit.lock().expect("metrics exit lock").take();
+        let Some(receiver) = receiver else {
+            return Ok(());
+        };
+        match receiver.await {
+            Ok(Some(kind)) => Err(io::Error::new(kind, "capture metrics writer failed")),
+            Ok(None) => Err(io::Error::other("capture metrics writer stopped unexpectedly")),
+            Err(_) => Err(io::Error::other("capture metrics writer panicked")),
+        }
     }
 
     /// Records one durable source transaction group without blocking capture.
@@ -333,5 +354,22 @@ mod tests {
         assert_eq!(report["staged_transactions_total"], 2);
         assert_eq!(report["reconnects_total"], 1);
         assert_eq!(report["dropped_samples_total"], 0);
+    }
+
+    #[test]
+    fn stopped_reports_metrics_write_failure() {
+        // /dev/full accepts open but fails every write with ENOSPC, which makes
+        // the aggregation thread exit with a storage-full error deterministically.
+        let metrics =
+            CaptureMetrics::start(Path::new("/dev/full"), Duration::from_millis(10))
+                .expect("metrics");
+        metrics.record_persisted(1, 1, 1, 1, Duration::from_millis(1), 1);
+        thread::sleep(Duration::from_millis(50));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(metrics.stopped());
+        assert!(result.is_err(), "expected a metrics write failure");
     }
 }
