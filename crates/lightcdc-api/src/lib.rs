@@ -1,7 +1,7 @@
 //! Serves durable redb events through the generated LightCDC gRPC contract.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt, fs,
     net::SocketAddr,
     pin::Pin,
@@ -69,7 +69,7 @@ pub struct LightCdcService {
     /// Prevents two workers from advancing the same consumer concurrently.
     active_subscriptions: Arc<Mutex<HashSet<SubscriptionKey>>>,
     /// Bounds acknowledgements to sequences this process actually delivered.
-    delivery_high_watermarks: Arc<Mutex<HashMap<SubscriptionKey, u64>>>,
+    delivery_high_watermarks: Arc<Mutex<DeliveryWatermarks>>,
     /// Resolved bearer principals and per-stream permissions.
     authorizer: Arc<ApiAuthorizer>,
     /// Fixed-cardinality counters and health signals in production runtimes.
@@ -267,6 +267,57 @@ type SubscriptionKey = (String, String);
 
 pub use lightcdc_runtime::EventNotifier;
 
+/// Bounds per-consumer delivery watermarks to the durable consumer limit so a
+/// long-lived server never accumulates an entry per distinct consumer name.
+#[derive(Debug)]
+struct DeliveryWatermarks {
+    capacity: usize,
+    /// Most-recently-used consumer keys, oldest first.
+    order: VecDeque<SubscriptionKey>,
+    highest: HashMap<SubscriptionKey, u64>,
+}
+
+impl DeliveryWatermarks {
+    fn new(capacity: usize) -> Self {
+        Self {
+            // The runtime validates the configured limit only against its upper
+            // bound, so treat an absent zero as the default.
+            capacity: if capacity == 0 { 10_000 } else { capacity },
+            order: VecDeque::new(),
+            highest: HashMap::new(),
+        }
+    }
+
+    /// Returns the watermark and marks the consumer most-recently-used.
+    fn get(&mut self, key: &SubscriptionKey) -> Option<u64> {
+        let highest = self.highest.get(key).copied()?;
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(highest)
+    }
+
+    /// Records a delivered sequence, evicting the least-recently-used consumer
+    /// when the map is at capacity.
+    fn record(&mut self, key: SubscriptionKey, sequence: u64) {
+        self.order.retain(|candidate| candidate != &key);
+        self.highest
+            .entry(key.clone())
+            .and_modify(|highest| *highest = (*highest).max(sequence))
+            .or_insert(sequence);
+        if self.highest.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.highest.remove(&evicted);
+            }
+        }
+        self.order.push_back(key);
+    }
+
+    fn remove(&mut self, key: &SubscriptionKey) {
+        self.order.retain(|candidate| candidate != key);
+        self.highest.remove(key);
+    }
+}
+
 /// Removes a subscription identity from the active set when its task exits.
 struct ActiveSubscription {
     key: SubscriptionKey,
@@ -395,6 +446,7 @@ impl LightCdcService {
     fn from_parts(parts: ServiceParts, authorizer: ApiAuthorizer) -> Self {
         #[cfg(not(test))]
         drop(parts.store);
+        let delivery_capacity = parts.config.runtime.max_durable_consumers;
         Self {
             config: Arc::new(parts.config),
             #[cfg(test)]
@@ -407,7 +459,9 @@ impl LightCdcService {
             _shutdown_owner: parts.shutdown_owner,
             event_notifier: parts.event_notifier,
             active_subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            delivery_high_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            delivery_high_watermarks: Arc::new(Mutex::new(DeliveryWatermarks::new(
+                delivery_capacity,
+            ))),
             authorizer: Arc::new(authorizer),
             metrics: parts.metrics,
         }
@@ -725,10 +779,7 @@ impl LightCdc for LightCdcService {
                 {
                     Ok(batch) => batch,
                     Err(error) => {
-                        if let Some(metrics) = &metrics {
-                            metrics.record_replay_error();
-                            metrics.record_storage_error();
-                        }
+                        record_replay_failure(&metrics, &error);
                         let _ = tx.send(Err(replay_status(error))).await;
                         return;
                     }
@@ -747,7 +798,8 @@ impl LightCdc for LightCdcService {
                     continue;
                 }
 
-                for event in batch {
+                let mut events = batch.into_iter();
+                while let Some(event) = events.next() {
                     next_sequence = event.sequence + 1;
                     if !stream.matches_event(&event) {
                         continue;
@@ -761,11 +813,48 @@ impl LightCdc for LightCdcService {
                         return;
                     }
 
-                    if tx.capacity() == 0
-                        && let Some(metrics) = &metrics
-                    {
-                        metrics.record_subscription_backpressure();
+                    if tx.capacity() == 0 {
+                        // A stalled client must not pin the reader-pool permit or
+                        // the remaining batch memory while it waits for channel
+                        // space; drop the batch before blocking on reserve.
+                        drop(events);
+                        if let Some(metrics) = &metrics {
+                            metrics.record_subscription_backpressure();
+                        }
+                        let permit = tokio::select! {
+                            result = tx.reserve() => match result {
+                                Ok(permit) => permit,
+                                Err(_) => return,
+                            },
+                            _ = shutdown.cancelled() => return,
+                        };
+                        record_delivery(&delivery_high_watermarks, &delivery_key, event.sequence);
+                        if let Some(metrics) = &metrics {
+                            metrics.record_delivery();
+                        }
+                        permit.send(Ok(event.into()));
+                        emitted += 1;
+
+                        if limit > 0 && emitted >= limit {
+                            return;
+                        }
+
+                        // Resume replay with a fresh reader-pool permit.
+                        let batch = match storage_reader
+                            .replay_from(next_sequence, replay_batch_events, replay_batch_max_bytes)
+                            .await
+                        {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                record_replay_failure(&metrics, &error);
+                                let _ = tx.send(Err(replay_status(error))).await;
+                                return;
+                            }
+                        };
+                        events = batch.into_iter();
+                        continue;
                     }
+
                     let permit = tokio::select! {
                         result = tx.reserve() => match result {
                             Ok(permit) => permit,
@@ -804,9 +893,13 @@ impl LightCdc for LightCdcService {
         )?;
         let stream = self.stream(&request.stream)?;
         let key = (stream.name.clone(), consumer.to_owned());
+        if request.sequence == 0 {
+            return Err(Status::invalid_argument(
+                "sequence must be greater than zero",
+            ));
+        }
         let highest_delivered = delivery_high_watermarks(&self.delivery_high_watermarks)
             .get(&key)
-            .copied()
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
                     "consumer {consumer:?} has not been delivered an event from stream {:?}",
@@ -852,6 +945,14 @@ impl LightCdc for LightCdcService {
             self.config.runtime.max_consumer_name_bytes,
         )?;
         let stream = self.stream(&request.stream)?;
+        let key = (stream.name.clone(), consumer.to_owned());
+        if active_subscriptions(&self.active_subscriptions).contains(&key) {
+            return Err(Status::failed_precondition(format!(
+                "consumer {consumer:?} has an active subscription on stream {:?}; end the \
+                 subscription before seeking",
+                stream.name
+            )));
+        }
         let position =
             SeekPosition::try_from(request.position).unwrap_or(SeekPosition::Unspecified);
 
@@ -882,8 +983,7 @@ impl LightCdc for LightCdcService {
             )
             .await
             .map_err(|error| consumer_write_status(&self.metrics, error))?;
-        delivery_high_watermarks(&self.delivery_high_watermarks)
-            .remove(&(stream.name.clone(), consumer.to_owned()));
+        delivery_high_watermarks(&self.delivery_high_watermarks).remove(&key);
         if let Some(metrics) = &self.metrics {
             metrics.record_seek();
         }
@@ -1026,8 +1126,8 @@ fn active_subscriptions(
 
 /// Recovers the delivery map if another task panicked while holding it.
 fn delivery_high_watermarks(
-    high_watermarks: &Mutex<HashMap<SubscriptionKey, u64>>,
-) -> std::sync::MutexGuard<'_, HashMap<SubscriptionKey, u64>> {
+    high_watermarks: &Mutex<DeliveryWatermarks>,
+) -> std::sync::MutexGuard<'_, DeliveryWatermarks> {
     high_watermarks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1035,14 +1135,11 @@ fn delivery_high_watermarks(
 
 /// Records the highest sequence made available to one stream consumer.
 fn record_delivery(
-    high_watermarks: &Mutex<HashMap<SubscriptionKey, u64>>,
+    high_watermarks: &Mutex<DeliveryWatermarks>,
     key: &SubscriptionKey,
     sequence: u64,
 ) {
-    delivery_high_watermarks(high_watermarks)
-        .entry(key.clone())
-        .and_modify(|highest| *highest = (*highest).max(sequence))
-        .or_insert(sequence);
+    delivery_high_watermarks(high_watermarks).record(key.clone(), sequence);
 }
 
 /// Returns the offset immediately before the oldest retained event.
@@ -1050,6 +1147,20 @@ async fn earliest_retained_offset(reader: &StorageReaderHandle) -> anyhow::Resul
     match reader.first_sequence().await? {
         Some(first_sequence) => Ok(first_sequence.saturating_sub(1)),
         None => Ok(reader.last_sequence().await?.unwrap_or(0)),
+    }
+}
+
+/// Records replay failure metrics, treating an expired offset as benign rather
+/// than a storage error.
+fn record_replay_failure(metrics: &Option<ProductionMetrics>, error: &anyhow::Error) {
+    if let Some(metrics) = metrics {
+        metrics.record_replay_error();
+        if !matches!(
+            error.downcast_ref::<StorageError>(),
+            Some(StorageError::SequenceExpired { .. })
+        ) {
+            metrics.record_storage_error();
+        }
     }
 }
 
@@ -1826,6 +1937,8 @@ mod tests {
             .await
             .expect("stream item")
             .expect("change event");
+        drop(subscription);
+        wait_for_subscription_release(&service, "search-indexer").await;
 
         service
             .seek(Request::new(SeekRequest {
@@ -1847,6 +1960,145 @@ mod tests {
             .expect_err("seek should require a new delivery before ack");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn seek_rejects_an_active_subscription_for_the_same_consumer() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 0)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .seek(Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                position: SeekPosition::Earliest as i32,
+                sequence: 0,
+            }))
+            .await
+            .expect_err("seek while subscribed must be rejected");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("active subscription"));
+
+        // An unrelated consumer may still seek while this subscription is active.
+        service
+            .seek(Request::new(SeekRequest {
+                stream: "orders".to_owned(),
+                consumer: "other-indexer".to_owned(),
+                position: SeekPosition::Latest as i32,
+                sequence: 0,
+            }))
+            .await
+            .expect("seek for an unrelated consumer should succeed");
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_a_zero_sequence() {
+        let service = service_with_events(&[event(1, "public", "orders")]);
+        let mut subscription = service
+            .subscribe(Request::new(subscription("search-indexer", 1)))
+            .await
+            .expect("subscribe response")
+            .into_inner();
+        subscription
+            .next()
+            .await
+            .expect("stream item")
+            .expect("change event");
+
+        let error = service
+            .ack(Request::new(AckRequest {
+                stream: "orders".to_owned(),
+                consumer: "search-indexer".to_owned(),
+                sequence: 0,
+            }))
+            .await
+            .expect_err("ack of sequence zero must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("greater than zero"));
+    }
+
+    #[test]
+    fn delivery_watermarks_bounds_the_map_to_capacity() {
+        let mut watermarks = DeliveryWatermarks::new(2);
+        watermarks.record(("orders".to_owned(), "one".to_owned()), 1);
+        watermarks.record(("orders".to_owned(), "two".to_owned()), 2);
+        watermarks.record(("orders".to_owned(), "three".to_owned()), 3);
+        assert_eq!(watermarks.highest.len(), 2);
+        assert!(
+            watermarks
+                .get(&("orders".to_owned(), "one".to_owned()))
+                .is_none()
+        );
+
+        // Touching a key keeps it in the map past capacity.
+        watermarks.record(("orders".to_owned(), "two".to_owned()), 4);
+        watermarks.record(("orders".to_owned(), "four".to_owned()), 5);
+        assert_eq!(watermarks.highest.len(), 2);
+        assert!(
+            watermarks
+                .get(&("orders".to_owned(), "three".to_owned()))
+                .is_none()
+        );
+        assert_eq!(
+            watermarks.get(&("orders".to_owned(), "two".to_owned())),
+            Some(4)
+        );
+        assert_eq!(
+            watermarks.get(&("orders".to_owned(), "four".to_owned())),
+            Some(5)
+        );
+
+        watermarks.remove(&("orders".to_owned(), "two".to_owned()));
+        assert!(
+            watermarks
+                .get(&("orders".to_owned(), "two".to_owned()))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_subscriber_releases_the_reader_pool_for_other_consumers() {
+        let mut service = service_with_events(&[
+            event(1, "public", "orders"),
+            event(2, "public", "orders"),
+        ]);
+        let config = config_for_service(&mut service);
+        config.runtime.channel_capacity = 1;
+        config.runtime.replay_reader_threads = 1;
+        config.runtime.replay_reader_queue_capacity = 1;
+        config.runtime.replay_batch_events = 1;
+
+        let stalled = service
+            .subscribe(Request::new(subscription("stalled", 0)))
+            .await
+            .expect("stalled subscribe response")
+            .into_inner();
+        // Let the stalled worker take the reader-pool permit and block on a full
+        // channel; it must release the permit before waiting on the client.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut reader = service
+            .subscribe(Request::new(subscription("reader", 1)))
+            .await
+            .expect("reader subscribe response")
+            .into_inner();
+        let delivered = timeout(Duration::from_secs(2), reader.next())
+            .await
+            .expect("reader should progress while the first consumer is stalled")
+            .expect("reader stream item")
+            .expect("reader change event");
+        assert_eq!(delivered.sequence, 1);
+
+        drop(stalled);
     }
 
     struct TestService {
