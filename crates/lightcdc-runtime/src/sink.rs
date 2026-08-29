@@ -4,7 +4,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
 use lightcdc_core::{ChangeEvent, StreamConfig};
-use lightcdc_storage::RedbEventStore;
+use lightcdc_storage::{RedbEventStore, StorageError};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -161,13 +161,41 @@ async fn run_sink_worker(
         if shutdown.is_triggered() {
             return Ok(());
         }
-        let replay = reader
+        let replay = match reader
             .replay_from(
                 offset.saturating_add(1),
                 config.batch_max_events,
                 config.batch_max_bytes,
             )
-            .await?;
+            .await
+        {
+            Ok(replay) => replay,
+            Err(error) if matches!(
+                error.downcast_ref::<StorageError>(),
+                Some(StorageError::SequenceExpired { .. })
+            ) => {
+                let previous_offset = offset;
+                offset = match reader.first_sequence().await? {
+                    Some(first) => first.saturating_sub(1),
+                    None => reader
+                        .last_sequence()
+                        .await?
+                        .unwrap_or(1)
+                        .saturating_sub(1),
+                };
+                warn!(
+                    sink = %config.name,
+                    stream = %config.stream.name,
+                    consumer = %consumer,
+                    previous_offset,
+                    offset,
+                    %error,
+                    "consumer offset fell below the retained prefix; resuming from the earliest retained sequence"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if replay.is_empty() {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
@@ -237,7 +265,7 @@ mod tests {
     use std::{future::Future, pin::Pin, time::Duration};
 
     use lightcdc_core::{ChangeEvent, Operation, SourceMetadata, StreamConfig};
-    use lightcdc_storage::{LogOpenOptions, RedbEventStore};
+    use lightcdc_storage::{LogOpenOptions, RedbEventStore, RetentionPolicy, SegmentOptions};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -366,6 +394,89 @@ mod tests {
                 .expect("sink offset"),
             None
         );
+        drop(writer);
+        drop(store);
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn sink_resumes_when_its_offset_falls_below_the_retention_floor() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = RedbEventStore::open_with_segment_options(
+            &LogOpenOptions {
+                data_dir: temp.path().to_path_buf(),
+                database_file: "sink.redb".to_owned(),
+            },
+            SegmentOptions {
+                max_events: 2,
+                ..SegmentOptions::default()
+            },
+        )
+        .expect("open store");
+        for sequence in 1..=3 {
+            store.append_event(&event(sequence)).expect("append event");
+        }
+        store
+            .prune_events(
+                RetentionPolicy {
+                    max_events: Some(1),
+                    max_bytes: None,
+                    max_age: None,
+                    delete_batch_size: 10,
+                },
+                i64::MAX,
+            )
+            .expect("prune events");
+        store
+            .set_consumer_offset("orders", "sink:cache", 1)
+            .expect("set stale offset");
+        assert_eq!(
+            store.first_sequence().expect("first sequence"),
+            Some(3),
+            "the retention floor must leave only event 3 retained"
+        );
+
+        let writer =
+            CaptureStorageWriter::start(store.clone(), "default".to_owned()).expect("start writer");
+        let (batches_tx, mut batches_rx) = mpsc::unbounded_channel();
+        let (shutdown, shutdown_rx) = shutdown_channel();
+        let runtime = SinkRuntime::start(
+            store.clone(),
+            1,
+            8,
+            vec![registration(Box::new(RecordingSink {
+                batches: batches_tx,
+            }))],
+            writer.handle(),
+            EventNotifier::new(),
+            shutdown_rx,
+        )
+        .expect("sink runtime");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), batches_rx.recv())
+                .await
+                .expect("delivery timeout")
+                .expect("delivery batch"),
+            [3]
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store
+                .consumer_offset("orders", "sink:cache")
+                .expect("sink offset")
+                != Some(3)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("offset timeout");
+
+        shutdown.trigger();
+        runtime
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("sink shutdown");
         drop(writer);
         drop(store);
         drop(temp);
