@@ -2,19 +2,30 @@
 
 mod mapping;
 
-use std::{env, fs, future::Future, pin::Pin};
+use std::{env, fs, future::Future, pin::Pin, time::Duration};
 
 use anyhow::{Context, anyhow};
 use lightcdc_core::{ChangeEvent, RedisSinkConfig};
 use lightcdc_runtime::{Sink, SinkDeliveryError};
 use mapping::{CacheMutation, map_event};
-use redis::{RetryMethod, aio::ConnectionManager};
+use redis::{RetryMethod, aio::{ConnectionManager, ConnectionManagerConfig}};
 
 /// Lazily connected Redis destination that bulk-pipelines complete event batches.
+///
+/// Timeouts bound every Redis interaction so a half-open connection cannot
+/// stall the sink worker indefinitely; failures surface as retryable errors.
+/// Connection timeout: maximum time to establish the TCP connection and handshake.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Response timeout: maximum time for Redis to answer one pipelined batch.
+/// The crate default of 500ms is too tight for large batches, and no deadline
+/// would let a hung server block the sink forever.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RedisSink {
     url: String,
     rules: Vec<lightcdc_core::RedisCacheRule>,
     max_commands_per_batch: usize,
+    connection_config: ConnectionManagerConfig,
     connection: Option<ConnectionManager>,
 }
 
@@ -22,10 +33,14 @@ impl RedisSink {
     pub fn new(config: RedisSinkConfig) -> anyhow::Result<Self> {
         let url = resolve_url(&config)?;
         redis::Client::open(url.as_str()).context("validate Redis sink URL")?;
+        let connection_config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(CONNECTION_TIMEOUT))
+            .set_response_timeout(Some(RESPONSE_TIMEOUT));
         Ok(Self {
             url,
             rules: config.rules,
             max_commands_per_batch: config.max_commands_per_batch,
+            connection_config,
             connection: None,
         })
     }
@@ -54,7 +69,7 @@ impl RedisSink {
             })?;
             self.connection = Some(
                 client
-                    .get_connection_manager()
+                    .get_connection_manager_with_config(self.connection_config.clone())
                     .await
                     .map_err(|error| classify_redis(error, "connect to Redis sink"))?,
             );
