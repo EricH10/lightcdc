@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        mpsc::{self, Sender},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,7 +16,8 @@ use std::{
 
 use lightcdc_core::ChangeEvent;
 use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition, TableHandle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,11 @@ const SEGMENT_FORMAT_MARKER_PREFIX: &str = "lightcdc-segment-format=";
 const EVENT_FORMAT_MARKER_PREFIX: &str = "event-payload-format=";
 const TRANSACTION_REPLAY_PREFIX: &str = "lightcdc-tx-v1";
 const CONTROL_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Bound on the reaper's deferred-close queue. Each queued entry pins an
+/// open redb database (file descriptor plus mapped pages), so the queue
+/// must stay bounded to cap memory under heavy segment churn; overflow
+/// closes the database synchronously on the dropping thread instead.
+const REAPER_QUEUE_CAPACITY: usize = 64;
 
 /// Owns the control database and the ordered set of event segment files.
 pub(crate) struct SegmentStore {
@@ -108,12 +114,12 @@ type SegmentDatabase = Arc<DeferredDatabase>;
 struct DeferredDatabase {
     database: Option<Database>,
     path: PathBuf,
-    reaper: Sender<RetiredDatabase>,
+    reaper: SyncSender<RetiredDatabase>,
     pending_closes: Arc<PendingCloses>,
 }
 
 struct DatabaseReaper {
-    sender: Option<Sender<RetiredDatabase>>,
+    sender: Option<SyncSender<RetiredDatabase>>,
     pending_closes: Arc<PendingCloses>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1307,15 +1313,26 @@ impl SegmentStore {
                     .and_then(|candidate| candidate.high_watermark)
                     .map(|high| high.saturating_add(1))
             });
-        if let Err(error) = self.advance_retention_floor(next_first) {
-            let _ = fs::rename(&deleting_path, &descriptor.path);
-            return Err(error);
-        }
-
         state
             .descriptors
             .retain(|candidate| candidate.id != descriptor.id);
         drop(state);
+
+        if let Err(error) = self.advance_retention_floor(next_first) {
+            // Roll the catalog and file back under a fresh write lock so the
+            // segment remains fully visible. A crash between the rename and
+            // this point leaves a `.deleting` file with the floor unadvanced,
+            // which cleanup_interrupted_segment_files restores on restart.
+            let mut state = write_state(&self.state);
+            state.descriptors.push(descriptor.clone());
+            state
+                .descriptors
+                .sort_by_key(|candidate| candidate.id);
+            let _ = fs::rename(&deleting_path, &descriptor.path);
+            drop(state);
+            return Err(error);
+        }
+
         match fs::remove_file(&deleting_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1438,11 +1455,18 @@ impl Drop for DeferredDatabase {
             return;
         };
         mutex(&self.pending_closes.paths).insert(self.path.clone());
-        if let Err(error) = self.reaper.send(RetiredDatabase {
+        if let Err(error) = self.reaper.try_send(RetiredDatabase {
             path: self.path.clone(),
             database,
         }) {
-            drop(error.0.database);
+            // Queue overflow or a stopped reaper closes the database inline so
+            // queued redb handles (fd + mapped pages) cannot accumulate.
+            let RetiredDatabase { database, .. } = match error {
+                mpsc::TrySendError::Full(retired) | mpsc::TrySendError::Disconnected(retired) => {
+                    retired
+                }
+            };
+            drop(database);
             self.pending_closes.finish(&self.path);
         }
     }
@@ -1450,7 +1474,7 @@ impl Drop for DeferredDatabase {
 
 impl DatabaseReaper {
     fn start() -> Result<Self, StorageError> {
-        let (sender, receiver) = mpsc::channel::<RetiredDatabase>();
+        let (sender, receiver) = mpsc::sync_channel::<RetiredDatabase>(REAPER_QUEUE_CAPACITY);
         let pending_closes = Arc::new(PendingCloses::default());
         let thread_pending_closes = Arc::clone(&pending_closes);
         let thread = thread::Builder::new()
@@ -1856,9 +1880,10 @@ fn migrate_segment_formats(
     };
     for path in segment_paths(segments_dir)? {
         let marker = read_segment_format_marker(&path)?;
-        let database = open_database(&path, options.active_cache_bytes, false)?;
-        match read_metadata_value(&database, SEGMENT_FORMAT_KEY)? {
-            Some(1) => migrate_segment_v1_to_v2(&database)?,
+        let database = open_database_read_only(&path, options.active_cache_bytes)?;
+        let format = read_metadata_value(&database, SEGMENT_FORMAT_KEY)?;
+        match format {
+            Some(1) => {}
             Some(SEGMENT_FORMAT_VERSION) => {
                 let payload_format = read_metadata_value(&database, EVENT_PAYLOAD_FORMAT_KEY)?
                     .ok_or_else(|| {
@@ -1889,6 +1914,11 @@ fn migrate_segment_formats(
             }
         }
         drop(database);
+        if format == Some(1) {
+            // Migration rewrites payloads, so it reopens the segment writable.
+            let database = open_database(&path, options.active_cache_bytes, false)?;
+            migrate_segment_v1_to_v2(&database)?;
+        }
         if marker != Some(current) {
             write_segment_format_marker(
                 &path,
@@ -1959,7 +1989,7 @@ fn load_segment_descriptor(
     path: &Path,
     cache_bytes: usize,
 ) -> Result<SegmentDescriptor, StorageError> {
-    let database = open_database(path, cache_bytes, false)?;
+    let database = open_database_read_only(path, cache_bytes)?;
     let read = database.begin_read().map_err(redb_error)?;
     let events = read.open_table(EVENTS).map_err(redb_error)?;
     let event_ids = read.open_table(REPLAY_IDS).map_err(redb_error)?;
@@ -2089,7 +2119,22 @@ fn open_database(path: &Path, cache_bytes: usize, create: bool) -> Result<Databa
     }
 }
 
-fn read_metadata_value(database: &Database, key: &str) -> Result<Option<u64>, StorageError> {
+/// Opens a database strictly for metadata reads. Unlike a writable open this
+/// never takes the file lock that blocks a concurrent writable handle, and it
+/// never flushes on drop, so it is safe for startup scans.
+fn open_database_read_only(
+    path: &Path,
+    cache_bytes: usize,
+) -> Result<ReadOnlyDatabase, StorageError> {
+    let mut builder = Database::builder();
+    builder.set_cache_size(cache_bytes);
+    builder.open_read_only(path).map_err(redb_error)
+}
+
+fn read_metadata_value(
+    database: &impl ReadableDatabase,
+    key: &str,
+) -> Result<Option<u64>, StorageError> {
     if !table_exists(database, "metadata")? {
         return Ok(None);
     }
@@ -2101,7 +2146,7 @@ fn read_metadata_value(database: &Database, key: &str) -> Result<Option<u64>, St
         .map(|value| value.value()))
 }
 
-fn table_exists(database: &Database, name: &str) -> Result<bool, StorageError> {
+fn table_exists(database: &impl ReadableDatabase, name: &str) -> Result<bool, StorageError> {
     let read = database.begin_read().map_err(redb_error)?;
     Ok(read
         .list_tables()
@@ -2144,7 +2189,7 @@ fn cleanup_interrupted_segment_files(
             continue;
         }
         if let Some(id) = parse_interrupted_segment_id(name, SEGMENT_DELETING_SUFFIX) {
-            let database = open_database(&path, options.sealed_cache_bytes, false)?;
+            let database = open_database_read_only(&path, options.sealed_cache_bytes)?;
             let read = database.begin_read().map_err(redb_error)?;
             let events = read.open_table(EVENTS).map_err(redb_error)?;
             let last_sequence = events
@@ -2164,6 +2209,7 @@ fn cleanup_interrupted_segment_files(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
+                sync_directory(segments_dir)?;
             } else {
                 let restored = segment_path(segments_dir, id);
                 if restored.exists() {
@@ -2171,6 +2217,7 @@ fn cleanup_interrupted_segment_files(
                 } else {
                     fs::rename(path, restored)?;
                 }
+                sync_directory(segments_dir)?;
             }
         }
     }
@@ -2588,7 +2635,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(store.stats().expect("stats").segment_count, 1);
-        assert!(!table_exists(&store.control, "events").expect("list control tables"));
+        assert!(!table_exists(&*store.control, "events").expect("list control tables"));
         drop(store);
 
         let reopened = SegmentStore::open(control_path, test_segment_options(10))
@@ -2792,31 +2839,48 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_uncommitted_segment_deletion_is_rolled_back() {
+    fn interrupted_fully_retained_deletion_is_finished_on_reopen() {
         let temp = TempDir::new().expect("temp dir");
         let control_path = temp.path().join("events.redb");
-        let options = test_segment_options(1);
+        let options = test_segment_options(2);
         let store =
             SegmentStore::open(control_path.clone(), options).expect("open segmented store");
-        store.append_event(&event(1)).expect("append first segment");
-        let first_path = read_state(&store.state).descriptors[0].path.clone();
+        store.append_event(&event(1)).expect("append first");
+        store.append_event(&event(2)).expect("append second");
+        store.append_event(&event(3)).expect("rotate into a second segment");
+        // Commit a retention floor past the first segment, mirroring a crash
+        // between the floor commit and the deleting-file removal.
+        let write = store.control.begin_write().expect("begin control write");
+        {
+            let mut metadata = write.open_table(METADATA).expect("open metadata");
+            metadata
+                .insert(RETENTION_FLOOR_KEY, 3)
+                .expect("commit floor");
+        }
+        write.commit().expect("commit control");
+        let descriptors = read_state(&store.state).descriptors.clone();
+        assert_eq!(descriptors.len(), 2);
+        let first_path = descriptors[0].path.clone();
         drop(store);
 
         let deleting = deleting_segment_path(&first_path).expect("deleting path");
         fs::rename(&first_path, &deleting).expect("simulate interrupted deletion");
+        let marker = segment_format_marker_path(&first_path).expect("marker path");
+        assert!(marker.exists());
 
         let reopened =
             SegmentStore::open(control_path, options).expect("recover interrupted deletion");
         assert_eq!(
             reopened
-                .replay_from(1, 1, u64::MAX)
-                .expect("replay restored"),
-            [event(1)]
+                .replay_from(3, 1, u64::MAX)
+                .expect("replay retained events"),
+            [event(3)]
         );
-        assert!(first_path.exists());
         assert!(!deleting.exists());
+        assert!(!marker.exists());
+        assert!(!first_path.exists());
     }
-
+ 
     fn create_legacy_store(path: &Path) {
         let database = Database::create(path).expect("create legacy database");
         let write = database.begin_write().expect("begin legacy write");
