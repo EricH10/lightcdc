@@ -776,6 +776,7 @@ impl ProductionMetrics {
             .store(sample.consumer_lag_max, Ordering::Relaxed);
         self.record_durable_source_lsn(sample.durable_source_lsn);
         self.inner.storage_sample_ok.store(true, Ordering::Relaxed);
+        self.inner.storage_healthy.store(true, Ordering::Relaxed);
         add(&self.inner.storage_samples_total, 1);
     }
 
@@ -1056,6 +1057,34 @@ mod tests {
             rendered.contains("lightcdc_storage_commit_duration_seconds_bucket{le=\"0.01\"} 1")
         );
         assert!(rendered.contains("lightcdc_runtime_state{state=\"capturing\"} 1"));
+    }
+
+    #[test]
+    fn successful_storage_sample_clears_a_prior_storage_error() {
+        let metrics = ProductionMetrics::new(u64::MAX, 0, 32, 10_000, 16, 8);
+        metrics.record_storage_error();
+        assert!(
+            !metrics.storage_ready(),
+            "a recorded storage error must latch storage unhealthy"
+        );
+
+        metrics.apply_storage_sample(StorageSample {
+            storage_bytes: 0,
+            staging_bytes: 0,
+            filesystem_available_bytes: u64::MAX,
+            filesystem_total_bytes: u64::MAX,
+            retained_events: 0,
+            first_retained_sequence: 0,
+            event_high_watermark: 0,
+            consumer_offsets: 0,
+            consumer_lag_max: 0,
+            durable_source_lsn: 0,
+        });
+
+        assert!(
+            metrics.storage_ready(),
+            "a healthy storage sample must clear a prior storage error"
+        );
     }
 
     #[test]
