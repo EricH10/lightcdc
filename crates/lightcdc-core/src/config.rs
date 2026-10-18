@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     fs,
     net::SocketAddr,
-    path::Path,
+    path::{Component, Path},
 };
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use crate::{ChangeEvent, Error, Result};
 
 /// Holds all user-configurable settings loaded from TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// The PostgreSQL source captured by this process.
     pub source: SourceConfig,
@@ -37,6 +38,7 @@ pub struct Config {
 
 /// Describes the PostgreSQL source used for logical replication.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     /// Stable local identity used to scope checkpoints and staging files.
     #[serde(default = "default_source_name")]
@@ -83,6 +85,7 @@ pub enum PostgresTlsMode {
 
 /// Describes local runtime settings such as storage paths and buffer sizes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Directory containing redb and transaction staging data.
     pub data_dir: String,
@@ -243,6 +246,7 @@ pub struct ApiTokenConfig {
 
 /// Names a consumable stream and the tables it includes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamConfig {
     /// Stable name clients pass to subscribe, acknowledge, and seek.
     pub name: String,
@@ -256,6 +260,7 @@ pub struct StreamConfig {
 
 /// Routes one durable stream into a configured in-process destination.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     /// Stable sink identity used to scope its durable consumer offset.
     pub name: String,
@@ -479,10 +484,14 @@ impl Config {
         if runtime.data_dir.trim().is_empty() {
             return Err("runtime.data_dir must not be empty".to_owned());
         }
-        let storage_file = Path::new(&runtime.storage_file);
-        if runtime.storage_file.is_empty()
+        let storage_file_value = runtime.storage_file.trim();
+        let storage_file = Path::new(storage_file_value);
+        if storage_file_value.is_empty()
             || storage_file.is_absolute()
             || storage_file.components().count() != 1
+            || storage_file.components().any(|component| {
+                matches!(component, Component::CurDir | Component::ParentDir)
+            })
         {
             return Err(
                 "runtime.storage_file must be one relative filename without path components"
@@ -821,9 +830,27 @@ impl Config {
             }
             match &sink.destination {
                 SinkDestinationConfig::Redis(redis) => {
-                    let selected = usize::from(redis.url.is_some())
-                        + usize::from(redis.url_env.is_some())
-                        + usize::from(redis.url_file.is_some());
+                    if redis.url.as_deref() == Some("") {
+                        return Err(format!(
+                            "Redis sink {:?} url must not be empty when configured",
+                            sink.name
+                        ));
+                    }
+                    if redis.url_env.as_deref() == Some("") {
+                        return Err(format!(
+                            "Redis sink {:?} url_env must not be empty when configured",
+                            sink.name
+                        ));
+                    }
+                    if redis.url_file.as_deref() == Some("") {
+                        return Err(format!(
+                            "Redis sink {:?} url_file must not be empty when configured",
+                            sink.name
+                        ));
+                    }
+                    let selected = usize::from(redis.url.as_ref().is_some_and(|value| !value.is_empty()))
+                        + usize::from(redis.url_env.as_ref().is_some_and(|value| !value.is_empty()))
+                        + usize::from(redis.url_file.as_ref().is_some_and(|value| !value.is_empty()));
                     if selected != 1 {
                         return Err(format!(
                             "Redis sink {:?} must configure exactly one of url, url_env, or url_file",
@@ -858,6 +885,28 @@ impl Config {
                         if rule.key.is_empty() || !rule.key.contains('{') {
                             return Err(format!(
                                 "Redis sink {:?} rule {:?} needs a key placeholder",
+                                sink.name, rule.key
+                            ));
+                        }
+                        let mut brace_depth = 0usize;
+                        for character in rule.key.chars() {
+                            match character {
+                                '{' => brace_depth += 1,
+                                '}' => {
+                                    if brace_depth == 0 {
+                                        return Err(format!(
+                                            "Redis sink {:?} rule {:?} has unbalanced key template braces",
+                                            sink.name, rule.key
+                                        ));
+                                    }
+                                    brace_depth -= 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if brace_depth != 0 {
+                            return Err(format!(
+                                "Redis sink {:?} rule {:?} has unbalanced key template braces",
                                 sink.name, rule.key
                             ));
                         }
@@ -1048,6 +1097,8 @@ fn parse_table_pattern(pattern: &str) -> Option<TablePattern> {
         || table.contains('.')
         || schema.trim() != schema
         || table.trim() != table
+        || schema.contains('*')
+        || (table.contains('*') && table != "*")
     {
         return None;
     }
@@ -1232,7 +1283,10 @@ mod tests {
 
     use crate::{Operation, SourceMetadata};
 
-    use super::{CapturePlanError, Config, StreamConfig, quote_postgres_parameter};
+    use super::{
+        CapturePlanError, Config, StreamConfig, TablePattern, parse_table_pattern,
+        quote_postgres_parameter,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -1580,6 +1634,236 @@ mod tests {
                 .expect_err("unknown stream")
                 .contains("unknown stream")
         );
+    }
+
+    #[test]
+    fn table_pattern_wildcards_are_rejected_outside_the_table_position() {
+        assert!(matches!(parse_table_pattern("*"), Some(TablePattern::All)));
+        assert_eq!(
+            parse_table_pattern("a.*"),
+            Some(TablePattern::Schema("a".to_owned()))
+        );
+        assert_eq!(
+            parse_table_pattern("a.b"),
+            Some(TablePattern::Exact {
+                schema: "a".to_owned(),
+                table: "b".to_owned(),
+            })
+        );
+        assert_eq!(parse_table_pattern("*.orders"), None);
+        assert_eq!(parse_table_pattern("*.*"), None);
+        assert_eq!(parse_table_pattern("a.b*"), None);
+        assert_eq!(parse_table_pattern("a.*b"), None);
+    }
+
+    #[test]
+    fn capture_plan_rejects_wildcards_in_the_schema_position() {
+        let config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["*.orders".to_owned()],
+        }]);
+        assert!(matches!(
+            config.capture_plan(),
+            Err(CapturePlanError::InvalidTablePattern { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_validation_rejects_dot_and_parent_storage_files() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+        for invalid in [".", ".."] {
+            config.runtime.storage_file = invalid.to_owned();
+            assert_eq!(
+                config.validate_runtime(),
+                Err(
+                    "runtime.storage_file must be one relative filename without path components"
+                        .to_owned()
+                ),
+                "storage_file {invalid:?} must be rejected"
+            );
+        }
+        config.runtime.storage_file = "   ".to_owned();
+        assert!(
+            config
+                .validate_runtime()
+                .expect_err("whitespace-only storage_file must fail")
+                .contains("storage_file")
+        );
+    }
+
+    #[test]
+    fn redis_sink_rejects_empty_url_sources() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+
+        config.sinks.push(redis_sink(Some(""), None, None, "order:{id}"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("empty url must fail")
+                .contains("url must not be empty")
+        );
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(None, Some(""), None, "order:{id}"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("empty url_env must fail")
+                .contains("url_env must not be empty")
+        );
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(None, None, Some(""), "order:{id}"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("empty url_file must fail")
+                .contains("url_file must not be empty")
+        );
+    }
+
+    #[test]
+    fn redis_sink_empty_url_does_not_satisfy_the_exactly_one_count() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+
+        // url = "" alone cannot satisfy the exactly-one count.
+        config.sinks.push(redis_sink(Some(""), None, None, "order:{id}"));
+        let error = config
+            .validate_sinks()
+            .expect_err("empty url alone must fail");
+        assert!(error.contains("url must not be empty"), "{error}");
+
+        // An empty url is rejected even when a real url_env is present.
+        config.sinks.clear();
+        config.sinks.push(redis_sink(Some(""), Some("REDIS_URL"), None, "order:{id}"));
+        let error = config
+            .validate_sinks()
+            .expect_err("empty url must fail with url_env set");
+        assert!(error.contains("url must not be empty"), "{error}");
+
+        // An empty url_env is rejected even when a real url_file is present.
+        config.sinks.clear();
+        config.sinks.push(redis_sink(None, Some(""), Some("redis.url"), "order:{id}"));
+        let error = config
+            .validate_sinks()
+            .expect_err("empty url_env must fail with url_file set");
+        assert!(error.contains("url_env must not be empty"), "{error}");
+    }
+
+    #[test]
+    fn redis_sink_rejects_unbalanced_key_template_braces() {
+        let mut config = config_with_streams(vec![StreamConfig {
+            name: "orders".to_owned(),
+            source: "default".to_owned(),
+            tables: vec!["public.orders".to_owned()],
+        }]);
+
+        config.sinks.push(redis_sink(Some("redis://x"), None, None, "order:{id"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("unclosed brace must fail")
+                .contains("unbalanced")
+        );
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(Some("redis://x"), None, None, "order:{id}}"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("extra closing brace must fail")
+                .contains("unbalanced")
+        );
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(Some("redis://x"), None, None, "order:id}"));
+        assert!(
+            config
+                .validate_sinks()
+                .expect_err("closing brace without opener must fail")
+                .contains("key placeholder")
+        );
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(Some("redis://x"), None, None, "order:{id}"));
+        config.validate_sinks().expect("balanced braces are valid");
+
+        config.sinks.clear();
+        config.sinks.push(redis_sink(Some("redis://x"), None, None, "order:{{id}}"));
+        config.validate_sinks().expect("nested balanced braces are valid");
+    }
+
+    #[test]
+    fn config_rejects_unknown_runtime_keys() {
+        let error = toml::from_str::<super::Config>(
+            r#"
+            [source]
+            name = "default"
+            host = "localhost"
+            port = 5432
+            database = "lightcdc"
+            user = "lightcdc"
+            password = "secret"
+            publication = "publication"
+            slot = "slot"
+
+            [runtime]
+            data_dir = "data"
+            storage_file = "events.redb"
+            channel_capacity = 32
+            shutdown_timeout_ms = 1000
+            retention_max_event = 1
+
+            [logging]
+            level = "info"
+            "#,
+        )
+        .expect_err("typo'd runtime key must fail to parse");
+        assert!(
+            error.to_string().contains("retention_max_event"),
+            "{error}"
+        );
+    }
+
+    fn redis_sink(
+        url: Option<&str>,
+        url_env: Option<&str>,
+        url_file: Option<&str>,
+        key: &str,
+    ) -> super::SinkConfig {
+        super::SinkConfig {
+            name: "orders-cache".to_owned(),
+            stream: "orders".to_owned(),
+            batch_max_events: 500,
+            batch_max_bytes: 16 * 1024 * 1024,
+            retry_initial_ms: 250,
+            retry_max_ms: 15_000,
+            destination: super::SinkDestinationConfig::Redis(super::RedisSinkConfig {
+                url: url.map(str::to_owned),
+                url_env: url_env.map(str::to_owned),
+                url_file: url_file.map(str::to_owned),
+                max_commands_per_batch: 10_000,
+                rules: vec![super::RedisCacheRule {
+                    table: "public.orders".to_owned(),
+                    key: key.to_owned(),
+                    action: super::RedisCacheAction::Invalidate,
+                    ttl_seconds: None,
+                }],
+            }),
+        }
     }
 
     fn config_with_streams(streams: Vec<StreamConfig>) -> Config {
