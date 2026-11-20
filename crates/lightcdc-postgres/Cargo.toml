@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 lightcdc-core = { path = "../lightcdc-core", version = "0.1.0" }
 lightcdc-storage = { path = "../lightcdc-storage", version = "0.1.0" }
-pgwire-replication = "0.4.0"
+pgwire-replication = "0.5.0"
 serde.workspace = true
 serde_json.workspace = true
 rustls.workspace = true
